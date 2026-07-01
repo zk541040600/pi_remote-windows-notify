@@ -1,0 +1,6 @@
+# Local runtime/config artifacts
+.pi-notify/
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
