@@ -4,3 +4,5 @@
 *.tmp
 .DS_Store
 Thumbs.db
+# Local secret config; keep only the example in git.
+linux/remote-windows-notify.json

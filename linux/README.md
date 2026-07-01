@@ -1,0 +1,43 @@
+# Linux side
+
+This side contains the Pi extension that runs on the remote/Linux machine and sends a notification to the Windows listener when a Pi agent turn ends.
+
+## Files
+
+- `extensions/remote-windows-notify.ts` - Pi extension declared by the repo root `package.json`.
+- `remote-windows-notify.example.json` - example runtime config. Copy it to `~/.pi/agent/remote-windows-notify.json` and replace the token.
+
+## Install
+
+Recommended: install the repo as a Pi package.
+
+```bash
+pi install git:github.com/zk541040600/pi_remote-windows-notify
+cp ~/.pi/agent/git/github.com/zk541040600/pi_remote-windows-notify/linux/remote-windows-notify.example.json \
+  ~/.pi/agent/remote-windows-notify.json
+```
+
+For local development before pushing, install the local checkout instead:
+
+```bash
+pi install /root/work/pi_remote-windows-notify
+```
+
+Edit `~/.pi/agent/remote-windows-notify.json`:
+
+- `endpoint` should point to the Windows listener endpoint.
+- `token` must match the Windows listener token.
+
+Then restart Pi or run `/reload`.
+
+## Environment overrides
+
+- `PI_NOTIFY_CONFIG` - config file path.
+- `PI_NOTIFY_ENDPOINT` - override endpoint.
+- `PI_NOTIFY_TOKEN` - override token.
+- `PI_NOTIFY_TIMEOUT_MS` - override timeout, clamped to 1000-15000 ms.
+- `PI_NOTIFY_TITLE` - notification title.
+- `PI_NOTIFY_BODY_TEMPLATE` - body template, supports `{host}` and `{cwd}`.
+- `PI_NOTIFY_DISABLED=1` - disable notifications.
+
+Notification failures are ignored so they never break Pi.
