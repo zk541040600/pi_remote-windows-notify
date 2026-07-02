@@ -10,6 +10,7 @@ type NotifyConfigFile = {
   timeoutMs?: number;
   title?: string;
   bodyTemplate?: string;
+  messageMode?: "dynamic" | "static";
 };
 
 type RuntimeConfig = {
@@ -19,6 +20,14 @@ type RuntimeConfig = {
   timeoutMs: number;
   title: string;
   bodyTemplate: string;
+  messageMode: "dynamic" | "static";
+};
+
+type AgentMessageLike = {
+  role?: string;
+  content?: unknown;
+  toolName?: string;
+  isError?: boolean;
 };
 
 const DEFAULT_ENDPOINT = "http://127.0.0.1:23117/notify";
@@ -39,6 +48,101 @@ function normalizeText(value: string | undefined, fallback: string, maxLength: n
 
 function renderBody(template: string): string {
   return template.replace(/\{host\}/g, hostname()).replace(/\{cwd\}/g, process.cwd());
+}
+
+function normalizeMode(value: string | undefined): "dynamic" | "static" {
+  return value === "static" ? "static" : "dynamic";
+}
+
+function extractTextContent(content: unknown): string {
+  if (typeof content === "string") {
+    return content;
+  }
+
+  if (!Array.isArray(content)) {
+    return "";
+  }
+
+  const parts: string[] = [];
+  for (const item of content) {
+    if (!item || typeof item !== "object") {
+      continue;
+    }
+
+    const maybeText = item as { type?: string; text?: string };
+    if (maybeText.type === "text" && typeof maybeText.text === "string") {
+      parts.push(maybeText.text);
+    }
+  }
+
+  return parts.join(" ");
+}
+
+function findLastTextForRole(messages: AgentMessageLike[], role: string): string {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message?.role !== role) {
+      continue;
+    }
+
+    const text = extractTextContent(message.content);
+    if (text.trim()) {
+      return text;
+    }
+  }
+
+  return "";
+}
+
+function collectToolInfo(messages: AgentMessageLike[]): { toolNames: string[]; hasError: boolean } {
+  const seen = new Set<string>();
+  const toolNames: string[] = [];
+  let hasError = false;
+
+  for (const message of messages) {
+    if (message?.role !== "toolResult") {
+      continue;
+    }
+
+    if (message.isError) {
+      hasError = true;
+    }
+
+    const toolName = normalizeText(typeof message.toolName === "string" ? message.toolName : "", "", 32);
+    if (!toolName || seen.has(toolName)) {
+      continue;
+    }
+
+    seen.add(toolName);
+    toolNames.push(toolName);
+  }
+
+  return { toolNames, hasError };
+}
+
+function buildDynamicNotification(messages: AgentMessageLike[], config: RuntimeConfig): { title: string; body: string } {
+  const userPrompt = normalizeText(findLastTextForRole(messages, "user"), "", 72);
+  const assistantText = normalizeText(findLastTextForRole(messages, "assistant"), "", 120);
+  const { toolNames, hasError } = collectToolInfo(messages);
+
+  const title = normalizeText(userPrompt || assistantText || config.title, "Pi", 72);
+  const status = hasError ? "有报错，等你看" : toolNames.length > 0 ? "已完成，等你确认" : "已回复，等你输入";
+  const bodyParts: string[] = [status];
+
+  if (toolNames.length > 0) {
+    bodyParts.push(`tools: ${toolNames.slice(0, 4).join(", ")}`);
+  }
+
+  if (assistantText && assistantText !== title) {
+    bodyParts.push(assistantText);
+  } else {
+    bodyParts.push(renderBody(config.bodyTemplate));
+  }
+
+  return {
+    title,
+    body: normalizeText(bodyParts.join(" · "), renderBody(config.bodyTemplate), 220),
+  };
 }
 
 async function loadConfigFile(): Promise<NotifyConfigFile> {
@@ -68,7 +172,12 @@ async function getRuntimeConfig(): Promise<RuntimeConfig> {
       "Remote Pi on {host} is ready for input",
       220,
     ),
+    messageMode: normalizeMode(process.env.PI_NOTIFY_MESSAGE_MODE || file.messageMode),
   };
+}
+
+function shouldSkipNotificationForThisProcess(): boolean {
+  return process.env.PI_SUBAGENT_CHILD === "1";
 }
 
 async function notify(endpoint: string, token: string, title: string, body: string, timeoutMs: number): Promise<void> {
@@ -97,17 +206,30 @@ async function notify(endpoint: string, token: string, title: string, body: stri
 }
 
 export default function remoteWindowsNotify(pi: ExtensionAPI) {
-  pi.on("agent_end", async () => {
+  pi.on("agent_end", async (event) => {
+    if (shouldSkipNotificationForThisProcess()) {
+      return;
+    }
+
     const config = await getRuntimeConfig();
     if (!config.enabled || !config.token) {
       return;
     }
 
+    const messages = Array.isArray((event as { messages?: AgentMessageLike[] }).messages)
+      ? ((event as { messages: AgentMessageLike[] }).messages ?? [])
+      : [];
+
+    const { title, body } =
+      config.messageMode === "static"
+        ? { title: config.title, body: renderBody(config.bodyTemplate) }
+        : buildDynamicNotification(messages, config);
+
     await notify(
       config.endpoint,
       config.token,
-      config.title,
-      renderBody(config.bodyTemplate),
+      title,
+      body,
       config.timeoutMs,
     );
   });

@@ -234,26 +234,6 @@ function Show-Toast {
     }
 
     if ($DisplayMode -eq 'popup-focus' -and (Test-Path -LiteralPath $script:NotifyPopupScript)) {
-        try {
-            Get-CimInstance Win32_Process -ErrorAction Stop |
-                Where-Object { $_.CommandLine -like '*pi-notify-popup.ps1*' } |
-                ForEach-Object {
-                    try { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop } catch {}
-                }
-        }
-        catch {
-        }
-
-        foreach ($pathToClear in @($script:NotifyPopupStdoutLogPath, $script:NotifyPopupStderrLogPath)) {
-            try {
-                if (Test-Path -LiteralPath $pathToClear) {
-                    Remove-Item -LiteralPath $pathToClear -Force -ErrorAction Stop
-                }
-            }
-            catch {
-            }
-        }
-
         $payloadPath = Join-Path (Get-NotifyBridgeLogDir) 'popup-payload.json'
         $payload = @{
             title          = $Title
@@ -264,17 +244,48 @@ function Show-Toast {
         }
         [System.IO.File]::WriteAllText($payloadPath, ($payload | ConvertTo-Json -Depth 4), [System.Text.UTF8Encoding]::new($false))
 
-        Write-NotifyListenerLog -Message ('popup-launch title="{0}" focusTarget="{1}" cwdBase="{2}" timeout={3} payload="{4}" stdout="{5}" stderr="{6}"' -f $Title, $focusTarget, $cwdBase, $PopupTimeoutSeconds, $payloadPath, $script:NotifyPopupStdoutLogPath, $script:NotifyPopupStderrLogPath)
-        $popupProcess = Start-Process -FilePath $script:NotifyPowerShellExe -WindowStyle Hidden -ArgumentList @(
-            '-NoProfile',
-            '-STA',
-            '-WindowStyle', 'Hidden',
-            '-ExecutionPolicy', 'Bypass',
-            '-File', $script:NotifyPopupScript,
-            '-ConfigPath', $ConfigPath,
-            '-PayloadPath', $payloadPath
-        ) -RedirectStandardOutput $script:NotifyPopupStdoutLogPath -RedirectStandardError $script:NotifyPopupStderrLogPath -PassThru
-        Write-NotifyListenerLog -Message ('popup-pid {0}' -f $popupProcess.Id)
+        # Check if daemon is already running
+        $daemonRunning = $false
+        try {
+            $existingDaemons = Get-CimInstance Win32_Process -ErrorAction Stop |
+                Where-Object { $_.CommandLine -like '*pi-notify-popup.ps1*' -and $_.CommandLine -like '*-Daemon*' }
+            if ($existingDaemons) {
+                $daemonRunning = $true
+                Write-NotifyListenerLog -Message 'popup-daemon-already-running'
+            }
+        }
+        catch {
+            Write-NotifyListenerLog -Message ('popup-daemon-check-error "{0}"' -f $_.Exception.Message)
+        }
+
+        if (-not $daemonRunning) {
+            # Start daemon process
+            foreach ($pathToClear in @($script:NotifyPopupStdoutLogPath, $script:NotifyPopupStderrLogPath)) {
+                try {
+                    if (Test-Path -LiteralPath $pathToClear) {
+                        Remove-Item -LiteralPath $pathToClear -Force -ErrorAction Stop
+                    }
+                }
+                catch {
+                }
+            }
+
+            Write-NotifyListenerLog -Message ('popup-daemon-launch title="{0}" focusTarget="{1}" cwdBase="{2}" timeout={3} payload="{4}" stdout="{5}" stderr="{6}"' -f $Title, $focusTarget, $cwdBase, $PopupTimeoutSeconds, $payloadPath, $script:NotifyPopupStdoutLogPath, $script:NotifyPopupStderrLogPath)
+            $popupProcess = Start-Process -FilePath $script:NotifyPowerShellExe -WindowStyle Hidden -ArgumentList @(
+                '-NoProfile',
+                '-STA',
+                '-WindowStyle', 'Hidden',
+                '-ExecutionPolicy', 'Bypass',
+                '-File', $script:NotifyPopupScript,
+                '-ConfigPath', $ConfigPath,
+                '-PayloadPath', $payloadPath,
+                '-Daemon'
+            ) -RedirectStandardOutput $script:NotifyPopupStdoutLogPath -RedirectStandardError $script:NotifyPopupStderrLogPath -PassThru
+            Write-NotifyListenerLog -Message ('popup-daemon-pid {0}' -f $popupProcess.Id)
+        }
+        else {
+            Write-NotifyListenerLog -Message 'popup-daemon-payload-written (watcher will trigger display)'
+        }
         return
     }
 
@@ -283,6 +294,20 @@ function Show-Toast {
 
     $template = [Windows.UI.Notifications.ToastTemplateType]::ToastText02
     $xml = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent($template)
+    # scenario="reminder" keeps the toast on screen until user dismisses it
+    $toastNode = $xml.SelectSingleNode('/toast')
+    if ($null -ne $toastNode) {
+        $scenarioAttr = $xml.CreateAttribute('scenario')
+        $scenarioAttr.Value = 'reminder'
+        $toastNode.Attributes.Append($scenarioAttr) | Out-Null
+        # reminder scenario requires at least one action
+        $actionsNode = $xml.CreateElement('actions')
+        $actionNode = $xml.CreateElement('action')
+        $actionNode.SetAttribute('content', 'dismiss')
+        $actionNode.SetAttribute('arguments', 'dismiss')
+        $actionsNode.AppendChild($actionNode) | Out-Null
+        $toastNode.AppendChild($actionsNode) | Out-Null
+    }
     $texts = $xml.GetElementsByTagName('text')
     $texts.Item(0).AppendChild($xml.CreateTextNode($Title)) | Out-Null
     $texts.Item(1).AppendChild($xml.CreateTextNode($Body)) | Out-Null

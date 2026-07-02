@@ -291,7 +291,7 @@ function Ensure-NotifyBridgeConfig {
         [int]$existing['popupTimeoutSeconds']
     }
     else {
-        18
+        300
     }
 
     $config = @{

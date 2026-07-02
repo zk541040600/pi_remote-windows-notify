@@ -6,7 +6,8 @@ param(
     [string]$CwdBase,
     [string]$PayloadPath,
     [string]$ConfigPath,
-    [int]$TimeoutSeconds = 18
+    [int]$TimeoutSeconds = 300,
+    [switch]$Daemon
 )
 
 Set-StrictMode -Version Latest
@@ -57,6 +58,18 @@ public static class PiNotifyPopupUser32 {
 
     [DllImport("user32.dll")]
     public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+
+    [DllImport("user32.dll")]
+    public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetForegroundWindow();
+
+    public static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
+    public const uint SWP_NOACTIVATE = 0x0010;
+    public const uint SWP_SHOWWINDOW = 0x0040;
+    public const uint SWP_NOMOVE = 0x0002;
+    public const uint SWP_NOSIZE = 0x0001;
 }
 "@
 
@@ -334,7 +347,7 @@ function Invoke-NotifyPopupActivation {
         Write-NotifyPopupLog -Message ('popup-focus-best windowTitle="{0}" tabTitle="{1}" score={2}' -f $best.Window.Title, $best.TabName, $best.Score)
         if ([PiNotifyPopupUser32]::IsIconic($best.Window.Handle)) {
             [void][PiNotifyPopupUser32]::ShowWindowAsync($best.Window.Handle, 9)
-            Start-Sleep -Milliseconds 120
+            Start-Sleep -Milliseconds 40
         }
 
         try {
@@ -344,9 +357,9 @@ function Invoke-NotifyPopupActivation {
         catch {
             Write-NotifyPopupLog -Message ('popup-appactivate-error "{0}"' -f $_.Exception.Message)
         }
-        Start-Sleep -Milliseconds 80
+        Start-Sleep -Milliseconds 30
         [void][PiNotifyPopupUser32]::SetForegroundWindow($best.Window.Handle)
-        Start-Sleep -Milliseconds 80
+        Start-Sleep -Milliseconds 30
 
         if ($null -ne $best.Tab) {
             if (Select-NotifyPopupTab -TabElement $best.Tab) {
@@ -374,7 +387,10 @@ $form.Size = New-Object System.Drawing.Size(380, 110)
 $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::None
 $form.StartPosition = [System.Windows.Forms.FormStartPosition]::Manual
 $form.ShowInTaskbar = $false
-$form.TopMost = $true
+# ponytail: not using $form.TopMost — it can trigger WM_ACTIVATE and steal
+# keyboard focus on some Windows versions. Instead use SetWindowPos with
+# SWP_NOACTIVATE in the Shown handler to display on top without activation.
+$form.TopMost = $false
 $form.BackColor = [System.Drawing.Color]::FromArgb(58, 58, 58)
 $form.Opacity = 0.985
 $form.Cursor = [System.Windows.Forms.Cursors]::Hand
@@ -429,60 +445,161 @@ $targetCwdBase = $CwdBase
 $didActivate = $false
 $shouldActivate = $false
 
-$activateAction = {
-    if ($didActivate) {
-        return
-    }
-    $script:didActivate = $true
-    $script:shouldActivate = $true
-    Write-NotifyPopupLog -Message 'popup-click'
-    $form.Close()
-}
-
-$closeAction = {
-    Write-NotifyPopupLog -Message 'popup-close-button'
-    $form.Close()
-}
-
-foreach ($control in @($form, $panel, $appLabel, $titleLabel, $bodyLabel)) {
-    $control.Add_Click($activateAction)
-    $control.Add_MouseDown($activateAction)
-}
-$closeLabel.Add_Click($closeAction)
-$closeLabel.Add_MouseDown($closeAction)
-
-$timer = New-Object System.Windows.Forms.Timer
-$timer.Interval = [Math]::Max(3000, ($TimeoutSeconds * 1000))
-$timer.Add_Tick({
-    Write-NotifyPopupLog -Message 'popup-timeout-close'
-    $timer.Stop()
-    $form.Close()
-})
-
-$form.Add_Shown({
-    $workingArea = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
-    $margin = 16
-    $x = [Math]::Max($workingArea.Left, $workingArea.Right - $form.Width - $margin)
-    $y = [Math]::Max($workingArea.Top, $workingArea.Bottom - $form.Height - $margin)
-    $form.Location = New-Object System.Drawing.Point($x, $y)
-    $form.BringToFront()
-    $form.Activate()
-    Write-NotifyPopupLog -Message ('popup-shown x={0} y={1} w={2} h={3}' -f $x, $y, $form.Width, $form.Height)
-    $timer.Start()
-})
-
-$form.Add_FormClosed({
-    Write-NotifyPopupLog -Message 'popup-closed'
-    try {
+if ($Daemon) {
+    # Daemon mode: persistent process, FileSystemWatcher triggers popup updates
+    $activateAction = {
+        Write-NotifyPopupLog -Message 'popup-click (daemon)'
+        $form.Hide()
         $timer.Stop()
-        $timer.Dispose()
+        # Trigger activation in background runspace so message loop doesn't block
+        $rs = [powershell]::Create().AddScript({
+            param($scriptPath, $host2, $cwdBase2)
+            . $scriptPath
+            Invoke-NotifyPopupActivation -TargetHost $host2 -CurrentDirBase $cwdBase2
+        })
+        $rs.AddArgument($PSScriptRoot).AddArgument($script:targetHost).AddArgument($script:targetCwdBase) | Out-Null
+        $rs.BeginInvoke() | Out-Null
     }
-    catch {
+
+    $closeAction = {
+        Write-NotifyPopupLog -Message 'popup-close-button (daemon)'
+        $form.Hide()
+        $timer.Stop()
     }
-})
 
-[System.Windows.Forms.Application]::Run($form)
+    foreach ($control in @($form, $panel, $appLabel, $titleLabel, $bodyLabel)) {
+        $control.Add_Click($activateAction)
+        $control.Add_MouseDown($activateAction)
+    }
+    $closeLabel.Add_Click($closeAction)
+    $closeLabel.Add_MouseDown($closeAction)
 
-if ($shouldActivate) {
-    Invoke-NotifyPopupActivation -TargetHost $targetHost -CurrentDirBase $targetCwdBase
+    $timer = New-Object System.Windows.Forms.Timer
+    $timer.Interval = [Math]::Max(3000, ($TimeoutSeconds * 1000))
+    $timer.Add_Tick({
+        Write-NotifyPopupLog -Message 'popup-timeout-hide (daemon)'
+        $timer.Stop()
+        $form.Hide()
+    })
+
+    # Prevent actual close — hide instead
+    $form.Add_FormClosing({
+        $_.Cancel = $true
+        $form.Hide()
+    })
+
+    $form.Add_Shown({
+        $form.Hide() # Hide initially; watcher will show it
+    })
+
+    # FileSystemWatcher to monitor payload file
+    $payloadDir = Split-Path $PayloadPath -Parent
+    $payloadFile = Split-Path $PayloadPath -Leaf
+    $watcher = New-Object System.IO.FileSystemWatcher ($payloadDir, $payloadFile)
+    $watcher.SynchronizingObject = $form  # Marshal events to UI thread
+    $watcher.EnableRaisingEvents = $true
+
+    $onPayloadChanged = {
+        try {
+            if (-not (Test-Path -LiteralPath $script:PayloadPath)) { return }
+            $payloadText = [System.IO.File]::ReadAllText($script:PayloadPath, [System.Text.UTF8Encoding]::new($false))
+            $payload = $payloadText | ConvertFrom-Json
+            if ($payload.PSObject.Properties['title']) { $script:titleLabel.Text = [string]$payload.title }
+            if ($payload.PSObject.Properties['body']) { $script:bodyLabel.Text = [string]$payload.body }
+            if ($payload.PSObject.Properties['focusTarget']) { $script:targetHost = [string]$payload.focusTarget }
+            if ($payload.PSObject.Properties['cwdBase']) { $script:targetCwdBase = [string]$payload.cwdBase }
+            if ($payload.PSObject.Properties['timeoutSeconds']) { $script:timer.Interval = [Math]::Max(3000, ([int]$payload.timeoutSeconds * 1000)) }
+
+            # Reposition and show form on top without stealing focus
+            $workingArea = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+            $margin = 16
+            $x = [Math]::Max($workingArea.Left, $workingArea.Right - $script:form.Width - $margin)
+            $y = [Math]::Max($workingArea.Top, $workingArea.Bottom - $script:form.Height - $margin)
+            $script:form.Location = New-Object System.Drawing.Point($x, $y)
+            [void][PiNotifyPopupUser32]::SetWindowPos(
+                $script:form.Handle,
+                [PiNotifyPopupUser32]::HWND_TOPMOST,
+                $x, $y, $script:form.Width, $script:form.Height,
+                [PiNotifyPopupUser32]::SWP_NOACTIVATE -bor [PiNotifyPopupUser32]::SWP_SHOWWINDOW)
+            $script:timer.Start()
+            Write-NotifyPopupLog -Message ('popup-daemon-show title="{0}"' -f $script:titleLabel.Text)
+        }
+        catch {
+            Write-NotifyPopupLog -Message ('popup-daemon-payload-error "{0}"' -f $_.Exception.Message)
+        }
+    }
+
+    Register-ObjectEvent -InputObject $watcher -EventName Changed -Action $onPayloadChanged | Out-Null
+
+    # Show immediately if payload exists at startup
+    if (Test-Path -LiteralPath $PayloadPath) {
+        & $onPayloadChanged
+    }
+
+    Write-NotifyPopupLog -Message 'popup-daemon-start'
+    [System.Windows.Forms.Application]::Run()
+}
+else {
+    # Non-daemon mode: original behavior
+    $activateAction = {
+        if ($didActivate) {
+            return
+        }
+        $script:didActivate = $true
+        $script:shouldActivate = $true
+        Write-NotifyPopupLog -Message 'popup-click'
+        $form.Close()
+    }
+
+    $closeAction = {
+        Write-NotifyPopupLog -Message 'popup-close-button'
+        $form.Close()
+    }
+
+    foreach ($control in @($form, $panel, $appLabel, $titleLabel, $bodyLabel)) {
+        $control.Add_Click($activateAction)
+        $control.Add_MouseDown($activateAction)
+    }
+    $closeLabel.Add_Click($closeAction)
+    $closeLabel.Add_MouseDown($closeAction)
+
+    $timer = New-Object System.Windows.Forms.Timer
+    $timer.Interval = [Math]::Max(3000, ($TimeoutSeconds * 1000))
+    $timer.Add_Tick({
+        Write-NotifyPopupLog -Message 'popup-timeout-close'
+        $timer.Stop()
+        $form.Close()
+    })
+
+    $form.Add_Shown({
+        $workingArea = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+        $margin = 16
+        $x = [Math]::Max($workingArea.Left, $workingArea.Right - $form.Width - $margin)
+        $y = [Math]::Max($workingArea.Top, $workingArea.Bottom - $form.Height - $margin)
+        $form.Location = New-Object System.Drawing.Point($x, $y)
+        # Display on top without stealing keyboard focus (SWP_NOACTIVATE)
+        [void][PiNotifyPopupUser32]::SetWindowPos(
+            $form.Handle,
+            [PiNotifyPopupUser32]::HWND_TOPMOST,
+            $x, $y, $form.Width, $form.Height,
+            [PiNotifyPopupUser32]::SWP_NOACTIVATE -bor [PiNotifyPopupUser32]::SWP_SHOWWINDOW)
+        Write-NotifyPopupLog -Message ('popup-shown x={0} y={1} w={2} h={3}' -f $x, $y, $form.Width, $form.Height)
+        $timer.Start()
+    })
+
+    $form.Add_FormClosed({
+        Write-NotifyPopupLog -Message 'popup-closed'
+        try {
+            $timer.Stop()
+            $timer.Dispose()
+        }
+        catch {
+        }
+    })
+
+    [System.Windows.Forms.Application]::Run($form)
+
+    if ($shouldActivate) {
+        Invoke-NotifyPopupActivation -TargetHost $targetHost -CurrentDirBase $targetCwdBase
+    }
 }
