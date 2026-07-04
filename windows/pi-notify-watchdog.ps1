@@ -35,7 +35,14 @@ function Test-NotifyListenerHealth {
 
 function Test-NotifyRemoteTunnel {
     $probe = @"
-python - <<'PY'
+if command -v python3 >/dev/null 2>&1; then
+    pi_notify_python=python3
+elif command -v python >/dev/null 2>&1; then
+    pi_notify_python=python
+else
+    exit 127
+fi
+"`$pi_notify_python" - <<'PY'
 import urllib.request
 with urllib.request.urlopen('http://127.0.0.1:$($config.Port)/health', timeout=4) as r:
     print('HTTP', r.status)
@@ -57,8 +64,8 @@ function Get-NotifyProcessIds {
         $items = Get-CimInstance Win32_Process -ErrorAction Stop |
             Where-Object { $_.CommandLine -like $Pattern } |
             Select-Object -ExpandProperty ProcessId
-        foreach ($pid in $items) {
-            if ($pid) { $pids += [int]$pid }
+        foreach ($processId in $items) {
+            if ($processId) { $pids += [int]$processId }
         }
     }
     catch {
@@ -68,10 +75,10 @@ function Get-NotifyProcessIds {
 
 function Stop-NotifyProcessGroup {
     param([int[]]$ProcessIds)
-    foreach ($pid in @($ProcessIds | Where-Object { $_ -gt 0 } | Select-Object -Unique)) {
+    foreach ($processId in @($ProcessIds | Where-Object { $_ -gt 0 } | Select-Object -Unique)) {
         try {
-            Start-Process -FilePath 'taskkill.exe' -ArgumentList @('/PID', $pid, '/F', '/T') -WindowStyle Hidden -Wait | Out-Null
-            Write-NotifyWatchdogLog -Message ('taskkill pid={0}' -f $pid)
+            Start-Process -FilePath 'taskkill.exe' -ArgumentList @('/PID', $processId, '/F', '/T') -WindowStyle Hidden -Wait | Out-Null
+            Write-NotifyWatchdogLog -Message ('taskkill pid={0}' -f $processId)
         }
         catch {
         }
@@ -119,8 +126,8 @@ while ($true) {
                 $sshItems = Get-CimInstance Win32_Process -ErrorAction Stop |
                     Where-Object { ($_.Name -eq 'ssh.exe') -and ($_.CommandLine -like ('*127.0.0.1:{0}:127.0.0.1:{0}*' -f $config.Port)) } |
                     Select-Object -ExpandProperty ProcessId
-                foreach ($pid in $sshItems) {
-                    if ($pid) { $sshPids += [int]$pid }
+                foreach ($processId in $sshItems) {
+                    if ($processId) { $sshPids += [int]$processId }
                 }
             }
             catch {

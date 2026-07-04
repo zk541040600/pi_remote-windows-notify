@@ -25,7 +25,7 @@ Windows local machine
         | persistent ssh -R reverse tunnel
         |
 Remote host my
-  Pi extension POST http://127.0.0.1:23117/notify
+  Pi extension POST http://127.0.0.1:23118/notify
 ```
 
 ## First-time remote install
@@ -57,7 +57,7 @@ powershell.exe -ExecutionPolicy Bypass -File .\windows\pi-notify-reverse-tunnel.
 Or ad-hoc SSH:
 
 ```powershell
-ssh -R 127.0.0.1:23117:127.0.0.1:23117 my
+ssh -R 127.0.0.1:23118:127.0.0.1:23118 my
 ```
 
 ## One-shot autostart install
@@ -103,13 +103,13 @@ Installs and enables:
 
 - systemd service: `pi-remote-windows-notify-ensure.service`
 
-It runs at Linux boot and ensures the remote Pi extension/config are restored into `~/.pi/agent/` from a managed copy.
+It runs at Linux boot and ensures the remote Pi extension/config are restored into the selected remote Pi dir (default `~/.pi/agent/`) from a managed copy. If you pass `-RemotePiDir`, the boot-time guard uses that same directory instead of falling back to the default.
 
 ## After autostart is installed
 
 You no longer need to manually add `-R` to your interactive `wt ssh my` command.
 
-The background tunnel task on Windows already keeps `my:127.0.0.1:23117` forwarded back to your Windows machine.
+The background tunnel task on Windows already keeps `my:127.0.0.1:23118` forwarded back to your Windows machine.
 
 ## If Pi is already open on `my`
 
@@ -124,7 +124,7 @@ Run in Pi:
 From `my`:
 
 ```bash
-curl -X POST http://127.0.0.1:23117/notify \
+curl -X POST http://127.0.0.1:23118/notify \
   -H 'Content-Type: application/json' \
   -H 'X-Pi-Notify-Token: <token-from-local-config>' \
   -d '{"title":"Pi","body":"Hello from remote my"}'
@@ -146,7 +146,7 @@ Important keys:
 ```json
 {
   "listenHost": "127.0.0.1",
-  "port": 23117,
+  "port": 23118,
   "remoteHostAlias": "my",
   "sshExecutable": "C:/.../ssh.exe",
   "tunnelRetryDelaySeconds": 5,
@@ -156,6 +156,8 @@ Important keys:
   "token": "..."
 }
 ```
+
+The installers use `sshExecutable` for all SSH probes/uploads and prefer `scp.exe`/`scp` from the same directory as that SSH executable when uploading files.
 
 Remote config also supports:
 
@@ -195,6 +197,7 @@ powershell.exe -ExecutionPolicy Bypass -File .\windows\set-notify-mode.ps1 -Mode
 2. otherwise check the Startup-folder `PiNotify*.vbs` files still exist
 3. run the manual `curl` test from `my`
 4. if Pi was already running before install, run `/reload`
+5. for `system-toast`, check installer warnings about Python/pywin32 shortcut registration; `popup-focus` does not need that shortcut
 
 ### Token mismatch
 
@@ -208,5 +211,5 @@ Check both files use the same token:
 Re-run the installers with a custom port:
 
 ```powershell
-powershell.exe -ExecutionPolicy Bypass -File .\windows\install-autostart-all.ps1 -RemoteHostAlias my -Port 23118
+powershell.exe -ExecutionPolicy Bypass -File .\windows\install-autostart-all.ps1 -RemoteHostAlias my -Port 23119
 ```

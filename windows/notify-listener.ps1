@@ -25,6 +25,7 @@ $Token = $config.Token
 $ConfigPath = $config.ConfigPath
 $DisplayMode = $config.DisplayMode
 $PopupTimeoutSeconds = $config.PopupTimeoutSeconds
+$script:NotifyMaxBodyBytes = 1048576
 $script:NotifyToastEventHandlers = New-Object System.Collections.ArrayList
 $script:NotifyActivationScript = Join-Path $PSScriptRoot 'pi-notify-activate.ps1'
 $script:NotifyPopupScript = Join-Path $PSScriptRoot 'pi-notify-popup.ps1'
@@ -126,7 +127,13 @@ function Read-HttpRequest {
 
     $contentLength = 0
     if ($headers.ContainsKey('Content-Length')) {
-        [int]::TryParse([string]$headers['Content-Length'], [ref]$contentLength) | Out-Null
+        $contentLengthValid = [int]::TryParse([string]$headers['Content-Length'], [ref]$contentLength)
+        if (-not $contentLengthValid -or $contentLength -lt 0) {
+            throw "Invalid Content-Length header."
+        }
+        if ($contentLength -gt $script:NotifyMaxBodyBytes) {
+            throw "HTTP body too large."
+        }
     }
 
     $bodyMemory = [System.IO.MemoryStream]::new()
@@ -161,7 +168,8 @@ function Read-HttpRequest {
 function Get-NotifyBridgeActivationUri {
     param(
         [string]$TargetHost,
-        [string]$CwdBase
+        [string]$CwdBase,
+        [string]$TabTitle
     )
 
     $protocol = Get-NotifyBridgeProtocolName
@@ -171,6 +179,9 @@ function Get-NotifyBridgeActivationUri {
     }
     if (-not [string]::IsNullOrWhiteSpace($CwdBase)) {
         $parts += ('cwdBase=' + [Uri]::EscapeDataString($CwdBase.Trim()))
+    }
+    if (-not [string]::IsNullOrWhiteSpace($TabTitle)) {
+        $parts += ('tabTitle=' + [Uri]::EscapeDataString($TabTitle.Trim()))
     }
 
     if ($parts.Count -gt 0) {
@@ -216,6 +227,7 @@ function Show-Toast {
 
     $focusTarget = $config.RemoteHostAlias
     $cwdBase = ''
+    $tabTitle = ''
     if (-not [string]::IsNullOrWhiteSpace($LaunchUri)) {
         try {
             $parsed = [Uri]$LaunchUri
@@ -227,6 +239,7 @@ function Show-Toast {
                 $value = if ($parts.Length -gt 1) { [Uri]::UnescapeDataString(([string]$parts[1]).Replace('+', ' ')) } else { '' }
                 if ($name -eq 'host' -and -not [string]::IsNullOrWhiteSpace($value)) { $focusTarget = $value }
                 if ($name -eq 'cwdBase' -and -not [string]::IsNullOrWhiteSpace($value)) { $cwdBase = $value }
+                if ($name -eq 'tabTitle' -and -not [string]::IsNullOrWhiteSpace($value)) { $tabTitle = $value }
             }
         }
         catch {
@@ -240,6 +253,7 @@ function Show-Toast {
             body           = $Body
             focusTarget    = $focusTarget
             cwdBase        = $cwdBase
+            tabTitle       = $tabTitle
             timeoutSeconds = $PopupTimeoutSeconds
         }
         [System.IO.File]::WriteAllText($payloadPath, ($payload | ConvertTo-Json -Depth 4), [System.Text.UTF8Encoding]::new($false))
@@ -332,6 +346,7 @@ try {
     while ($true) {
         $client = $listener.AcceptTcpClient()
         $notified = $false
+        $stream = $null
         try {
             $client.ReceiveTimeout = 15000
             $client.SendTimeout = 15000
@@ -380,6 +395,7 @@ try {
             $body = 'Ready for input'
             $focusTarget = [string]$config.RemoteHostAlias
             $cwdBase = ''
+            $tabTitle = ''
             if ($null -ne $payload) {
                 if ($payload.PSObject.Properties['title'] -and -not [string]::IsNullOrWhiteSpace([string]$payload.title)) {
                     $title = [string]$payload.title
@@ -393,12 +409,16 @@ try {
                 if ($payload.PSObject.Properties['cwdBase'] -and -not [string]::IsNullOrWhiteSpace([string]$payload.cwdBase)) {
                     $cwdBase = [string]$payload.cwdBase
                 }
+                if ($payload.PSObject.Properties['tabTitle'] -and -not [string]::IsNullOrWhiteSpace([string]$payload.tabTitle)) {
+                    $tabTitle = [string]$payload.tabTitle
+                }
             }
             $title = if ([string]::IsNullOrWhiteSpace($title)) { 'Pi' } else { $title.Trim() }
             $body = if ([string]::IsNullOrWhiteSpace($body)) { 'Ready for input' } else { $body.Trim() }
-            $launchUri = Get-NotifyBridgeActivationUri -TargetHost $focusTarget -CwdBase $cwdBase
+            $tabTitle = if ([string]::IsNullOrWhiteSpace($tabTitle)) { '' } else { $tabTitle.Trim() }
+            $launchUri = Get-NotifyBridgeActivationUri -TargetHost $focusTarget -CwdBase $cwdBase -TabTitle $tabTitle
 
-            Write-NotifyListenerLog -Message ('notify title="{0}" body="{1}" launchUri="{2}"' -f $title, $body, $launchUri)
+            Write-NotifyListenerLog -Message ('notify title="{0}" body="{1}" tabTitle="{2}" launchUri="{3}"' -f $title, $body, $tabTitle, $launchUri)
             Show-Toast -Title $title -Body $body -ToastAppId $AppId -LaunchUri $launchUri
             $notified = $true
             Write-Host ("[{0}] notify: {1} :: {2}" -f (Get-Date -Format 'HH:mm:ss'), $title, $body)

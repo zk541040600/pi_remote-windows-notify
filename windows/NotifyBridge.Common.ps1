@@ -68,6 +68,24 @@ function Get-NotifyBridgeProtocolName {
     return 'pi-notify'
 }
 
+function Resolve-NotifyBridgePythonExecutable {
+    [CmdletBinding()]
+    param()
+
+    foreach ($name in @('python.exe', 'python', 'py.exe', 'py')) {
+        try {
+            $command = Get-Command $name -ErrorAction Stop
+            if ($command.Source) {
+                return $command.Source
+            }
+        }
+        catch {
+        }
+    }
+
+    return $null
+}
+
 function Resolve-NotifyBridgeWtExecutable {
     [CmdletBinding()]
     param()
@@ -107,6 +125,70 @@ function Resolve-NotifyBridgeSshExecutable {
     catch {
         throw 'Unable to locate ssh.exe for Pi notify bridge tunnel.'
     }
+}
+
+function Resolve-NotifyBridgeScpExecutable {
+    [CmdletBinding()]
+    param(
+        [string]$SshExecutable
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($SshExecutable)) {
+        $sshPath = $SshExecutable
+        try {
+            $sshPath = [System.IO.Path]::GetFullPath($SshExecutable)
+        }
+        catch {
+        }
+
+        $sshDir = Split-Path -Parent $sshPath
+        if ($sshDir) {
+            foreach ($name in @('scp.exe', 'scp')) {
+                $candidate = Join-Path $sshDir $name
+                if (Test-Path -LiteralPath $candidate) {
+                    return [System.IO.Path]::GetFullPath($candidate)
+                }
+            }
+        }
+    }
+
+    foreach ($name in @('scp.exe', 'scp')) {
+        try {
+            $command = Get-Command $name -ErrorAction Stop
+            if ($command.Source) {
+                return $command.Source
+            }
+        }
+        catch {
+        }
+    }
+
+    return 'scp'
+}
+
+function Resolve-NotifyBridgeRemotePath {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RemotePath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$RemoteHome
+    )
+
+    if ([string]::IsNullOrWhiteSpace($RemotePath)) {
+        throw 'Remote Pi directory cannot be empty.'
+    }
+
+    $trimmed = $RemotePath.Trim()
+    $home = $RemoteHome.TrimEnd('/')
+    if ($trimmed -eq '~') {
+        return $home
+    }
+    if ($trimmed.StartsWith('~/')) {
+        return ('{0}/{1}' -f $home, $trimmed.Substring(2))
+    }
+    return $trimmed
 }
 
 function Normalize-NotifyBridgeDisplayMode {
@@ -220,7 +302,7 @@ function Ensure-NotifyBridgeConfig {
         [int]$existing['port']
     }
     else {
-        23117
+        23118
     }
 
     $finalToken = if ($PSBoundParameters.ContainsKey('Token') -and -not [string]::IsNullOrWhiteSpace($Token)) {
@@ -243,7 +325,6 @@ function Ensure-NotifyBridgeConfig {
         'my'
     }
 
-    $detectedSsh = Resolve-NotifyBridgeSshExecutable
     $finalSshExecutable = if ($PSBoundParameters.ContainsKey('SshExecutable') -and -not [string]::IsNullOrWhiteSpace($SshExecutable)) {
         [System.IO.Path]::GetFullPath($SshExecutable)
     }
@@ -251,7 +332,7 @@ function Ensure-NotifyBridgeConfig {
         [System.IO.Path]::GetFullPath([string]$existing['sshExecutable'])
     }
     else {
-        $detectedSsh
+        Resolve-NotifyBridgeSshExecutable
     }
 
     $finalTunnelRetryDelaySeconds = if ($PSBoundParameters.ContainsKey('TunnelRetryDelaySeconds') -and $TunnelRetryDelaySeconds -ge 1) {

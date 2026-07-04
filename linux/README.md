@@ -37,7 +37,8 @@ Then restart Pi or run `/reload`.
 - `PI_NOTIFY_TOKEN` - override token.
 - `PI_NOTIFY_TIMEOUT_MS` - override timeout, clamped to 1000-15000 ms.
 - `PI_NOTIFY_TITLE` - notification title.
-- `PI_NOTIFY_BODY_TEMPLATE` - body template, supports `{host}` and `{cwd}`.
+- `PI_NOTIFY_BODY_TEMPLATE` - body template, supports `{host}`, `{cwd}`, and `{cwdBase}`.
+- `PI_NOTIFY_REMOTE_ALIAS` - Windows listener focus target / remote host alias.
 - `PI_NOTIFY_DISABLED=1` - disable notifications.
 
 Notification failures are ignored so they never break Pi.

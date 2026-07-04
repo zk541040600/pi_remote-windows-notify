@@ -26,13 +26,16 @@ if ($PSBoundParameters.ContainsKey('SshExecutable')) { $configArgs.SshExecutable
 if ($PSBoundParameters.ContainsKey('TunnelRetryDelaySeconds')) { $configArgs.TunnelRetryDelaySeconds = $TunnelRetryDelaySeconds }
 if ($PSBoundParameters.ContainsKey('TunnelStartupDelaySeconds')) { $configArgs.TunnelStartupDelaySeconds = $TunnelStartupDelaySeconds }
 $config = Ensure-NotifyBridgeConfig @configArgs
+$sshExecutable = $config.SshExecutable
+$scpExecutable = Resolve-NotifyBridgeScpExecutable -SshExecutable $sshExecutable
 
-& (Join-Path $PSScriptRoot 'install-remote-windows-notify.ps1') -RemoteHostAlias $RemoteHostAlias -RemotePiDir $RemotePiDir -ConfigPath $config.ConfigPath -ListenHost $config.ListenHost -Port $config.Port -Token $config.Token
-
-$remoteHome = (& ssh $RemoteHostAlias 'printf %s "$HOME"').Trim()
+$remoteHome = (& $sshExecutable $RemoteHostAlias 'printf %s "$HOME"').Trim()
 if ([string]::IsNullOrWhiteSpace($remoteHome)) {
     throw "Failed to resolve remote HOME on $RemoteHostAlias."
 }
+
+$remotePiDirResolved = Resolve-NotifyBridgeRemotePath -RemotePath $RemotePiDir -RemoteHome $remoteHome
+& (Join-Path $PSScriptRoot 'install-remote-windows-notify.ps1') -RemoteHostAlias $RemoteHostAlias -RemotePiDir $remotePiDirResolved -ConfigPath $config.ConfigPath -ListenHost $config.ListenHost -Port $config.Port -Token $config.Token -SshExecutable $sshExecutable
 
 $remoteManagedDir = "$remoteHome/.local/share/pi-notify"
 $remoteServiceName = 'pi-remote-windows-notify-ensure'
@@ -67,7 +70,7 @@ install -m 0644 "$managed_dir/remote-windows-notify.ts" "$pi_dir/extensions/remo
 install -m 0644 "$managed_dir/remote-windows-notify.json" "$pi_dir/remote-windows-notify.json"
 echo "Pi notify bridge ensured in $pi_dir"
 '@
-    $ensureScript = $ensureScript.Replace('__MANAGED_DIR__', $remoteManagedDir).Replace('__PI_DIR__', "$remoteHome/.pi/agent")
+    $ensureScript = $ensureScript.Replace('__MANAGED_DIR__', $remoteManagedDir).Replace('__PI_DIR__', $remotePiDirResolved)
     [System.IO.File]::WriteAllText($tempScript, $ensureScript.TrimStart(), [System.Text.UTF8Encoding]::new($false))
 
     $serviceUnit = @"
@@ -86,22 +89,22 @@ WantedBy=multi-user.target
 "@
     [System.IO.File]::WriteAllText($tempUnit, $serviceUnit.TrimStart(), [System.Text.UTF8Encoding]::new($false))
 
-    & ssh $RemoteHostAlias "mkdir -p '$remoteManagedDir'"
+    & $sshExecutable $RemoteHostAlias "mkdir -p '$remoteManagedDir'"
     if ($LASTEXITCODE -ne 0) { throw "Failed to create remote managed dir on $RemoteHostAlias." }
 
-    & scp -q (Join-Path $PSScriptRoot 'remote-windows-notify.ts') "${RemoteHostAlias}:$remoteManagedDir/remote-windows-notify.ts"
+    & $scpExecutable -q (Join-Path $PSScriptRoot 'remote-windows-notify.ts') "${RemoteHostAlias}:$remoteManagedDir/remote-windows-notify.ts"
     if ($LASTEXITCODE -ne 0) { throw "Failed to upload managed extension to $RemoteHostAlias." }
 
-    & scp -q $tempConfig "${RemoteHostAlias}:$remoteManagedDir/remote-windows-notify.json"
+    & $scpExecutable -q $tempConfig "${RemoteHostAlias}:$remoteManagedDir/remote-windows-notify.json"
     if ($LASTEXITCODE -ne 0) { throw "Failed to upload managed config to $RemoteHostAlias." }
 
-    & scp -q $tempScript "${RemoteHostAlias}:$remoteManagedDir/pi-notify-bridge-ensure.sh"
+    & $scpExecutable -q $tempScript "${RemoteHostAlias}:$remoteManagedDir/pi-notify-bridge-ensure.sh"
     if ($LASTEXITCODE -ne 0) { throw "Failed to upload ensure script to $RemoteHostAlias." }
 
-    & scp -q $tempUnit "${RemoteHostAlias}:$remoteManagedDir/$remoteServiceName.service"
+    & $scpExecutable -q $tempUnit "${RemoteHostAlias}:$remoteManagedDir/$remoteServiceName.service"
     if ($LASTEXITCODE -ne 0) { throw "Failed to upload systemd unit to $RemoteHostAlias." }
 
-    & ssh $RemoteHostAlias "chmod 755 '$remoteManagedDir/pi-notify-bridge-ensure.sh' && install -m 0644 '$remoteManagedDir/$remoteServiceName.service' '$remoteServicePath' && systemctl daemon-reload && systemctl enable --now '$remoteServiceName.service' && systemctl is-enabled '$remoteServiceName.service' && systemctl --no-pager --full status '$remoteServiceName.service' | sed -n '1,20p'"
+    & $sshExecutable $RemoteHostAlias "chmod 755 '$remoteManagedDir/pi-notify-bridge-ensure.sh' && install -m 0644 '$remoteManagedDir/$remoteServiceName.service' '$remoteServicePath' && systemctl daemon-reload && systemctl enable --now '$remoteServiceName.service' && systemctl is-enabled '$remoteServiceName.service' && systemctl --no-pager --full status '$remoteServiceName.service' | sed -n '1,20p'"
     if ($LASTEXITCODE -ne 0) { throw "Failed to enable remote systemd service on $RemoteHostAlias." }
 }
 finally {
@@ -110,5 +113,6 @@ finally {
 
 Write-Host 'Linux Pi notify auto-start installed.'
 Write-Host ('Remote host   : {0}' -f $RemoteHostAlias)
+Write-Host ('Remote Pi dir : {0}' -f $remotePiDirResolved)
 Write-Host ('Managed dir   : {0}' -f $remoteManagedDir)
 Write-Host ('Systemd unit  : {0}' -f $remoteServicePath)

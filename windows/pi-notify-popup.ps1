@@ -4,6 +4,7 @@ param(
     [string]$Body,
     [string]$FocusTarget,
     [string]$CwdBase,
+    [string]$TabTitle,
     [string]$PayloadPath,
     [string]$ConfigPath,
     [int]$TimeoutSeconds = 300,
@@ -90,24 +91,54 @@ function Write-NotifyPopupLog {
     Add-Content -LiteralPath $script:NotifyPopupLogPath -Value $line -Encoding UTF8
 }
 
-if (-not [string]::IsNullOrWhiteSpace($PayloadPath) -and (Test-Path -LiteralPath $PayloadPath)) {
-    try {
-        $payloadText = [System.IO.File]::ReadAllText($PayloadPath, [System.Text.UTF8Encoding]::new($false))
-        $payload = $payloadText | ConvertFrom-Json
+function Read-NotifyPopupPayload {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+        [int]$MaxAttempts = 5
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path)) {
+        return $null
+    }
+
+    $lastError = $null
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        try {
+            $payloadText = [System.IO.File]::ReadAllText($Path, [System.Text.UTF8Encoding]::new($false))
+            if ([string]::IsNullOrWhiteSpace($payloadText)) {
+                return $null
+            }
+            return ($payloadText | ConvertFrom-Json)
+        }
+        catch {
+            $lastError = $_.Exception.Message
+            if ($attempt -lt $MaxAttempts) {
+                Start-Sleep -Milliseconds 40
+            }
+        }
+    }
+
+    Write-NotifyPopupLog -Message ('popup-payload-read-error attempts={0} "{1}"' -f $MaxAttempts, $lastError)
+    return $null
+}
+
+if (-not [string]::IsNullOrWhiteSpace($PayloadPath)) {
+    $payload = Read-NotifyPopupPayload -Path $PayloadPath
+    if ($null -ne $payload) {
         if ($payload.PSObject.Properties['title']) { $Title = [string]$payload.title }
         if ($payload.PSObject.Properties['body']) { $Body = [string]$payload.body }
         if ($payload.PSObject.Properties['focusTarget']) { $FocusTarget = [string]$payload.focusTarget }
         if ($payload.PSObject.Properties['cwdBase']) { $CwdBase = [string]$payload.cwdBase }
+        if ($payload.PSObject.Properties['tabTitle']) { $TabTitle = [string]$payload.tabTitle }
         if ($payload.PSObject.Properties['timeoutSeconds']) { $TimeoutSeconds = [int]$payload.timeoutSeconds }
-    }
-    catch {
-        Write-NotifyPopupLog -Message ('popup-payload-read-error "{0}"' -f $_.Exception.Message)
     }
 }
 
 $Title = if ([string]::IsNullOrWhiteSpace($Title)) { 'Ready for input' } else { $Title }
 $Body = if ([string]::IsNullOrWhiteSpace($Body)) { '' } else { $Body }
 $FocusTarget = if ([string]::IsNullOrWhiteSpace($FocusTarget)) { $config.RemoteHostAlias } else { $FocusTarget }
+$TabTitle = if ([string]::IsNullOrWhiteSpace($TabTitle)) { '' } else { $TabTitle.Trim() }
 
 try {
     $consoleHandle = [PiNotifyConsoleWindow]::GetConsoleWindow()
@@ -118,7 +149,7 @@ try {
 catch {
 }
 
-Write-NotifyPopupLog -Message ('popup-start title="{0}" focusTarget="{1}" cwdBase="{2}" timeout={3}' -f $Title, $FocusTarget, $CwdBase, $TimeoutSeconds)
+Write-NotifyPopupLog -Message ('popup-start title="{0}" focusTarget="{1}" cwdBase="{2}" tabTitle="{3}" timeout={4}' -f $Title, $FocusTarget, $CwdBase, $TabTitle, $TimeoutSeconds)
 
 function Get-NotifyPopupWindows {
     param(
@@ -272,14 +303,15 @@ function Select-NotifyPopupTab {
 function Invoke-NotifyPopupActivation {
     param(
         [string]$TargetHost,
-        [string]$CurrentDirBase
+        [string]$CurrentDirBase,
+        [string]$TargetTabTitle
     )
 
     try {
         $startedAt = [DateTime]::UtcNow
-        Write-NotifyPopupLog -Message ('popup-activate host="{0}" cwdBase="{1}"' -f $TargetHost, $CurrentDirBase)
+        Write-NotifyPopupLog -Message ('popup-activate host="{0}" cwdBase="{1}" tabTitle="{2}"' -f $TargetHost, $CurrentDirBase, $TargetTabTitle)
 
-        $keywords = @($TargetHost, $CurrentDirBase) |
+        $keywords = @($TargetTabTitle, $TargetHost, $CurrentDirBase) |
             Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
             ForEach-Object { $_.Trim() } |
             Select-Object -Unique
@@ -320,6 +352,9 @@ function Invoke-NotifyPopupActivation {
                     if (-not [string]::IsNullOrWhiteSpace($tab.Name) -and $tab.Name.IndexOf($keyword, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
                         $score += 120
                     }
+                }
+                if (-not [string]::IsNullOrWhiteSpace($TargetTabTitle) -and $tab.Name -eq $TargetTabTitle) {
+                    $score += 260
                 }
                 if ($null -ne $cache -and -not [string]::IsNullOrWhiteSpace([string]$cache.tabTitle) -and $tab.Name -eq [string]$cache.tabTitle) {
                     $score += 200
@@ -364,14 +399,14 @@ function Invoke-NotifyPopupActivation {
         if ($null -ne $best.Tab) {
             if (Select-NotifyPopupTab -TabElement $best.Tab) {
                 Write-NotifyPopupLog -Message ('popup-tab-selected "{0}" elapsedMs={1}' -f $best.TabName, [int]([DateTime]::UtcNow - $startedAt).TotalMilliseconds)
-                Save-NotifyPopupCache -Host $TargetHost -CwdBaseValue $CurrentDirBase -WindowTitle $best.Window.Title -TabTitle $best.TabName
+                Save-NotifyPopupCache -TargetHostValue $TargetHost -CwdBaseValue $CurrentDirBase -WindowTitle $best.Window.Title -TabTitle $best.TabName
             }
             else {
                 Write-NotifyPopupLog -Message ('popup-tab-select-failed "{0}" elapsedMs={1}' -f $best.TabName, [int]([DateTime]::UtcNow - $startedAt).TotalMilliseconds)
             }
         }
         else {
-            Save-NotifyPopupCache -Host $TargetHost -CwdBaseValue $CurrentDirBase -WindowTitle $best.Window.Title -TabTitle ''
+            Save-NotifyPopupCache -TargetHostValue $TargetHost -CwdBaseValue $CurrentDirBase -WindowTitle $best.Window.Title -TabTitle ''
         }
     }
     catch {
@@ -442,23 +477,29 @@ $bodyLabel.Cursor = [System.Windows.Forms.Cursors]::Hand
 
 $targetHost = $FocusTarget
 $targetCwdBase = $CwdBase
+$targetTabTitle = $TabTitle
 $didActivate = $false
 $shouldActivate = $false
+$daemonActivating = $false
 
 if ($Daemon) {
-    # Daemon mode: persistent process, FileSystemWatcher triggers popup updates
+    # Daemon mode: persistent process, FileSystemWatcher triggers popup updates.
+    # MouseDown and Click can both fire for one user click; guard so one toast
+    # activation does not spawn duplicate focus attempts.
     $activateAction = {
-        Write-NotifyPopupLog -Message 'popup-click (daemon)'
-        $form.Hide()
-        $timer.Stop()
-        # Trigger activation in background runspace so message loop doesn't block
-        $rs = [powershell]::Create().AddScript({
-            param($scriptPath, $host2, $cwdBase2)
-            . $scriptPath
-            Invoke-NotifyPopupActivation -TargetHost $host2 -CurrentDirBase $cwdBase2
-        })
-        $rs.AddArgument($PSScriptRoot).AddArgument($script:targetHost).AddArgument($script:targetCwdBase) | Out-Null
-        $rs.BeginInvoke() | Out-Null
+        if ($script:daemonActivating) {
+            return
+        }
+        $script:daemonActivating = $true
+        try {
+            Write-NotifyPopupLog -Message 'popup-click (daemon)'
+            $form.Hide()
+            $timer.Stop()
+            Invoke-NotifyPopupActivation -TargetHost $script:targetHost -CurrentDirBase $script:targetCwdBase -TargetTabTitle $script:targetTabTitle
+        }
+        finally {
+            $script:daemonActivating = $false
+        }
     }
 
     $closeAction = {
@@ -501,13 +542,13 @@ if ($Daemon) {
 
     $onPayloadChanged = {
         try {
-            if (-not (Test-Path -LiteralPath $script:PayloadPath)) { return }
-            $payloadText = [System.IO.File]::ReadAllText($script:PayloadPath, [System.Text.UTF8Encoding]::new($false))
-            $payload = $payloadText | ConvertFrom-Json
+            $payload = Read-NotifyPopupPayload -Path $script:PayloadPath
+            if ($null -eq $payload) { return }
             if ($payload.PSObject.Properties['title']) { $script:titleLabel.Text = [string]$payload.title }
             if ($payload.PSObject.Properties['body']) { $script:bodyLabel.Text = [string]$payload.body }
             if ($payload.PSObject.Properties['focusTarget']) { $script:targetHost = [string]$payload.focusTarget }
             if ($payload.PSObject.Properties['cwdBase']) { $script:targetCwdBase = [string]$payload.cwdBase }
+            if ($payload.PSObject.Properties['tabTitle']) { $script:targetTabTitle = [string]$payload.tabTitle }
             if ($payload.PSObject.Properties['timeoutSeconds']) { $script:timer.Interval = [Math]::Max(3000, ([int]$payload.timeoutSeconds * 1000)) }
 
             # Reposition and show form on top without stealing focus
@@ -600,6 +641,6 @@ else {
     [System.Windows.Forms.Application]::Run($form)
 
     if ($shouldActivate) {
-        Invoke-NotifyPopupActivation -TargetHost $targetHost -CurrentDirBase $targetCwdBase
+        Invoke-NotifyPopupActivation -TargetHost $targetHost -CurrentDirBase $targetCwdBase -TargetTabTitle $targetTabTitle
     }
 }

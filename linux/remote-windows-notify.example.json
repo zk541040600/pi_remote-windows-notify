@@ -1,8 +1,8 @@
 {
   "enabled": true,
-  "endpoint": "http://127.0.0.1:23117/notify",
+  "endpoint": "http://127.0.0.1:23118/notify",
   "token": "CHANGE_ME_TO_THE_WINDOWS_LISTENER_TOKEN",
   "timeoutMs": 4000,
   "title": "Pi",
-  "bodyTemplate": "Remote Pi on {host} is ready for input"
+  "bodyTemplate": "host: {host} | cwd: {cwdBase}"
 }

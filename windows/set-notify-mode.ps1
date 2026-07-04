@@ -23,10 +23,17 @@ if ($RestartListener) {
         Get-CimInstance Win32_Process -ErrorAction Stop |
             Where-Object { $_.CommandLine -like '*notify-listener.ps1*' } |
             ForEach-Object {
-                try { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop } catch {}
+                $process = $_
+                try {
+                    Stop-Process -Id $process.ProcessId -Force -ErrorAction Stop
+                }
+                catch {
+                    Write-Warning ('Failed to stop notify-listener process {0}: {1}' -f $process.ProcessId, $_.Exception.Message)
+                }
             }
     }
     catch {
+        Write-Warning ('Failed to enumerate notify-listener processes: {0}' -f $_.Exception.Message)
     }
 
     Start-Sleep -Seconds 2
@@ -42,11 +49,19 @@ if ($RestartListener) {
         $shortcutPath = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Pi Remote.lnk'
         if ((Test-Path -LiteralPath $registerShortcutScript) -and (Test-Path -LiteralPath $noopScript)) {
             $shortcutArgs = ('-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}"' -f $noopScript)
-            $shortcutIcon = ('{0},0' -f (Get-NotifyBridgePowerShellExe))
-            try {
-                & python $registerShortcutScript --shortcut $shortcutPath --target (Get-NotifyBridgePowerShellExe) --arguments $shortcutArgs --workdir (Get-NotifyBridgeBaseDir) --icon $shortcutIcon --app-id 'Pi Remote' | Out-Null
+            $powershellExe = Get-NotifyBridgePowerShellExe
+            $shortcutIcon = ('{0},0' -f $powershellExe)
+            $pythonExe = Resolve-NotifyBridgePythonExecutable
+            if ($pythonExe) {
+                try {
+                    & $pythonExe $registerShortcutScript --shortcut $shortcutPath --target $powershellExe --arguments $shortcutArgs --workdir (Get-NotifyBridgeBaseDir) --icon $shortcutIcon --app-id 'Pi Remote' | Out-Null
+                }
+                catch {
+                    Write-Warning ('Toast shortcut registration failed: {0}' -f $_.Exception.Message)
+                }
             }
-            catch {
+            else {
+                Write-Warning 'Python was not found; Windows native toast AppID shortcut was not registered. popup-focus mode is unaffected.'
             }
         }
     }

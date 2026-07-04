@@ -109,10 +109,17 @@ $installMode = ''
 $toastShortcutPath = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Pi Remote.lnk'
 $shortcutArgs = ('-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}"' -f $noopScript)
 $shortcutIcon = ('{0},0' -f $powershellExe)
-try {
-    & python $registerShortcutScript --shortcut $toastShortcutPath --target $powershellExe --arguments $shortcutArgs --workdir $baseDir --icon $shortcutIcon --app-id 'Pi Remote' | Out-Null
+$pythonExe = Resolve-NotifyBridgePythonExecutable
+if ($pythonExe) {
+    try {
+        & $pythonExe $registerShortcutScript --shortcut $toastShortcutPath --target $powershellExe --arguments $shortcutArgs --workdir $baseDir --icon $shortcutIcon --app-id 'Pi Remote' | Out-Null
+    }
+    catch {
+        Write-Warning ('Toast shortcut registration failed: {0}' -f $_.Exception.Message)
+    }
 }
-catch {
+else {
+    Write-Warning 'Python was not found; Windows native toast AppID shortcut was not registered. popup-focus mode is unaffected.'
 }
 
 $listenerTaskName = 'PiNotifyListener'
@@ -155,11 +162,15 @@ try {
     if (Test-Path -LiteralPath $watchdogVbs) { Remove-Item -LiteralPath $watchdogVbs -Force }
 
     if ($StartNow) {
-        try { Start-ScheduledTask -TaskName $listenerTaskName } catch {}
-        Start-Sleep -Seconds 2
-        try { Start-ScheduledTask -TaskName $tunnelTaskName } catch {}
-        Start-Sleep -Seconds 2
-        try { Start-ScheduledTask -TaskName $watchdogTaskName } catch {}
+        foreach ($taskName in @($listenerTaskName, $tunnelTaskName, $watchdogTaskName)) {
+            try {
+                Start-ScheduledTask -TaskName $taskName -ErrorAction Stop
+            }
+            catch {
+                Write-Warning ('Failed to start scheduled task {0}: {1}' -f $taskName, $_.Exception.Message)
+            }
+            Start-Sleep -Seconds 2
+        }
     }
 }
 catch {

@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { hostname, homedir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 type NotifyConfigFile = {
@@ -32,11 +33,11 @@ type AgentMessageLike = {
   isError?: boolean;
 };
 
-const DEFAULT_ENDPOINT = "http://127.0.0.1:23117/notify";
+const DEFAULT_ENDPOINT = "http://127.0.0.1:23118/notify";
 const DEFAULT_TIMEOUT_MS = 4000;
 const DEFAULT_CONFIG_PATH = join(homedir(), ".pi", "agent", "remote-windows-notify.json");
-
-let cachedConfigPromise: Promise<NotifyConfigFile> | null = null;
+const NOTIFY_SESSION_KEY = `${process.pid.toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+const globalState = globalThis as { __piRemoteWindowsNotifyRegistered?: string | boolean };
 
 function isTruthy(value: string | undefined): boolean {
   return /^(1|true|yes|on)$/i.test((value ?? "").trim());
@@ -152,14 +153,40 @@ function buildDynamicNotification(messages: AgentMessageLike[], config: RuntimeC
   };
 }
 
-async function loadConfigFile(): Promise<NotifyConfigFile> {
-  if (!cachedConfigPromise) {
-    const configPath = process.env.PI_NOTIFY_CONFIG || DEFAULT_CONFIG_PATH;
-    cachedConfigPromise = readFile(configPath, "utf8")
-      .then((raw) => JSON.parse(raw) as NotifyConfigFile)
-      .catch(() => ({}));
+function getExtensionConfigPaths(): string[] {
+  const paths: string[] = [];
+  let current = dirname(fileURLToPath(import.meta.url));
+
+  while (true) {
+    paths.push(join(current, "remote-windows-notify.json"));
+    const parent = dirname(current);
+    if (parent === current) {
+      break;
+    }
+    current = parent;
   }
-  return cachedConfigPromise;
+
+  return paths;
+}
+
+async function loadConfigFile(): Promise<NotifyConfigFile> {
+  const configPaths = [process.env.PI_NOTIFY_CONFIG, ...getExtensionConfigPaths(), DEFAULT_CONFIG_PATH]
+    .filter((value): value is string => Boolean(value));
+  const seen = new Set<string>();
+
+  for (const configPath of configPaths) {
+    if (seen.has(configPath)) {
+      continue;
+    }
+    seen.add(configPath);
+
+    try {
+      return JSON.parse(await readFile(configPath, "utf8")) as NotifyConfigFile;
+    } catch {
+    }
+  }
+
+  return {};
 }
 
 async function getRuntimeConfig(): Promise<RuntimeConfig> {
@@ -188,10 +215,31 @@ function shouldSkipNotificationForThisProcess(): boolean {
   return process.env.PI_SUBAGENT_CHILD === "1";
 }
 
+function normalizeTabTitlePart(value: string, fallback: string): string {
+  const cleaned = value.replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim();
+  return cleaned || fallback;
+}
+
+function getNotifyTabTitle(cwdBase: string): string {
+  const safeCwd = normalizeTabTitlePart(cwdBase, "Pi");
+  return `π - ${safeCwd} · ${NOTIFY_SESSION_KEY}`;
+}
+
+function setTerminalTitle(title: string): void {
+  if (!process.stdout.isTTY) {
+    return;
+  }
+
+  try {
+    process.stdout.write(`\u001b]0;${title}\u0007`);
+  } catch {
+  }
+}
+
 async function notify(
   endpoint: string,
   token: string,
-  payload: { title: string; body: string; focusTarget?: string; cwdBase?: string },
+  payload: { title: string; body: string; focusTarget?: string; cwdBase?: string; tabTitle?: string },
   timeoutMs: number,
 ): Promise<void> {
   const controller = new AbortController();
@@ -218,7 +266,27 @@ async function notify(
   }
 }
 
+function getCurrentNotifyTabTitle(): { cwdBase: string | undefined; tabTitle: string } {
+  const cwdBase = basename(process.cwd()) || undefined;
+  return { cwdBase, tabTitle: getNotifyTabTitle(cwdBase || "") };
+}
+
 export default function remoteWindowsNotify(pi: ExtensionAPI) {
+  if (shouldSkipNotificationForThisProcess() || typeof globalState.__piRemoteWindowsNotifyRegistered === "string") {
+    return;
+  }
+
+  globalState.__piRemoteWindowsNotifyRegistered = NOTIFY_SESSION_KEY;
+
+  pi.on("session_shutdown", () => {
+    if (globalState.__piRemoteWindowsNotifyRegistered === NOTIFY_SESSION_KEY) {
+      delete globalState.__piRemoteWindowsNotifyRegistered;
+    }
+  });
+
+  const initialTitle = getCurrentNotifyTabTitle();
+  setTerminalTitle(initialTitle.tabTitle);
+
   pi.on("agent_end", async (event) => {
     if (shouldSkipNotificationForThisProcess()) {
       return;
@@ -238,13 +306,17 @@ export default function remoteWindowsNotify(pi: ExtensionAPI) {
         ? { title: config.title, body: renderBody(config.bodyTemplate) }
         : buildDynamicNotification(messages, config);
 
+    const { cwdBase, tabTitle } = getCurrentNotifyTabTitle();
+    setTerminalTitle(tabTitle);
+
     await notify(
       config.endpoint,
       config.token,
       {
         ...payload,
         focusTarget: config.remoteHostAlias || undefined,
-        cwdBase: basename(process.cwd()) || undefined,
+        cwdBase,
+        tabTitle,
       },
       config.timeoutMs,
     );

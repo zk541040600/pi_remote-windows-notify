@@ -1,5 +1,7 @@
 # Local runtime/config artifacts
 .pi-notify/
+node_modules/
+package-lock.json
 *.log
 *.tmp
 .DS_Store

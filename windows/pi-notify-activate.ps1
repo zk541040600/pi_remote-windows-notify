@@ -204,7 +204,8 @@ function Select-NotifyTab {
 function Focus-NotifyWindow {
     param(
         [Parameter(Mandatory = $true)]
-        [string[]]$Keywords
+        [string[]]$Keywords,
+        [string]$TargetTabTitle
     )
 
     $normalized = @($Keywords | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { $_.Trim() } | Select-Object -Unique)
@@ -241,6 +242,9 @@ function Focus-NotifyWindow {
 
         foreach ($tab in $tabs) {
             $score = $baseScore
+            if (-not [string]::IsNullOrWhiteSpace($TargetTabTitle) -and $tab.Name -eq $TargetTabTitle) {
+                $score += 260
+            }
             foreach ($keyword in $normalized) {
                 if (-not [string]::IsNullOrWhiteSpace($tab.Name) -and $tab.Name.IndexOf($keyword, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
                     $score += 120
@@ -303,25 +307,30 @@ Write-NotifyActivateLog -Message ('activate-start uri="{0}"' -f $Uri)
 
 $targetHost = $config.RemoteHostAlias
 $cwdBase = ''
+$tabTitle = ''
 if (-not [string]::IsNullOrWhiteSpace($Uri)) {
     try {
         $parsedUri = [Uri]$Uri
         $hostValue = Get-NotifyQueryValue -ParsedUri $parsedUri -Name 'host'
         $cwdBaseValue = Get-NotifyQueryValue -ParsedUri $parsedUri -Name 'cwdBase'
+        $tabTitleValue = Get-NotifyQueryValue -ParsedUri $parsedUri -Name 'tabTitle'
         if (-not [string]::IsNullOrWhiteSpace($hostValue)) {
             $targetHost = $hostValue.Trim()
         }
         if (-not [string]::IsNullOrWhiteSpace($cwdBaseValue)) {
             $cwdBase = $cwdBaseValue.Trim()
         }
+        if (-not [string]::IsNullOrWhiteSpace($tabTitleValue)) {
+            $tabTitle = $tabTitleValue.Trim()
+        }
     }
     catch {
     }
 }
 
-$keywords = @($targetHost, $cwdBase)
-Write-NotifyActivateLog -Message ('activate-target host="{0}" cwdBase="{1}" keywords="{2}"' -f $targetHost, $cwdBase, ($keywords -join ','))
-if (Focus-NotifyWindow -Keywords $keywords) {
+$keywords = @($tabTitle, $targetHost, $cwdBase)
+Write-NotifyActivateLog -Message ('activate-target host="{0}" cwdBase="{1}" tabTitle="{2}" keywords="{3}"' -f $targetHost, $cwdBase, $tabTitle, ($keywords -join ','))
+if (Focus-NotifyWindow -Keywords $keywords -TargetTabTitle $tabTitle) {
     Write-NotifyActivateLog -Message 'activate-focus-success'
     exit 0
 }
