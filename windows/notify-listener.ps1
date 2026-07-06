@@ -191,6 +191,30 @@ function Get-NotifyBridgeActivationUri {
     return ('{0}://focus' -f $protocol)
 }
 
+function Get-NotifyPopupTargetKey {
+    param(
+        [string]$FocusTarget,
+        [string]$CwdBase,
+        [string]$TabTitle
+    )
+
+    $normalizedHost = ''
+    $normalizedCwd = ''
+    $normalizedTab = ''
+    if (-not [string]::IsNullOrWhiteSpace($FocusTarget)) { $normalizedHost = $FocusTarget.Trim().ToLowerInvariant() }
+    if (-not [string]::IsNullOrWhiteSpace($CwdBase)) { $normalizedCwd = $CwdBase.Trim().ToLowerInvariant() }
+    if (-not [string]::IsNullOrWhiteSpace($TabTitle)) { $normalizedTab = $TabTitle.Trim().ToLowerInvariant() }
+
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes((@($normalizedHost, $normalizedCwd, $normalizedTab) -join "`n"))
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        return ([BitConverter]::ToString($sha.ComputeHash($bytes)).Replace('-', '').ToLowerInvariant()).Substring(0, 16)
+    }
+    finally {
+        $sha.Dispose()
+    }
+}
+
 function Invoke-NotifyToastActivation {
     param(
         [string]$LaunchUri
@@ -257,49 +281,58 @@ function Show-Toast {
             timeoutSeconds = $PopupTimeoutSeconds
         }
         [System.IO.File]::WriteAllText($payloadPath, ($payload | ConvertTo-Json -Depth 4), [System.Text.UTF8Encoding]::new($false))
+        $targetKey = Get-NotifyPopupTargetKey -FocusTarget $focusTarget -CwdBase $cwdBase -TabTitle $tabTitle
 
-        # Check if daemon is already running
-        $daemonRunning = $false
+        # ponytail: one popup process per notification. The daemon watcher can
+        # miss later payload writes; short-lived popups are boring and reliable.
         try {
-            $existingDaemons = Get-CimInstance Win32_Process -ErrorAction Stop |
-                Where-Object { $_.CommandLine -like '*pi-notify-popup.ps1*' -and $_.CommandLine -like '*-Daemon*' }
-            if ($existingDaemons) {
-                $daemonRunning = $true
-                Write-NotifyListenerLog -Message 'popup-daemon-already-running'
+            Get-CimInstance Win32_Process -ErrorAction Stop |
+                Where-Object { $_.CommandLine -like '*pi-notify-popup.ps1*' -and $_.CommandLine -like '*-Daemon*' } |
+                ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+        }
+        catch {
+            Write-NotifyListenerLog -Message ('popup-daemon-cleanup-error "{0}"' -f $_.Exception.Message)
+        }
+
+        try {
+            $oldPopups = @(Get-CimInstance Win32_Process -ErrorAction Stop |
+                Where-Object {
+                    $_.CommandLine -like '*pi-notify-popup.ps1*' -and
+                    ($_.CommandLine -like ('*-TargetKey*{0}*' -f $targetKey) -or $_.CommandLine -notlike '*-TargetKey*')
+                })
+            foreach ($oldPopup in $oldPopups) {
+                Stop-Process -Id $oldPopup.ProcessId -Force -ErrorAction SilentlyContinue
+            }
+            if ($oldPopups.Count -gt 0) {
+                Write-NotifyListenerLog -Message ('popup-replaced-old targetKey={0} count={1}' -f $targetKey, $oldPopups.Count)
             }
         }
         catch {
-            Write-NotifyListenerLog -Message ('popup-daemon-check-error "{0}"' -f $_.Exception.Message)
+            Write-NotifyListenerLog -Message ('popup-replace-old-error targetKey={0} "{1}"' -f $targetKey, $_.Exception.Message)
         }
 
-        if (-not $daemonRunning) {
-            # Start daemon process
-            foreach ($pathToClear in @($script:NotifyPopupStdoutLogPath, $script:NotifyPopupStderrLogPath)) {
-                try {
-                    if (Test-Path -LiteralPath $pathToClear) {
-                        Remove-Item -LiteralPath $pathToClear -Force -ErrorAction Stop
-                    }
-                }
-                catch {
+        foreach ($pathToClear in @($script:NotifyPopupStdoutLogPath, $script:NotifyPopupStderrLogPath)) {
+            try {
+                if (Test-Path -LiteralPath $pathToClear) {
+                    Remove-Item -LiteralPath $pathToClear -Force -ErrorAction Stop
                 }
             }
+            catch {
+            }
+        }
 
-            Write-NotifyListenerLog -Message ('popup-daemon-launch title="{0}" focusTarget="{1}" cwdBase="{2}" timeout={3} payload="{4}" stdout="{5}" stderr="{6}"' -f $Title, $focusTarget, $cwdBase, $PopupTimeoutSeconds, $payloadPath, $script:NotifyPopupStdoutLogPath, $script:NotifyPopupStderrLogPath)
-            $popupProcess = Start-Process -FilePath $script:NotifyPowerShellExe -WindowStyle Hidden -ArgumentList @(
-                '-NoProfile',
-                '-STA',
-                '-WindowStyle', 'Hidden',
-                '-ExecutionPolicy', 'Bypass',
-                '-File', $script:NotifyPopupScript,
-                '-ConfigPath', $ConfigPath,
-                '-PayloadPath', $payloadPath,
-                '-Daemon'
-            ) -RedirectStandardOutput $script:NotifyPopupStdoutLogPath -RedirectStandardError $script:NotifyPopupStderrLogPath -PassThru
-            Write-NotifyListenerLog -Message ('popup-daemon-pid {0}' -f $popupProcess.Id)
-        }
-        else {
-            Write-NotifyListenerLog -Message 'popup-daemon-payload-written (watcher will trigger display)'
-        }
+        Write-NotifyListenerLog -Message ('popup-launch title="{0}" focusTarget="{1}" cwdBase="{2}" targetKey={3} timeout={4} payload="{5}" stdout="{6}" stderr="{7}"' -f $Title, $focusTarget, $cwdBase, $targetKey, $PopupTimeoutSeconds, $payloadPath, $script:NotifyPopupStdoutLogPath, $script:NotifyPopupStderrLogPath)
+        $popupProcess = Start-Process -FilePath $script:NotifyPowerShellExe -WindowStyle Hidden -ArgumentList @(
+            '-NoProfile',
+            '-STA',
+            '-WindowStyle', 'Hidden',
+            '-ExecutionPolicy', 'Bypass',
+            '-File', $script:NotifyPopupScript,
+            '-ConfigPath', $ConfigPath,
+            '-PayloadPath', $payloadPath,
+            '-TargetKey', $targetKey
+        ) -RedirectStandardOutput $script:NotifyPopupStdoutLogPath -RedirectStandardError $script:NotifyPopupStderrLogPath -PassThru
+        Write-NotifyListenerLog -Message ('popup-pid {0}' -f $popupProcess.Id)
         return
     }
 

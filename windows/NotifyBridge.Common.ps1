@@ -267,7 +267,9 @@ function Ensure-NotifyBridgeConfig {
         [int]$TunnelRetryDelaySeconds,
         [int]$TunnelStartupDelaySeconds,
         [string]$DisplayMode,
-        [int]$PopupTimeoutSeconds
+        [int]$PopupTimeoutSeconds,
+        [string]$PopupWallpaperPath,
+        [int]$PopupWallpaperOffsetYPixels
     )
 
     $resolvedPath = [System.IO.Path]::GetFullPath($ConfigPath)
@@ -375,6 +377,26 @@ function Ensure-NotifyBridgeConfig {
         300
     }
 
+    $finalPopupWallpaperPath = if ($PSBoundParameters.ContainsKey('PopupWallpaperPath')) {
+        if ([string]::IsNullOrWhiteSpace($PopupWallpaperPath)) { '' } else { [System.IO.Path]::GetFullPath($PopupWallpaperPath.Trim()) }
+    }
+    elseif ($existing.ContainsKey('popupWallpaperPath') -and -not [string]::IsNullOrWhiteSpace([string]$existing['popupWallpaperPath'])) {
+        [string]$existing['popupWallpaperPath']
+    }
+    else {
+        ''
+    }
+
+    $finalPopupWallpaperOffsetYPixels = if ($PSBoundParameters.ContainsKey('PopupWallpaperOffsetYPixels')) {
+        [Math]::Min(200, [Math]::Max(-200, [int]$PopupWallpaperOffsetYPixels))
+    }
+    elseif ($existing.ContainsKey('popupWallpaperOffsetYPixels')) {
+        [Math]::Min(200, [Math]::Max(-200, [int]$existing['popupWallpaperOffsetYPixels']))
+    }
+    else {
+        0
+    }
+
     $config = @{
         listenHost                = $finalHost
         port                      = $finalPort
@@ -387,6 +409,8 @@ function Ensure-NotifyBridgeConfig {
         tunnelStartupDelaySeconds = $finalTunnelStartupDelaySeconds
         displayMode               = $finalDisplayMode
         popupTimeoutSeconds       = $finalPopupTimeoutSeconds
+        popupWallpaperPath        = $finalPopupWallpaperPath
+        popupWallpaperOffsetYPixels = $finalPopupWallpaperOffsetYPixels
         updatedAtUtc              = [DateTime]::UtcNow.ToString('o')
     }
 
@@ -405,5 +429,7 @@ function Ensure-NotifyBridgeConfig {
         TunnelStartupDelaySeconds = $config.tunnelStartupDelaySeconds
         DisplayMode               = $config.displayMode
         PopupTimeoutSeconds       = $config.popupTimeoutSeconds
+        PopupWallpaperPath        = $config.popupWallpaperPath
+        PopupWallpaperOffsetYPixels = $config.popupWallpaperOffsetYPixels
     }
 }

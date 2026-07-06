@@ -6,6 +6,7 @@ param(
     [string]$CwdBase,
     [string]$TabTitle,
     [string]$PayloadPath,
+    [string]$TargetKey,
     [string]$ConfigPath,
     [int]$TimeoutSeconds = 300,
     [switch]$Daemon
@@ -90,6 +91,82 @@ function Write-NotifyPopupLog {
     $line = ('[{0}] {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'), $Message)
     Add-Content -LiteralPath $script:NotifyPopupLogPath -Value $line -Encoding UTF8
 }
+
+function Get-NotifyPopupWallpaperImage {
+    param(
+        [string]$Path
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return $null
+    }
+
+    try {
+        $resolved = [System.IO.Path]::GetFullPath($Path.Trim())
+        if (-not (Test-Path -LiteralPath $resolved -PathType Leaf)) {
+            Write-NotifyPopupLog -Message ('popup-wallpaper-missing "{0}"' -f $resolved)
+            return $null
+        }
+
+        $bytes = [System.IO.File]::ReadAllBytes($resolved)
+        $stream = [System.IO.MemoryStream]::new($bytes)
+        $loaded = $null
+        try {
+            $loaded = [System.Drawing.Image]::FromStream($stream)
+            $bitmap = [System.Drawing.Bitmap]::new($loaded)
+            Write-NotifyPopupLog -Message ('popup-wallpaper-loaded "{0}" {1}x{2}' -f $resolved, $bitmap.Width, $bitmap.Height)
+            return $bitmap
+        }
+        finally {
+            if ($null -ne $loaded) { $loaded.Dispose() }
+            $stream.Dispose()
+        }
+    }
+    catch {
+        Write-NotifyPopupLog -Message ('popup-wallpaper-error "{0}"' -f $_.Exception.Message)
+        return $null
+    }
+}
+
+function Get-NotifyPopupCoverSourceRectangle {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Drawing.Image]$Image,
+        [int]$TargetWidth,
+        [int]$TargetHeight,
+        [int]$VerticalOffsetPixels = 0
+    )
+
+    if ($TargetWidth -le 0 -or $TargetHeight -le 0 -or $Image.Width -le 0 -or $Image.Height -le 0) {
+        return [System.Drawing.Rectangle]::new(0, 0, $Image.Width, $Image.Height)
+    }
+
+    $targetRatio = [double]$TargetWidth / [double]$TargetHeight
+    $imageRatio = [double]$Image.Width / [double]$Image.Height
+    if ($imageRatio -gt $targetRatio) {
+        $sourceWidth = [Math]::Max(1, [int][Math]::Round($Image.Height * $targetRatio))
+        $sourceX = [Math]::Max(0, [int][Math]::Round(($Image.Width - $sourceWidth) / 2))
+        return [System.Drawing.Rectangle]::new($sourceX, 0, $sourceWidth, $Image.Height)
+    }
+
+    $sourceHeight = [Math]::Max(1, [int][Math]::Round($Image.Width / $targetRatio))
+    $maxSourceY = [Math]::Max(0, $Image.Height - $sourceHeight)
+    $sourceY = [int][Math]::Round($maxSourceY / 2)
+    if ($VerticalOffsetPixels -ne 0) {
+        # Positive offset moves the wallpaper down in the popup.
+        $sourceOffsetY = [int][Math]::Round(([double]$VerticalOffsetPixels * [double]$sourceHeight) / [Math]::Max(1, $TargetHeight))
+        $sourceY -= $sourceOffsetY
+    }
+    $sourceY = [Math]::Min($maxSourceY, [Math]::Max(0, $sourceY))
+    return [System.Drawing.Rectangle]::new(0, $sourceY, $Image.Width, $sourceHeight)
+}
+
+$popupWallpaperPath = if ($config.PSObject.Properties['PopupWallpaperPath']) { [string]$config.PopupWallpaperPath } else { '' }
+$script:NotifyPopupWallpaperOffsetYPixels = 0
+if ($config.PSObject.Properties['PopupWallpaperOffsetYPixels']) {
+    try { $script:NotifyPopupWallpaperOffsetYPixels = [int]$config.PopupWallpaperOffsetYPixels } catch { }
+}
+$script:NotifyPopupWallpaperImage = Get-NotifyPopupWallpaperImage -Path $popupWallpaperPath
 
 function Read-NotifyPopupPayload {
     param(
@@ -434,6 +511,29 @@ $panel = New-Object System.Windows.Forms.Panel
 $panel.Dock = [System.Windows.Forms.DockStyle]::Fill
 $panel.BackColor = [System.Drawing.Color]::FromArgb(58, 58, 58)
 $panel.Cursor = [System.Windows.Forms.Cursors]::Hand
+if ($null -ne $script:NotifyPopupWallpaperImage) {
+    $panel.Add_Paint({
+        param($sender, $eventArgs)
+
+        $dest = [System.Drawing.Rectangle]::new(0, 0, $sender.Width, $sender.Height)
+        $source = Get-NotifyPopupCoverSourceRectangle -Image $script:NotifyPopupWallpaperImage -TargetWidth $sender.Width -TargetHeight $sender.Height -VerticalOffsetPixels $script:NotifyPopupWallpaperOffsetYPixels
+        $eventArgs.Graphics.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+        $eventArgs.Graphics.DrawImage($script:NotifyPopupWallpaperImage, $dest, $source, [System.Drawing.GraphicsUnit]::Pixel)
+        # ponytail: one horizontal gradient is enough: readable text on the left,
+        # visible wallpaper detail on the right.
+        $overlay = [System.Drawing.Drawing2D.LinearGradientBrush]::new(
+            $dest,
+            [System.Drawing.Color]::FromArgb(152, 0, 0, 0),
+            [System.Drawing.Color]::FromArgb(58, 0, 0, 0),
+            [System.Drawing.Drawing2D.LinearGradientMode]::Horizontal)
+        try {
+            $eventArgs.Graphics.FillRectangle($overlay, $dest)
+        }
+        finally {
+            $overlay.Dispose()
+        }
+    })
+}
 [void]$form.Controls.Add($panel)
 
 $appLabel = New-Object System.Windows.Forms.Label
@@ -451,7 +551,7 @@ $closeLabel.Size = New-Object System.Drawing.Size(24, 24)
 $closeLabel.Font = New-Object System.Drawing.Font('Segoe UI Symbol', 11, [System.Drawing.FontStyle]::Regular)
 $closeLabel.ForeColor = [System.Drawing.Color]::FromArgb(210, 210, 210)
 $closeLabel.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
-$closeLabel.Text = '×'
+$closeLabel.Text = [string][char]0x00D7
 $closeLabel.Cursor = [System.Windows.Forms.Cursors]::Hand
 [void]$panel.Controls.Add($closeLabel)
 
@@ -474,6 +574,12 @@ $bodyLabel.Text = $Body
 $bodyLabel.AutoEllipsis = $true
 $bodyLabel.Cursor = [System.Windows.Forms.Cursors]::Hand
 [void]$panel.Controls.Add($bodyLabel)
+
+if ($null -ne $script:NotifyPopupWallpaperImage) {
+    foreach ($label in @($appLabel, $closeLabel, $titleLabel, $bodyLabel)) {
+        $label.BackColor = [System.Drawing.Color]::Transparent
+    }
+}
 
 $targetHost = $FocusTarget
 $targetCwdBase = $CwdBase
