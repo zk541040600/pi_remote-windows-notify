@@ -205,6 +205,20 @@ function Normalize-NotifyBridgeDisplayMode {
     return 'system-toast'
 }
 
+function Normalize-NotifyBridgePopupPlacement {
+    [CmdletBinding()]
+    param(
+        [string]$Value
+    )
+
+    $normalized = if ([string]::IsNullOrWhiteSpace($Value)) { '' } else { [string]$Value }
+    $normalized = $normalized.Trim().ToLowerInvariant()
+    if ($normalized -in @('cursor', 'primary', 'right')) {
+        return $normalized
+    }
+    return 'cursor'
+}
+
 function New-NotifyBridgeToken {
     [CmdletBinding()]
     param(
@@ -268,6 +282,7 @@ function Ensure-NotifyBridgeConfig {
         [int]$TunnelStartupDelaySeconds,
         [string]$DisplayMode,
         [int]$PopupTimeoutSeconds,
+        [string]$PopupPlacement,
         [string]$PopupWallpaperPath,
         [int]$PopupWallpaperOffsetYPixels
     )
@@ -377,6 +392,16 @@ function Ensure-NotifyBridgeConfig {
         300
     }
 
+    $finalPopupPlacement = if ($PSBoundParameters.ContainsKey('PopupPlacement')) {
+        Normalize-NotifyBridgePopupPlacement -Value $PopupPlacement
+    }
+    elseif ($existing.ContainsKey('popupPlacement')) {
+        Normalize-NotifyBridgePopupPlacement -Value ([string]$existing['popupPlacement'])
+    }
+    else {
+        'cursor'
+    }
+
     $finalPopupWallpaperPath = if ($PSBoundParameters.ContainsKey('PopupWallpaperPath')) {
         if ([string]::IsNullOrWhiteSpace($PopupWallpaperPath)) { '' } else { [System.IO.Path]::GetFullPath($PopupWallpaperPath.Trim()) }
     }
@@ -409,6 +434,7 @@ function Ensure-NotifyBridgeConfig {
         tunnelStartupDelaySeconds = $finalTunnelStartupDelaySeconds
         displayMode               = $finalDisplayMode
         popupTimeoutSeconds       = $finalPopupTimeoutSeconds
+        popupPlacement            = $finalPopupPlacement
         popupWallpaperPath        = $finalPopupWallpaperPath
         popupWallpaperOffsetYPixels = $finalPopupWallpaperOffsetYPixels
         updatedAtUtc              = [DateTime]::UtcNow.ToString('o')
@@ -429,6 +455,7 @@ function Ensure-NotifyBridgeConfig {
         TunnelStartupDelaySeconds = $config.tunnelStartupDelaySeconds
         DisplayMode               = $config.displayMode
         PopupTimeoutSeconds       = $config.popupTimeoutSeconds
+        PopupPlacement            = $config.popupPlacement
         PopupWallpaperPath        = $config.popupWallpaperPath
         PopupWallpaperOffsetYPixels = $config.popupWallpaperOffsetYPixels
     }

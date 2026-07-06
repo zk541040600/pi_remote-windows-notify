@@ -166,6 +166,7 @@ $script:NotifyPopupWallpaperOffsetYPixels = 0
 if ($config.PSObject.Properties['PopupWallpaperOffsetYPixels']) {
     try { $script:NotifyPopupWallpaperOffsetYPixels = [int]$config.PopupWallpaperOffsetYPixels } catch { }
 }
+$script:NotifyPopupPlacement = if ($config.PSObject.Properties['PopupPlacement']) { [string]$config.PopupPlacement } else { 'cursor' }
 $script:NotifyPopupWallpaperImage = Get-NotifyPopupWallpaperImage -Path $popupWallpaperPath
 
 function Read-NotifyPopupPayload {
@@ -491,6 +492,36 @@ function Invoke-NotifyPopupActivation {
     }
 }
 
+function Get-NotifyPopupWorkingArea {
+    param(
+        [string]$Placement
+    )
+
+    $normalized = if ([string]::IsNullOrWhiteSpace($Placement)) { 'cursor' } else { $Placement.Trim().ToLowerInvariant() }
+    if ($normalized -eq 'cursor') {
+        return [System.Windows.Forms.Screen]::FromPoint([System.Windows.Forms.Cursor]::Position).WorkingArea
+    }
+    if ($normalized -eq 'right') {
+        $best = [System.Windows.Forms.Screen]::AllScreens | Sort-Object { $_.WorkingArea.Right } -Descending | Select-Object -First 1
+        return $best.WorkingArea
+    }
+    return [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+}
+
+function Get-NotifyPopupLocation {
+    param(
+        [int]$Width,
+        [int]$Height,
+        [string]$Placement
+    )
+
+    $workingArea = Get-NotifyPopupWorkingArea -Placement $Placement
+    $margin = 16
+    $x = [Math]::Max($workingArea.Left, $workingArea.Right - $Width - $margin)
+    $y = [Math]::Max($workingArea.Top, $workingArea.Bottom - $Height - $margin)
+    return [System.Drawing.Point]::new($x, $y)
+}
+
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
 $form = New-Object System.Windows.Forms.Form
@@ -658,11 +689,10 @@ if ($Daemon) {
             if ($payload.PSObject.Properties['timeoutSeconds']) { $script:timer.Interval = [Math]::Max(3000, ([int]$payload.timeoutSeconds * 1000)) }
 
             # Reposition and show form on top without stealing focus
-            $workingArea = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
-            $margin = 16
-            $x = [Math]::Max($workingArea.Left, $workingArea.Right - $script:form.Width - $margin)
-            $y = [Math]::Max($workingArea.Top, $workingArea.Bottom - $script:form.Height - $margin)
-            $script:form.Location = New-Object System.Drawing.Point($x, $y)
+            $location = Get-NotifyPopupLocation -Width $script:form.Width -Height $script:form.Height -Placement $script:NotifyPopupPlacement
+            $x = $location.X
+            $y = $location.Y
+            $script:form.Location = $location
             [void][PiNotifyPopupUser32]::SetWindowPos(
                 $script:form.Handle,
                 [PiNotifyPopupUser32]::HWND_TOPMOST,
@@ -719,18 +749,17 @@ else {
     })
 
     $form.Add_Shown({
-        $workingArea = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
-        $margin = 16
-        $x = [Math]::Max($workingArea.Left, $workingArea.Right - $form.Width - $margin)
-        $y = [Math]::Max($workingArea.Top, $workingArea.Bottom - $form.Height - $margin)
-        $form.Location = New-Object System.Drawing.Point($x, $y)
+        $location = Get-NotifyPopupLocation -Width $form.Width -Height $form.Height -Placement $script:NotifyPopupPlacement
+        $x = $location.X
+        $y = $location.Y
+        $form.Location = $location
         # Display on top without stealing keyboard focus (SWP_NOACTIVATE)
         [void][PiNotifyPopupUser32]::SetWindowPos(
             $form.Handle,
             [PiNotifyPopupUser32]::HWND_TOPMOST,
             $x, $y, $form.Width, $form.Height,
             [PiNotifyPopupUser32]::SWP_NOACTIVATE -bor [PiNotifyPopupUser32]::SWP_SHOWWINDOW)
-        Write-NotifyPopupLog -Message ('popup-shown x={0} y={1} w={2} h={3}' -f $x, $y, $form.Width, $form.Height)
+        Write-NotifyPopupLog -Message ('popup-shown x={0} y={1} w={2} h={3} placement={4}' -f $x, $y, $form.Width, $form.Height, $script:NotifyPopupPlacement)
         $timer.Start()
     })
 
