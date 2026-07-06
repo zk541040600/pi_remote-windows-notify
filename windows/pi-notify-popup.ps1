@@ -396,8 +396,26 @@ function Invoke-NotifyPopupActivation {
         Write-NotifyPopupLog -Message ('popup-keywords "{0}"' -f ($keywords -join ','))
 
         $cache = Get-NotifyPopupCache
+        $cacheMatchesTarget = $false
+        $cacheWindowUsable = $false
+        $cacheTabUsable = $false
         if ($null -ne $cache) {
             Write-NotifyPopupLog -Message ('popup-cache host="{0}" cwdBase="{1}" windowTitle="{2}" tabTitle="{3}"' -f $cache.host, $cache.cwdBase, $cache.windowTitle, $cache.tabTitle)
+            $cacheMatchesTarget =
+                [string]::Equals([string]$cache.host, [string]$TargetHost, [System.StringComparison]::OrdinalIgnoreCase) -and
+                [string]::Equals([string]$cache.cwdBase, [string]$CurrentDirBase, [System.StringComparison]::OrdinalIgnoreCase)
+            if ($cacheMatchesTarget) {
+                $cacheWindowTitle = [string]$cache.windowTitle
+                $cacheTabTitle = [string]$cache.tabTitle
+                $cacheWindowUsable = -not [string]::IsNullOrWhiteSpace($cacheWindowTitle) -and (
+                    ([string]::IsNullOrWhiteSpace($CurrentDirBase) -or $cacheWindowTitle.IndexOf($CurrentDirBase, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) -or
+                    (-not [string]::IsNullOrWhiteSpace($TargetTabTitle) -and $cacheWindowTitle.IndexOf($TargetTabTitle, [System.StringComparison]::OrdinalIgnoreCase) -ge 0)
+                )
+                $cacheTabUsable = -not [string]::IsNullOrWhiteSpace($cacheTabTitle) -and (
+                    ([string]::IsNullOrWhiteSpace($CurrentDirBase) -or $cacheTabTitle.IndexOf($CurrentDirBase, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) -or
+                    (-not [string]::IsNullOrWhiteSpace($TargetTabTitle) -and $cacheTabTitle.IndexOf($TargetTabTitle, [System.StringComparison]::OrdinalIgnoreCase) -ge 0)
+                )
+            }
         }
 
         $windows = @(Get-NotifyPopupWindows -TerminalOnly)
@@ -410,7 +428,7 @@ function Invoke-NotifyPopupActivation {
                     $baseScore += 20
                 }
             }
-            if ($null -ne $cache -and -not [string]::IsNullOrWhiteSpace([string]$cache.windowTitle) -and $window.Title -eq [string]$cache.windowTitle) {
+            if ($cacheWindowUsable -and $window.Title -eq [string]$cache.windowTitle) {
                 $baseScore += 80
             }
 
@@ -434,7 +452,7 @@ function Invoke-NotifyPopupActivation {
                 if (-not [string]::IsNullOrWhiteSpace($TargetTabTitle) -and $tab.Name -eq $TargetTabTitle) {
                     $score += 260
                 }
-                if ($null -ne $cache -and -not [string]::IsNullOrWhiteSpace([string]$cache.tabTitle) -and $tab.Name -eq [string]$cache.tabTitle) {
+                if ($cacheTabUsable -and $tab.Name -eq [string]$cache.tabTitle) {
                     $score += 200
                 }
                 Write-NotifyPopupLog -Message ('popup-tab name="{0}" score={1}' -f $tab.Name, $score)
@@ -449,11 +467,13 @@ function Invoke-NotifyPopupActivation {
             }
         }
 
+        if ($null -ne $best -and $best.Score -lt 220 -and (-not [string]::IsNullOrWhiteSpace($CurrentDirBase) -or -not [string]::IsNullOrWhiteSpace($TargetTabTitle))) {
+            Write-NotifyPopupLog -Message ('popup-focus-low-confidence tabTitle="{0}" score={1}' -f $best.TabName, $best.Score)
+            $best = $null
+        }
+
         if ($null -eq $best) {
-            $wtExe = Resolve-NotifyBridgeWtExecutable
-            $arguments = @('-w', '0', 'new-tab', '--title', ("Pi@{0}" -f $TargetHost), 'ssh', $TargetHost)
-            Write-NotifyPopupLog -Message ('popup-focus-miss fallback-wt="{0}" args="{1}" elapsedMs={2}' -f $wtExe, ($arguments -join ' '), [int]([DateTime]::UtcNow - $startedAt).TotalMilliseconds)
-            Start-Process -FilePath $wtExe -ArgumentList $arguments | Out-Null
+            Write-NotifyPopupLog -Message ('popup-focus-miss no-target-open-skipped host="{0}" cwdBase="{1}" tabTitle="{2}" elapsedMs={3}' -f $TargetHost, $CurrentDirBase, $TargetTabTitle, [int]([DateTime]::UtcNow - $startedAt).TotalMilliseconds)
             return
         }
 
