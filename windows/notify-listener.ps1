@@ -13,6 +13,8 @@ $ErrorActionPreference = 'Stop'
 
 . "$PSScriptRoot/NotifyBridge.Common.ps1"
 
+Add-Type -AssemblyName System.Security
+
 $configArgs = @{}
 if ($PSBoundParameters.ContainsKey('ConfigPath')) { $configArgs.ConfigPath = $ConfigPath }
 if ($PSBoundParameters.ContainsKey('ListenHost')) { $configArgs.ListenHost = $ListenHost }
@@ -25,15 +27,15 @@ $Token = $config.Token
 $ConfigPath = $config.ConfigPath
 $DisplayMode = $config.DisplayMode
 $PopupTimeoutSeconds = $config.PopupTimeoutSeconds
-$script:NotifyMaxBodyBytes = 1048576
 $script:NotifyToastEventHandlers = New-Object System.Collections.ArrayList
+$script:NotifyActivationCleanupTimers = New-Object System.Collections.ArrayList
 $script:NotifyActivationScript = Join-Path $PSScriptRoot 'pi-notify-activate.ps1'
 $script:NotifyPopupScript = Join-Path $PSScriptRoot 'pi-notify-popup.ps1'
 $script:NotifyPowerShellExe = Get-NotifyBridgePowerShellExe
 $script:NotifyListenerLogPath = Join-Path (Get-NotifyBridgeLogDir) 'listener.log'
-$script:NotifyPopupStdoutLogPath = Join-Path (Get-NotifyBridgeLogDir) 'popup-stdout.log'
-$script:NotifyPopupStderrLogPath = Join-Path (Get-NotifyBridgeLogDir) 'popup-stderr.log'
+$script:NotifyRecentNotifications = @()
 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $script:NotifyListenerLogPath) | Out-Null
+Clear-NotifyBridgePopupArtifacts -MaxAgeMinutes 10
 
 function Write-NotifyListenerLog {
     param(
@@ -73,6 +75,7 @@ function Read-HttpRequest {
         [System.IO.Stream]$Stream
     )
 
+    $maxBodyBytes = 65536
     $buffer = [byte[]]::new(4096)
     $memory = [System.IO.MemoryStream]::new()
     $headerEnd = -1
@@ -127,17 +130,20 @@ function Read-HttpRequest {
 
     $contentLength = 0
     if ($headers.ContainsKey('Content-Length')) {
-        $contentLengthValid = [int]::TryParse([string]$headers['Content-Length'], [ref]$contentLength)
-        if (-not $contentLengthValid -or $contentLength -lt 0) {
-            throw "Invalid Content-Length header."
-        }
-        if ($contentLength -gt $script:NotifyMaxBodyBytes) {
-            throw "HTTP body too large."
-        }
+        [int]::TryParse([string]$headers['Content-Length'], [ref]$contentLength) | Out-Null
+    }
+    if ($contentLength -lt 0) {
+        throw "Invalid HTTP content length."
+    }
+    if ($contentLength -gt $maxBodyBytes) {
+        throw "HTTP request body too large."
     }
 
     $bodyMemory = [System.IO.MemoryStream]::new()
     $existingBytes = $allBytes.Length - $headerEnd
+    if ($existingBytes -gt $maxBodyBytes) {
+        throw "HTTP request body too large."
+    }
     if ($existingBytes -gt 0) {
         $bodyMemory.Write($allBytes, $headerEnd, $existingBytes)
     }
@@ -166,76 +172,259 @@ function Read-HttpRequest {
 }
 
 function Get-NotifyBridgeActivationUri {
+    param([string]$ActivationId)
+
+    $protocol = Get-NotifyBridgeProtocolName
+    if (-not [string]::IsNullOrWhiteSpace($ActivationId)) {
+        return ('{0}://focus?id={1}' -f $protocol, [Uri]::EscapeDataString($ActivationId.Trim()))
+    }
+    return ('{0}://focus' -f $protocol)
+}
+
+function Get-NotifyPopupTargetKey {
     param(
         [string]$TargetHost,
         [string]$CwdBase,
         [string]$TabTitle
     )
 
-    $protocol = Get-NotifyBridgeProtocolName
-    $parts = @()
-    if (-not [string]::IsNullOrWhiteSpace($TargetHost)) {
-        $parts += ('host=' + [Uri]::EscapeDataString($TargetHost.Trim()))
+    $hostPart = if ([string]::IsNullOrWhiteSpace($TargetHost)) { '' } else { $TargetHost.Trim().ToLowerInvariant() }
+    if (-not [string]::IsNullOrWhiteSpace($TabTitle)) {
+        return ('tab:{0}|{1}' -f $hostPart, $TabTitle.Trim().ToLowerInvariant())
     }
     if (-not [string]::IsNullOrWhiteSpace($CwdBase)) {
-        $parts += ('cwdBase=' + [Uri]::EscapeDataString($CwdBase.Trim()))
+        return ('cwd:{0}|{1}' -f $hostPart, $CwdBase.Trim().ToLowerInvariant())
     }
-    if (-not [string]::IsNullOrWhiteSpace($TabTitle)) {
-        $parts += ('tabTitle=' + [Uri]::EscapeDataString($TabTitle.Trim()))
-    }
-
-    if ($parts.Count -gt 0) {
-        return ('{0}://focus?{1}' -f $protocol, ($parts -join '&'))
-    }
-
-    return ('{0}://focus' -f $protocol)
+    return ('host:{0}' -f $hostPart)
 }
 
-function Get-NotifyPopupTargetKey {
+function Get-NotifyPopupTargetFingerprint {
     param(
-        [string]$FocusTarget,
-        [string]$CwdBase,
-        [string]$TabTitle
+        [Parameter(Mandatory = $true)]
+        [string]$TargetKey
     )
 
-    $normalizedHost = ''
-    $normalizedCwd = ''
-    $normalizedTab = ''
-    if (-not [string]::IsNullOrWhiteSpace($FocusTarget)) { $normalizedHost = $FocusTarget.Trim().ToLowerInvariant() }
-    if (-not [string]::IsNullOrWhiteSpace($CwdBase)) { $normalizedCwd = $CwdBase.Trim().ToLowerInvariant() }
-    if (-not [string]::IsNullOrWhiteSpace($TabTitle)) { $normalizedTab = $TabTitle.Trim().ToLowerInvariant() }
-
-    $bytes = [System.Text.Encoding]::UTF8.GetBytes((@($normalizedHost, $normalizedCwd, $normalizedTab) -join "`n"))
     $sha = [System.Security.Cryptography.SHA256]::Create()
     try {
-        return ([BitConverter]::ToString($sha.ComputeHash($bytes)).Replace('-', '').ToLowerInvariant()).Substring(0, 16)
+        $hash = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($TargetKey))
+        return ([System.BitConverter]::ToString($hash).Replace('-', '').ToLowerInvariant())
     }
     finally {
         $sha.Dispose()
     }
 }
 
-function Invoke-NotifyToastActivation {
+function Protect-NotifyActivationValue {
+    param([string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return '' }
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes([string]$Value)
+    $protected = [System.Security.Cryptography.ProtectedData]::Protect($bytes, $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser)
+    return [Convert]::ToBase64String($protected)
+}
+
+function Save-NotifyToastActivationState {
     param(
-        [string]$LaunchUri
+        [Parameter(Mandatory = $true)]
+        [string]$ActivationId,
+        [string]$FocusTarget,
+        [string]$CwdBase,
+        [string]$TabTitle
     )
 
-    if ([string]::IsNullOrWhiteSpace($LaunchUri)) {
-        return
+    try {
+        $logDirs = @((Get-NotifyBridgeLogDir), (Join-Path (Get-NotifyBridgeDefaultBaseDir) 'logs')) | Select-Object -Unique
+        $payload = @{
+            activationId   = $ActivationId
+            protectedHost  = Protect-NotifyActivationValue -Value $FocusTarget
+            protectedCwd   = Protect-NotifyActivationValue -Value $CwdBase
+            protectedTab   = Protect-NotifyActivationValue -Value $TabTitle
+            expiresAtTicks = [DateTime]::UtcNow.AddMinutes(10).Ticks
+        }
+        $writtenPaths = @()
+        foreach ($logDir in $logDirs) {
+            New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+            foreach ($item in @(Get-ChildItem -LiteralPath $logDir -Filter 'activation-*.json' -File -ErrorAction SilentlyContinue)) {
+                if ($item.LastWriteTime -lt (Get-Date).AddMinutes(-10)) {
+                    Remove-Item -LiteralPath $item.FullName -Force -ErrorAction SilentlyContinue
+                }
+            }
+            $path = Join-Path $logDir ('activation-{0}.json' -f $ActivationId)
+            [System.IO.File]::WriteAllText($path, ($payload | ConvertTo-Json -Depth 4), [System.Text.UTF8Encoding]::new($false))
+            $writtenPaths += $path
+        }
+        $cleanupTimer = [System.Threading.Timer]::new([System.Threading.TimerCallback]{
+            param($state)
+            foreach ($path in @($state)) { try { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue } catch {} }
+        }, @($writtenPaths), [TimeSpan]::FromMinutes(10), [System.Threading.Timeout]::InfiniteTimeSpan)
+        [void]$script:NotifyActivationCleanupTimers.Add($cleanupTimer)
+        while ($script:NotifyActivationCleanupTimers.Count -gt 96) {
+            try { $script:NotifyActivationCleanupTimers[0].Dispose() } catch {}
+            $script:NotifyActivationCleanupTimers.RemoveAt(0)
+        }
+        return @($writtenPaths)
+    }
+    catch {
+        Write-NotifyListenerLog -Message ('activation-cache-write-error "{0}"' -f $_.Exception.Message)
+    }
+}
+
+function Get-NotifyCommandLineArgument {
+    param(
+        [string]$CommandLine,
+        [Parameter(Mandatory = $true)]
+        [string]$Name
+    )
+
+    if ([string]::IsNullOrWhiteSpace($CommandLine)) { return '' }
+    $escapedName = [regex]::Escape($Name)
+    $match = [regex]::Match($CommandLine, ('(?i)-{0}\s+"([^"]*)"' -f $escapedName))
+    if ($match.Success) { return $match.Groups[1].Value }
+    $match = [regex]::Match($CommandLine, ('(?i)-{0}\s+([^\s]+)' -f $escapedName))
+    if ($match.Success) { return $match.Groups[1].Value }
+    return ''
+}
+
+function Get-NotifyPopupPayloadPathFromCommandLine {
+    param([string]$CommandLine)
+    return Get-NotifyCommandLineArgument -CommandLine $CommandLine -Name 'PayloadPath'
+}
+
+function Test-NotifyPathUnderDirectory {
+    param(
+        [string]$Path,
+        [string]$Directory
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path) -or [string]::IsNullOrWhiteSpace($Directory)) { return $false }
+    try {
+        $fullPath = [System.IO.Path]::GetFullPath($Path).TrimEnd([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
+        $fullDirectory = [System.IO.Path]::GetFullPath($Directory).TrimEnd([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
+        return ($fullPath.Equals($fullDirectory, [System.StringComparison]::OrdinalIgnoreCase) -or $fullPath.StartsWith(($fullDirectory + [System.IO.Path]::DirectorySeparatorChar), [System.StringComparison]::OrdinalIgnoreCase))
+    }
+    catch {
+        return $false
+    }
+}
+
+function Get-NotifyPopupProcesses {
+    $rows = @()
+    try {
+        $processes = @(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object { $_.CommandLine -like '*pi-notify-popup.ps1*' })
+        foreach ($process in $processes) {
+            $commandLine = [string]$process.CommandLine
+            $popupConfigPath = Get-NotifyCommandLineArgument -CommandLine $commandLine -Name 'ConfigPath'
+            if ([string]::IsNullOrWhiteSpace($popupConfigPath)) { continue }
+            try {
+                if (-not ([System.IO.Path]::GetFullPath($popupConfigPath).Equals([System.IO.Path]::GetFullPath($ConfigPath), [System.StringComparison]::OrdinalIgnoreCase))) { continue }
+            }
+            catch { continue }
+            $targetFingerprint = Get-NotifyCommandLineArgument -CommandLine $commandLine -Name 'TargetFingerprint'
+            $slot = -1
+            [int]::TryParse((Get-NotifyCommandLineArgument -CommandLine $commandLine -Name 'StackIndex'), [ref]$slot) | Out-Null
+            $rows += [pscustomobject]@{
+                ProcessId         = [int]$process.ProcessId
+                TargetFingerprint = $targetFingerprint
+                StackIndex        = $slot
+            }
+        }
+    }
+    catch {
+        Write-NotifyListenerLog -Message ('popup-process-scan-error "{0}"' -f $_.Exception.Message)
+    }
+    return @($rows)
+}
+
+function Get-NotifyPopupStackPlan {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$TargetKey
+    )
+
+    $targetFingerprint = Get-NotifyPopupTargetFingerprint -TargetKey $TargetKey
+    $usedSlots = @{}
+    $reuseSlot = -1
+    foreach ($popup in Get-NotifyPopupProcesses) {
+        $popupFingerprint = [string]$popup.TargetFingerprint
+        $sameTarget = (-not [string]::IsNullOrWhiteSpace($popupFingerprint) -and $popupFingerprint -eq $targetFingerprint)
+        $slot = [int]$popup.StackIndex
+
+        if ($sameTarget) {
+            if ($slot -ge 0 -and ($reuseSlot -lt 0 -or $slot -lt $reuseSlot)) { $reuseSlot = $slot }
+            try {
+                Stop-Process -Id $popup.ProcessId -Force -ErrorAction Stop
+                Write-NotifyListenerLog -Message ('popup-replace-same-target pid={0} targetFingerprint="{1}" slot={2}' -f $popup.ProcessId, $targetFingerprint, $slot)
+            }
+            catch {
+                Write-NotifyListenerLog -Message ('popup-replace-stop-error pid={0} targetFingerprint="{1}" "{2}"' -f $popup.ProcessId, $targetFingerprint, $_.Exception.Message)
+            }
+            continue
+        }
+
+        if ($slot -ge 0) { $usedSlots[[string]$slot] = $true }
     }
 
-    if (-not (Test-Path -LiteralPath $script:NotifyActivationScript)) {
-        return
+    if ($reuseSlot -ge 0 -and -not $usedSlots.ContainsKey([string]$reuseSlot)) { return $reuseSlot }
+    for ($slot = 0; $slot -lt 64; $slot++) {
+        if (-not $usedSlots.ContainsKey([string]$slot)) { return $slot }
+    }
+    return 63
+}
+
+function Stop-NotifyPopupTarget {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$TargetKey,
+        [string]$Reason = 'dedupe'
+    )
+
+    $targetFingerprint = Get-NotifyPopupTargetFingerprint -TargetKey $TargetKey
+    foreach ($popup in Get-NotifyPopupProcesses) {
+        $popupFingerprint = [string]$popup.TargetFingerprint
+        $sameTarget = (-not [string]::IsNullOrWhiteSpace($popupFingerprint) -and $popupFingerprint -eq $targetFingerprint)
+        if (-not $sameTarget) { continue }
+        try {
+            Stop-Process -Id $popup.ProcessId -Force -ErrorAction Stop
+            Write-NotifyListenerLog -Message ('popup-stop-target pid={0} targetFingerprint="{1}" reason={2}' -f $popup.ProcessId, $targetFingerprint, $Reason)
+        }
+        catch {
+            Write-NotifyListenerLog -Message ('popup-stop-target-error pid={0} targetFingerprint="{1}" reason={2} "{3}"' -f $popup.ProcessId, $targetFingerprint, $Reason, $_.Exception.Message)
+        }
+    }
+}
+
+function Test-NotifyDuplicateDrop {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Title,
+        [Parameter(Mandatory = $true)]
+        [string]$Body,
+        [string]$FocusTarget,
+        [string]$CwdBase,
+        [string]$TabTitle
+    )
+
+    $now = Get-Date
+    $precise = -not [string]::IsNullOrWhiteSpace($CwdBase) -or -not [string]::IsNullOrWhiteSpace($TabTitle)
+    $signature = ('{0}`n{1}`n{2}' -f ([string]$FocusTarget).Trim().ToLowerInvariant(), $Title.Trim(), $Body.Trim())
+    $script:NotifyRecentNotifications = @($script:NotifyRecentNotifications | Where-Object { ($now - $_.Time).TotalSeconds -lt 5 })
+    $matches = @($script:NotifyRecentNotifications | Where-Object { $_.Signature -eq $signature })
+
+    if (-not $precise -and @($matches | Where-Object { $_.Precise }).Count -gt 0) {
+        Write-NotifyListenerLog -Message ('notify-dedup drop-imprecise targetFingerprint="{0}"' -f (Get-NotifyPopupTargetFingerprint -TargetKey $FocusTarget))
+        return $true
     }
 
-    Start-Process -FilePath $script:NotifyPowerShellExe -WindowStyle Hidden -ArgumentList @(
-        '-NoProfile',
-        '-WindowStyle', 'Hidden',
-        '-ExecutionPolicy', 'Bypass',
-        '-File', $script:NotifyActivationScript,
-        '-ConfigPath', $ConfigPath,
-        $LaunchUri
-    ) | Out-Null
+    if ($precise -and @($matches | Where-Object { -not $_.Precise }).Count -gt 0) {
+        $hostKey = Get-NotifyPopupTargetKey -TargetHost $FocusTarget -CwdBase '' -TabTitle ''
+        Stop-NotifyPopupTarget -TargetKey $hostKey -Reason 'dedupe-precise-arrived'
+    }
+
+    $script:NotifyRecentNotifications += [pscustomobject]@{
+        Time      = $now
+        Signature = $signature
+        Precise   = $precise
+    }
+    return $false
 }
 
 function Show-Toast {
@@ -246,93 +435,46 @@ function Show-Toast {
         [string]$Body,
         [Parameter(Mandatory = $true)]
         [string]$ToastAppId,
+        [string]$FocusTarget,
+        [string]$CwdBase,
+        [string]$TabTitle,
         [string]$LaunchUri
     )
 
-    $focusTarget = $config.RemoteHostAlias
-    $cwdBase = ''
-    $tabTitle = ''
-    if (-not [string]::IsNullOrWhiteSpace($LaunchUri)) {
-        try {
-            $parsed = [Uri]$LaunchUri
-            $query = $parsed.Query.TrimStart('?')
-            foreach ($pair in $query -split '&') {
-                if ([string]::IsNullOrWhiteSpace($pair)) { continue }
-                $parts = $pair -split '=', 2
-                $name = [Uri]::UnescapeDataString(([string]$parts[0]).Replace('+', ' '))
-                $value = if ($parts.Length -gt 1) { [Uri]::UnescapeDataString(([string]$parts[1]).Replace('+', ' ')) } else { '' }
-                if ($name -eq 'host' -and -not [string]::IsNullOrWhiteSpace($value)) { $focusTarget = $value }
-                if ($name -eq 'cwdBase' -and -not [string]::IsNullOrWhiteSpace($value)) { $cwdBase = $value }
-                if ($name -eq 'tabTitle' -and -not [string]::IsNullOrWhiteSpace($value)) { $tabTitle = $value }
-            }
-        }
-        catch {
-        }
-    }
+    $focusTarget = if ([string]::IsNullOrWhiteSpace($FocusTarget)) { [string]$config.RemoteHostAlias } else { [string]$FocusTarget }
+    $cwdBase = if ([string]::IsNullOrWhiteSpace($CwdBase)) { '' } else { [string]$CwdBase }
+    $tabTitle = if ([string]::IsNullOrWhiteSpace($TabTitle)) { '' } else { [string]$TabTitle }
 
     if ($DisplayMode -eq 'popup-focus' -and (Test-Path -LiteralPath $script:NotifyPopupScript)) {
-        $payloadPath = Join-Path (Get-NotifyBridgeLogDir) 'popup-payload.json'
-        $payload = @{
-            title          = $Title
-            body           = $Body
-            focusTarget    = $focusTarget
-            cwdBase        = $cwdBase
-            tabTitle       = $tabTitle
-            timeoutSeconds = $PopupTimeoutSeconds
-        }
-        [System.IO.File]::WriteAllText($payloadPath, ($payload | ConvertTo-Json -Depth 4), [System.Text.UTF8Encoding]::new($false))
-        $targetKey = Get-NotifyPopupTargetKey -FocusTarget $focusTarget -CwdBase $cwdBase -TabTitle $tabTitle
+        $targetKey = Get-NotifyPopupTargetKey -TargetHost $focusTarget -CwdBase $cwdBase -TabTitle $tabTitle
+        $stackIndex = Get-NotifyPopupStackPlan -TargetKey $targetKey
+        Clear-NotifyBridgePopupArtifacts -Aggressive
+        $targetFingerprint = Get-NotifyPopupTargetFingerprint -TargetKey $targetKey
 
-        # ponytail: one popup process per notification. The daemon watcher can
-        # miss later payload writes; short-lived popups are boring and reliable.
-        try {
-            Get-CimInstance Win32_Process -ErrorAction Stop |
-                Where-Object { $_.CommandLine -like '*pi-notify-popup.ps1*' -and $_.CommandLine -like '*-Daemon*' } |
-                ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-        }
-        catch {
-            Write-NotifyListenerLog -Message ('popup-daemon-cleanup-error "{0}"' -f $_.Exception.Message)
-        }
-
-        try {
-            $oldPopups = @(Get-CimInstance Win32_Process -ErrorAction Stop |
-                Where-Object {
-                    $_.CommandLine -like '*pi-notify-popup.ps1*' -and
-                    ($_.CommandLine -like ('*-TargetKey*{0}*' -f $targetKey) -or $_.CommandLine -notlike '*-TargetKey*')
-                })
-            foreach ($oldPopup in $oldPopups) {
-                Stop-Process -Id $oldPopup.ProcessId -Force -ErrorAction SilentlyContinue
-            }
-            if ($oldPopups.Count -gt 0) {
-                Write-NotifyListenerLog -Message ('popup-replaced-old targetKey={0} count={1}' -f $targetKey, $oldPopups.Count)
-            }
-        }
-        catch {
-            Write-NotifyListenerLog -Message ('popup-replace-old-error targetKey={0} "{1}"' -f $targetKey, $_.Exception.Message)
-        }
-
-        foreach ($pathToClear in @($script:NotifyPopupStdoutLogPath, $script:NotifyPopupStderrLogPath)) {
-            try {
-                if (Test-Path -LiteralPath $pathToClear) {
-                    Remove-Item -LiteralPath $pathToClear -Force -ErrorAction Stop
-                }
-            }
-            catch {
-            }
-        }
-
-        Write-NotifyListenerLog -Message ('popup-launch title="{0}" focusTarget="{1}" cwdBase="{2}" targetKey={3} timeout={4} payload="{5}" stdout="{6}" stderr="{7}"' -f $Title, $focusTarget, $cwdBase, $targetKey, $PopupTimeoutSeconds, $payloadPath, $script:NotifyPopupStdoutLogPath, $script:NotifyPopupStderrLogPath)
-        $popupProcess = Start-Process -FilePath $script:NotifyPowerShellExe -WindowStyle Hidden -ArgumentList @(
+        Write-NotifyListenerLog -Message ('popup-launch targetFingerprint="{0}" slot={1} timeout={2}' -f $targetFingerprint, $stackIndex, $PopupTimeoutSeconds)
+        $popupArguments = Join-NotifyBridgeProcessArguments @(
             '-NoProfile',
             '-STA',
             '-WindowStyle', 'Hidden',
             '-ExecutionPolicy', 'Bypass',
             '-File', $script:NotifyPopupScript,
             '-ConfigPath', $ConfigPath,
-            '-PayloadPath', $payloadPath,
-            '-TargetKey', $targetKey
-        ) -RedirectStandardOutput $script:NotifyPopupStdoutLogPath -RedirectStandardError $script:NotifyPopupStderrLogPath -PassThru
-        Write-NotifyListenerLog -Message ('popup-pid {0}' -f $popupProcess.Id)
+            '-TargetFingerprint', $targetFingerprint,
+            '-StackIndex', $stackIndex,
+            '-TimeoutSeconds', $PopupTimeoutSeconds
+        )
+        $popupStartInfo = [System.Diagnostics.ProcessStartInfo]::new()
+        $popupStartInfo.FileName = $script:NotifyPowerShellExe
+        $popupStartInfo.Arguments = $popupArguments
+        $popupStartInfo.UseShellExecute = $false
+        $popupStartInfo.CreateNoWindow = $true
+        $popupStartInfo.EnvironmentVariables['PI_NOTIFY_TITLE'] = [string]$Title
+        $popupStartInfo.EnvironmentVariables['PI_NOTIFY_BODY'] = [string]$Body
+        $popupStartInfo.EnvironmentVariables['PI_NOTIFY_FOCUS_TARGET'] = [string]$focusTarget
+        $popupStartInfo.EnvironmentVariables['PI_NOTIFY_CWD_BASE'] = [string]$cwdBase
+        $popupStartInfo.EnvironmentVariables['PI_NOTIFY_TAB_TITLE'] = [string]$tabTitle
+        $popupProcess = [System.Diagnostics.Process]::Start($popupStartInfo)
+        Write-NotifyListenerLog -Message ('popup-pid {0} slot={1} targetFingerprint="{2}"' -f $popupProcess.Id, $stackIndex, $targetFingerprint)
         return
     }
 
@@ -341,26 +483,21 @@ function Show-Toast {
 
     $template = [Windows.UI.Notifications.ToastTemplateType]::ToastText02
     $xml = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent($template)
-    # scenario="reminder" keeps the toast on screen until user dismisses it
-    $toastNode = $xml.SelectSingleNode('/toast')
-    if ($null -ne $toastNode) {
-        $scenarioAttr = $xml.CreateAttribute('scenario')
-        $scenarioAttr.Value = 'reminder'
-        $toastNode.Attributes.Append($scenarioAttr) | Out-Null
-        # reminder scenario requires at least one action
-        $actionsNode = $xml.CreateElement('actions')
-        $actionNode = $xml.CreateElement('action')
-        $actionNode.SetAttribute('content', 'dismiss')
-        $actionNode.SetAttribute('arguments', 'dismiss')
-        $actionsNode.AppendChild($actionNode) | Out-Null
-        $toastNode.AppendChild($actionsNode) | Out-Null
-    }
     $texts = $xml.GetElementsByTagName('text')
     $texts.Item(0).AppendChild($xml.CreateTextNode($Title)) | Out-Null
     $texts.Item(1).AppendChild($xml.CreateTextNode($Body)) | Out-Null
 
-    Write-NotifyListenerLog -Message ('system-toast title="{0}" body="{1}"' -f $Title, $Body)
+    $activationId = [Guid]::NewGuid().ToString('N')
+    $activationPaths = @(Save-NotifyToastActivationState -ActivationId $activationId -FocusTarget $focusTarget -CwdBase $cwdBase -TabTitle $tabTitle)
+    $safeLaunchUri = Get-NotifyBridgeActivationUri -ActivationId $activationId
+    $xml.DocumentElement.SetAttribute('launch', $safeLaunchUri)
+    $xml.DocumentElement.SetAttribute('activationType', 'protocol')
+
+    Write-NotifyListenerLog -Message ('system-toast activationId={0} hasCwd={1} hasTab={2}' -f $activationId, (-not [string]::IsNullOrWhiteSpace($cwdBase)), (-not [string]::IsNullOrWhiteSpace($tabTitle)))
     $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
+    $toast.ExpirationTime = [DateTimeOffset]::Now.AddMinutes(5)
+    # Windows PowerShell 5.1 cannot reliably subscribe to WinRT toast events.
+    # Click activation is handled by the protocol launch URI above.
     [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($ToastAppId).Show($toast)
 }
 
@@ -379,7 +516,6 @@ try {
     while ($true) {
         $client = $listener.AcceptTcpClient()
         $notified = $false
-        $stream = $null
         try {
             $client.ReceiveTimeout = 15000
             $client.SendTimeout = 15000
@@ -391,7 +527,6 @@ try {
             $path = if ($parts.Length -ge 2) { $parts[1] } else { '/' }
 
             if ($method -eq 'GET' -and $path -eq '/health') {
-                Write-NotifyListenerLog -Message 'health-check ok'
                 Write-HttpResponse -Stream $stream -StatusCode 200 -Reason 'OK' -Body '{"ok":true}' -ContentType 'application/json; charset=utf-8'
                 continue
             }
@@ -448,13 +583,28 @@ try {
             }
             $title = if ([string]::IsNullOrWhiteSpace($title)) { 'Pi' } else { $title.Trim() }
             $body = if ([string]::IsNullOrWhiteSpace($body)) { 'Ready for input' } else { $body.Trim() }
-            $tabTitle = if ([string]::IsNullOrWhiteSpace($tabTitle)) { '' } else { $tabTitle.Trim() }
-            $launchUri = Get-NotifyBridgeActivationUri -TargetHost $focusTarget -CwdBase $cwdBase -TabTitle $tabTitle
+            if ([string]::IsNullOrWhiteSpace($cwdBase) -and $body -match '(?i)\bcwd\s*[:=]\s*([^|\u00B7]+)') {
+                $cwdValue = $Matches[1].Trim().Trim('"')
+                $cwdBase = if ([string]::IsNullOrWhiteSpace($cwdValue)) { '' } else { Split-Path -Leaf $cwdValue }
+            }
+            if ($cwdBase.Trim() -match '^\{[^}]+\}$') { $cwdBase = '' }
+            if ($tabTitle.Trim() -match '^\{[^}]+\}$') { $tabTitle = '' }
+            if ($DisplayMode -eq 'popup-focus' -and [string]::IsNullOrWhiteSpace($cwdBase) -and [string]::IsNullOrWhiteSpace($tabTitle)) {
+                Write-NotifyListenerLog -Message ('notify-drop missing-target-metadata targetFingerprint="{0}"' -f (Get-NotifyPopupTargetFingerprint -TargetKey $focusTarget))
+                Write-HttpResponse -Stream $stream -StatusCode 200 -Reason 'OK' -Body 'no-target'
+                continue
+            }
+            if (Test-NotifyDuplicateDrop -Title $title -Body $body -FocusTarget $focusTarget -CwdBase $cwdBase -TabTitle $tabTitle) {
+                Write-HttpResponse -Stream $stream -StatusCode 200 -Reason 'OK' -Body 'dedup'
+                continue
+            }
 
-            Write-NotifyListenerLog -Message ('notify title="{0}" body="{1}" tabTitle="{2}" launchUri="{3}"' -f $title, $body, $tabTitle, $launchUri)
-            Show-Toast -Title $title -Body $body -ToastAppId $AppId -LaunchUri $launchUri
+            $launchUri = Get-NotifyBridgeActivationUri -ActivationId ([Guid]::NewGuid().ToString('N'))
+
+            Write-NotifyListenerLog -Message ('notify targetFingerprint="{0}" hasCwd={1} hasTab={2}' -f (Get-NotifyPopupTargetFingerprint -TargetKey $focusTarget), (-not [string]::IsNullOrWhiteSpace($cwdBase)), (-not [string]::IsNullOrWhiteSpace($tabTitle)))
+            Show-Toast -Title $title -Body $body -ToastAppId $AppId -FocusTarget $focusTarget -CwdBase $cwdBase -TabTitle $tabTitle -LaunchUri $launchUri
             $notified = $true
-            Write-Host ("[{0}] notify: {1} :: {2}" -f (Get-Date -Format 'HH:mm:ss'), $title, $body)
+            Write-Host ("[{0}] notify ok" -f (Get-Date -Format 'HH:mm:ss'))
             Write-HttpResponse -Stream $stream -StatusCode 200 -Reason 'OK' -Body 'ok'
         }
         catch {

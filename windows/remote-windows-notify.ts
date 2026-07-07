@@ -37,7 +37,7 @@ const DEFAULT_ENDPOINT = "http://127.0.0.1:23118/notify";
 const DEFAULT_TIMEOUT_MS = 4000;
 const DEFAULT_CONFIG_PATH = join(homedir(), ".pi", "agent", "remote-windows-notify.json");
 const NOTIFY_SESSION_KEY = `${process.pid.toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
-const globalState = globalThis as { __piRemoteWindowsNotifyRegistered?: string | boolean };
+const globalState = globalThis as { __piRemoteWindowsNotifyRegistered?: boolean };
 
 function isTruthy(value: string | undefined): boolean {
   return /^(1|true|yes|on)$/i.test((value ?? "").trim());
@@ -272,17 +272,11 @@ function getCurrentNotifyTabTitle(): { cwdBase: string | undefined; tabTitle: st
 }
 
 export default function remoteWindowsNotify(pi: ExtensionAPI) {
-  if (shouldSkipNotificationForThisProcess() || typeof globalState.__piRemoteWindowsNotifyRegistered === "string") {
+  if (shouldSkipNotificationForThisProcess() || globalState.__piRemoteWindowsNotifyRegistered) {
     return;
   }
 
-  globalState.__piRemoteWindowsNotifyRegistered = NOTIFY_SESSION_KEY;
-
-  pi.on("session_shutdown", () => {
-    if (globalState.__piRemoteWindowsNotifyRegistered === NOTIFY_SESSION_KEY) {
-      delete globalState.__piRemoteWindowsNotifyRegistered;
-    }
-  });
+  globalState.__piRemoteWindowsNotifyRegistered = true;
 
   const initialTitle = getCurrentNotifyTabTitle();
   setTerminalTitle(initialTitle.tabTitle);

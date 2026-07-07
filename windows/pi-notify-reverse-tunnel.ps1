@@ -28,6 +28,9 @@ $TunnelRetryDelaySeconds = $config.TunnelRetryDelaySeconds
 $TunnelStartupDelaySeconds = $config.TunnelStartupDelaySeconds
 $forwardSpec = ('127.0.0.1:{0}:127.0.0.1:{0}' -f $config.Port)
 $script:NotifyTunnelLogPath = Join-Path (Get-NotifyBridgeLogDir) 'tunnel.log'
+$script:NotifyTunnelPidPath = Join-Path (Get-NotifyBridgeBaseDir) 'tunnel.pid'
+$script:NotifyTunnelMutex = $null
+$script:NotifyTunnelHasLock = $false
 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $script:NotifyTunnelLogPath) | Out-Null
 
 function Write-NotifyTunnelLog {
@@ -36,7 +39,51 @@ function Write-NotifyTunnelLog {
     Add-Content -LiteralPath $script:NotifyTunnelLogPath -Value $line -Encoding UTF8
 }
 
-Write-NotifyTunnelLog -Message ('tunnel-start ssh="{0}" forward="{1}" remote="{2}" startupDelay={3}s retry={4}s' -f $SshExecutable, $forwardSpec, $RemoteHostAlias, $TunnelStartupDelaySeconds, $TunnelRetryDelaySeconds)
+function Enter-NotifyTunnelSingleton {
+    param([int]$Port)
+
+    $mutexName = 'Global\PiNotifyReverseTunnel_{0}' -f $Port
+    $script:NotifyTunnelMutex = [System.Threading.Mutex]::new($false, $mutexName)
+    try {
+        $script:NotifyTunnelHasLock = $script:NotifyTunnelMutex.WaitOne(0, $false)
+    }
+    catch [System.Threading.AbandonedMutexException] {
+        $script:NotifyTunnelHasLock = $true
+    }
+
+    if (-not $script:NotifyTunnelHasLock) {
+        Write-NotifyTunnelLog -Message ('tunnel-singleton-exit port={0} pid={1}' -f $Port, $PID)
+        exit 0
+    }
+
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $script:NotifyTunnelPidPath) | Out-Null
+    Set-Content -LiteralPath $script:NotifyTunnelPidPath -Value ([string]$PID) -Encoding ASCII
+}
+
+function Exit-NotifyTunnelSingleton {
+    try {
+        if (Test-Path -LiteralPath $script:NotifyTunnelPidPath) {
+            $current = [string](Get-Content -LiteralPath $script:NotifyTunnelPidPath -Raw -ErrorAction SilentlyContinue)
+            if ($current.Trim() -eq [string]$PID) {
+                Remove-Item -LiteralPath $script:NotifyTunnelPidPath -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+    catch {
+    }
+
+    if ($script:NotifyTunnelHasLock -and $null -ne $script:NotifyTunnelMutex) {
+        try { $script:NotifyTunnelMutex.ReleaseMutex() } catch {}
+    }
+    if ($null -ne $script:NotifyTunnelMutex) {
+        $script:NotifyTunnelMutex.Dispose()
+    }
+}
+
+Enter-NotifyTunnelSingleton -Port ([int]$config.Port)
+
+try {
+Write-NotifyTunnelLog -Message ('tunnel-start pid={0} ssh="{1}" forward="{2}" remote="{3}" startupDelay={4}s retry={5}s' -f $PID, $SshExecutable, $forwardSpec, $RemoteHostAlias, $TunnelStartupDelaySeconds, $TunnelRetryDelaySeconds)
 if ($TunnelStartupDelaySeconds -gt 0) {
     Start-Sleep -Seconds $TunnelStartupDelaySeconds
 }
@@ -49,6 +96,7 @@ while ($true) {
         '-N',
         '-T',
         '-o', 'BatchMode=yes',
+        '-o', 'ConnectTimeout=10',
         '-o', 'ExitOnForwardFailure=yes',
         '-o', 'ServerAliveInterval=30',
         '-o', 'ServerAliveCountMax=3',
@@ -74,4 +122,8 @@ while ($true) {
     }
 
     Start-Sleep -Seconds $TunnelRetryDelaySeconds
+}
+}
+finally {
+    Exit-NotifyTunnelSingleton
 }

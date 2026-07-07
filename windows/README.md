@@ -10,7 +10,7 @@ This folder implements a reliable **Windows local notification bridge** for runn
 - `pi-notify-watchdog.ps1` — self-heal watchdog for listener/tunnel health
 - `set-notify-mode.ps1` — switch between `system-toast` and `popup-focus`
 - `install-remote-windows-notify.ps1` — installs the remote Pi extension + config
-- `install-windows-autostart.ps1` — registers Windows scheduled tasks or Startup-folder launchers for listener/tunnel/watchdog
+- `install-windows-autostart.ps1` — registers Startup-folder launchers for listener/tunnel/watchdog and removes legacy scheduled tasks
 - `install-linux-autostart.ps1` — installs Linux systemd boot-time remote guard on `my`
 - `install-autostart-all.ps1` — one-shot installer for both Windows + Linux autostart
 - `remote-windows-notify.ts` — Pi extension template installed on the remote host
@@ -31,7 +31,7 @@ Remote host my
 ## First-time remote install
 
 ```powershell
-powershell.exe -ExecutionPolicy Bypass -File .\windows\install-remote-windows-notify.ps1 -RemoteHostAlias my
+powershell.exe -ExecutionPolicy Bypass -File .\scripts\pi-notify\install-remote-windows-notify.ps1 -RemoteHostAlias my
 ```
 
 This creates/updates:
@@ -45,13 +45,13 @@ This creates/updates:
 Start the listener:
 
 ```powershell
-powershell.exe -ExecutionPolicy Bypass -File .\windows\notify-listener.ps1
+powershell.exe -ExecutionPolicy Bypass -File .\scripts\pi-notify\pi-notify-restart-listener.ps1
 ```
 
 Start the reverse tunnel:
 
 ```powershell
-powershell.exe -ExecutionPolicy Bypass -File .\windows\pi-notify-reverse-tunnel.ps1
+powershell.exe -ExecutionPolicy Bypass -File .\scripts\pi-notify\pi-notify-reverse-tunnel.ps1
 ```
 
 Or ad-hoc SSH:
@@ -65,45 +65,58 @@ ssh -R 127.0.0.1:23118:127.0.0.1:23118 my
 ### Windows + Linux together
 
 ```powershell
-powershell.exe -ExecutionPolicy Bypass -File .\windows\install-autostart-all.ps1 -RemoteHostAlias my
+powershell.exe -ExecutionPolicy Bypass -File .\scripts\pi-notify\install-autostart-all.ps1 -RemoteHostAlias my
+# custom remote Pi dir:
+# powershell.exe -ExecutionPolicy Bypass -File .\scripts\pi-notify\install-autostart-all.ps1 -RemoteHostAlias my -RemotePiDir /custom/pi/agent
 ```
 
 ### Windows only
 
 ```powershell
-powershell.exe -ExecutionPolicy Bypass -File .\windows\install-windows-autostart.ps1 -RemoteHostAlias my
+powershell.exe -ExecutionPolicy Bypass -File .\scripts\pi-notify\install-windows-autostart.ps1 -RemoteHostAlias my
 ```
 
 Installer behavior:
 
-- first tries Windows Scheduled Tasks
-- if task registration is denied, automatically falls back to Startup-folder launchers
+- removes legacy scheduled tasks named `PiNotifyListener`, `PiNotifyTunnel`, and `PiNotifyWatchdog`
+- writes Startup-folder launchers for listener/tunnel/watchdog
 
-Possible scheduled-task names:
-
-- `PiNotifyListener`
-- `PiNotifyTunnel`
-- `PiNotifyWatchdog`
-
-Fallback Startup files:
+Startup files:
 
 - `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\PiNotifyListener.vbs`
 - `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\PiNotifyTunnel.vbs`
 - `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\PiNotifyWatchdog.vbs`
 
-They start at user logon. `PiNotifyTunnel` keeps retrying automatically if SSH drops, and `PiNotifyWatchdog` periodically verifies both local listener health and remote loopback tunnel health and restarts the broken side when needed.
+They start at user logon. `PiNotifyListener.vbs` invokes `pi-notify-restart-listener.ps1`, so startup keeps the runner-owned listener invariant instead of launching `notify-listener.ps1` directly. `PiNotifyTunnel` keeps retrying automatically if SSH drops, and `PiNotifyWatchdog` periodically verifies both local listener health and remote loopback tunnel health and restarts the broken side when needed.
+
+## Refresh after pull
+
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File .\scripts\pi-notify\pi-notify-refresh.ps1
+```
+
+By default this sets `popup-focus`, `popupPlacement=cursor`, and a 300 second timeout, syncs Windows runtime files, restarts the listener, and restarts the reverse tunnel. Add `-Pull` to run a fast-forward-only git pull. Add `-SyncRemote` to sync the remote `my` extension/config and update any existing Pi package-cache extension copies. When using a non-default remote Pi directory, pass `-RemotePiDir` together with `-SyncRemote` so refresh updates the same directory that autostart installed. Use `-SkipRemoteSync` only when the remote host is unavailable and you know the remote config is already current.
+
+Run the fixed-root check script when validating from another working directory:
+
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File .\scripts\pi-notify\pi-notify-check.ps1
+```
 
 ### Linux `my` only
 
 ```powershell
-powershell.exe -ExecutionPolicy Bypass -File .\windows\install-linux-autostart.ps1 -RemoteHostAlias my
+powershell.exe -ExecutionPolicy Bypass -File .\scripts\pi-notify\install-linux-autostart.ps1 -RemoteHostAlias my
+# custom remote Pi dir:
+# powershell.exe -ExecutionPolicy Bypass -File .\scripts\pi-notify\install-linux-autostart.ps1 -RemoteHostAlias my -RemotePiDir /custom/pi/agent
 ```
 
-Installs and enables:
+Installs and enables a user-level autostart guard:
 
-- systemd service: `pi-remote-windows-notify-ensure.service`
+- preferred: `systemd --user` service `pi-remote-windows-notify-ensure.service`
+- fallback: user `crontab @reboot` entry when `systemd --user` is unavailable
 
-It runs at Linux boot and ensures the remote Pi extension/config are restored into the selected remote Pi dir (default `~/.pi/agent/`) from a managed copy. If you pass `-RemotePiDir`, the boot-time guard uses that same directory instead of falling back to the default.
+It runs on Linux user startup and ensures the remote Pi extension/config are restored into `-RemotePiDir` from a managed copy. The default remote Pi directory is `~/.pi/agent/`.
 
 ## After autostart is installed
 
@@ -127,19 +140,23 @@ From `my`:
 curl -X POST http://127.0.0.1:23118/notify \
   -H 'Content-Type: application/json' \
   -H 'X-Pi-Notify-Token: <token-from-local-config>' \
-  -d '{"title":"Pi","body":"Hello from remote my"}'
+  -d '{"title":"Pi","body":"Hello from remote my","focusTarget":"my","cwdBase":"manual-test","tabTitle":"manual-test"}'
 ```
 
 Expected result:
 
-- Windows shows a toast
+- Windows shows a toast or popup card
 - response body is `ok`
+
+When `displayMode` is `popup-focus`, include `cwdBase` or `tabTitle`; metadata-free payloads are intentionally dropped as `no-target` so clicks never jump to the wrong terminal.
 
 ## Config
 
 Local config path:
 
 - `%USERPROFILE%\.pi-notify\config.json`
+
+If you pass `-ConfigPath C:\path\to\config.json`, that file's parent directory is the isolated instance base. The instance's `bin\`, `logs\`, `listener.pid`, `tunnel.pid`, and `watchdog.pid` stay under that parent instead of `%USERPROFILE%\.pi-notify`.
 
 Important keys:
 
@@ -153,11 +170,13 @@ Important keys:
   "tunnelStartupDelaySeconds": 15,
   "displayMode": "system-toast",
   "popupTimeoutSeconds": 18,
+  "popupWallpaperPath": "C:/Users/Administrator/.pi-notify/bin/popup-wallpaper.png",
+  "popupPlacement": "cursor",
   "token": "..."
 }
 ```
 
-The installers use `sshExecutable` for all SSH probes/uploads and prefer `scp.exe`/`scp` from the same directory as that SSH executable when uploading files.
+`tunnelStartupDelaySeconds` is normalized to at least 5 seconds to avoid startup races between listener, tunnel, and watchdog.
 
 Remote config also supports:
 
@@ -165,9 +184,28 @@ Remote config also supports:
 {
   "messageMode": "dynamic",
   "title": "Pi",
-  "bodyTemplate": "host: {host} | cwd: {cwdBase}"
+  "bodyTemplate": "host: {host} | cwd: {cwdBase}",
+  "remoteHostAlias": "my"
 }
 ```
+
+Notification payloads may include:
+
+```json
+{
+  "focusTarget": "my",
+  "cwdBase": "project-name",
+  "tabTitle": "π - project-name · sessionKey"
+}
+```
+
+`popup-focus` uses `tabTitle` first, then `cwdBase`. It never opens a new Windows Terminal tab/window as a fallback.
+
+`popupPlacement` controls which monitor gets the popup card:
+
+- `cursor` -> the screen currently containing the mouse pointer
+- `right` -> the right-most screen
+- `primary` -> the Windows primary screen
 
 Template fields:
 
@@ -175,18 +213,26 @@ Template fields:
 - `{cwd}` → full current working directory
 - `{cwdBase}` → current directory basename
 
+The default popup background is bundled as `popup-wallpaper.png` and copied into `%USERPROFILE%\.pi-notify\bin` by install/refresh.
+
 Default behavior is `messageMode: dynamic`: the toast title/body are generated from the last prompt, tool names, and final reply. `bodyTemplate` is used as fallback, or when `messageMode` is set to `static`.
 
 Display modes:
 
-- `system-toast` → Windows native toast, no jump, best for pure reminder mode
-- `popup-focus` → custom popup card, click to jump back to the matching WT/tab
+- `system-toast` → Windows native toast; clicking the toast tries the same safe tab activation path, but it is best for pure reminder mode
+- `popup-focus` → custom no-activate popup card; it does not steal keyboard focus, `x` only closes, clicking the card jumps to the matching Windows Terminal tab. If you manually switch to the target tab first, the popup auto-closes. Popups from different tabs stack upward from the bottom-right; a newer popup from the same tab replaces the older one.
+
+`popup-focus` matching rules:
+
+1. Prefer exact-ish `tabTitle` from the sender (`π - <cwdBase> · <sessionKey>`).
+2. Fall back to `cwdBase` when older senders do not provide `tabTitle`.
+3. If no matching tab is found, log `popup-focus-miss` and do nothing. It does **not** open a new tab/window and does **not** jump to `Windows PowerShell`.
 
 Switch modes:
 
 ```powershell
-powershell.exe -ExecutionPolicy Bypass -File .\windows\set-notify-mode.ps1 -Mode system-toast
-powershell.exe -ExecutionPolicy Bypass -File .\windows\set-notify-mode.ps1 -Mode popup-focus
+powershell.exe -ExecutionPolicy Bypass -File .\scripts\pi-notify\set-notify-mode.ps1 -Mode system-toast
+powershell.exe -ExecutionPolicy Bypass -File .\scripts\pi-notify\set-notify-mode.ps1 -Mode popup-focus -PopupPlacement cursor
 ```
 
 ## Troubleshooting
@@ -197,7 +243,6 @@ powershell.exe -ExecutionPolicy Bypass -File .\windows\set-notify-mode.ps1 -Mode
 2. otherwise check the Startup-folder `PiNotify*.vbs` files still exist
 3. run the manual `curl` test from `my`
 4. if Pi was already running before install, run `/reload`
-5. for `system-toast`, check installer warnings about Python/pywin32 shortcut registration; `popup-focus` does not need that shortcut
 
 ### Token mismatch
 
@@ -211,5 +256,5 @@ Check both files use the same token:
 Re-run the installers with a custom port:
 
 ```powershell
-powershell.exe -ExecutionPolicy Bypass -File .\windows\install-autostart-all.ps1 -RemoteHostAlias my -Port 23119
+powershell.exe -ExecutionPolicy Bypass -File .\scripts\pi-notify\install-autostart-all.ps1 -RemoteHostAlias my -Port 23118
 ```

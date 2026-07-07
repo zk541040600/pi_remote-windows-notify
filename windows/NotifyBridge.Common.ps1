@@ -1,6 +1,8 @@
 Set-StrictMode -Version Latest
+$script:NotifyBridgeActiveConfigPath = $null
+$script:NotifyBridgeActiveBaseDir = $null
 
-function Get-NotifyBridgeBaseDir {
+function Get-NotifyBridgeDefaultBaseDir {
     [CmdletBinding()]
     param()
 
@@ -17,11 +19,38 @@ function Get-NotifyBridgeBaseDir {
     return [System.IO.Path]::Combine($base, '.pi-notify')
 }
 
+function Set-NotifyBridgeActiveConfigPath {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ConfigPath
+    )
+
+    $resolvedPath = [System.IO.Path]::GetFullPath($ConfigPath)
+    $baseDir = Split-Path -Parent $resolvedPath
+    if ([string]::IsNullOrWhiteSpace($baseDir)) {
+        throw "Unable to resolve notify bridge base directory from config path '$ConfigPath'."
+    }
+    $script:NotifyBridgeActiveConfigPath = $resolvedPath
+    $script:NotifyBridgeActiveBaseDir = $baseDir
+    return $resolvedPath
+}
+
+function Get-NotifyBridgeBaseDir {
+    [CmdletBinding()]
+    param()
+
+    if (-not [string]::IsNullOrWhiteSpace($script:NotifyBridgeActiveBaseDir)) {
+        return $script:NotifyBridgeActiveBaseDir
+    }
+    return Get-NotifyBridgeDefaultBaseDir
+}
+
 function Get-NotifyBridgeDefaultConfigPath {
     [CmdletBinding()]
     param()
 
-    return [System.IO.Path]::Combine((Get-NotifyBridgeBaseDir), 'config.json')
+    return [System.IO.Path]::Combine((Get-NotifyBridgeDefaultBaseDir), 'config.json')
 }
 
 function Get-NotifyBridgeBinDir {
@@ -61,6 +90,109 @@ function Get-NotifyBridgePowerShellExe {
     }
 }
 
+
+function ConvertTo-NotifyBridgeProcessArgument {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        [string]$Value
+    )
+
+    if ($null -eq $Value) { return '""' }
+    $text = [string]$Value
+    if ($text.Length -eq 0) { return '""' }
+    if ($text -notmatch '[\s"]') { return $text }
+
+    $builder = [System.Text.StringBuilder]::new()
+    [void]$builder.Append('"')
+    $backslashCount = 0
+    foreach ($ch in $text.ToCharArray()) {
+        if ($ch -eq '\') {
+            $backslashCount += 1
+            continue
+        }
+        if ($ch -eq '"') {
+            if ($backslashCount -gt 0) { [void]$builder.Append(('\' * ($backslashCount * 2))) }
+            [void]$builder.Append('\"')
+            $backslashCount = 0
+            continue
+        }
+        if ($backslashCount -gt 0) {
+            [void]$builder.Append(('\' * $backslashCount))
+            $backslashCount = 0
+        }
+        [void]$builder.Append($ch)
+    }
+    if ($backslashCount -gt 0) { [void]$builder.Append(('\' * ($backslashCount * 2))) }
+    [void]$builder.Append('"')
+    return $builder.ToString()
+}
+
+function Join-NotifyBridgeProcessArguments {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [object[]]$ArgumentList
+    )
+
+    return (@($ArgumentList) | ForEach-Object { ConvertTo-NotifyBridgeProcessArgument -Value ([string]$_) }) -join ' '
+}
+
+function Clear-NotifyBridgePopupArtifacts {
+    [CmdletBinding()]
+    param(
+        [switch]$Aggressive,
+        [int]$MaxAgeMinutes = 10
+    )
+
+    $logDir = Get-NotifyBridgeLogDir
+    if (-not (Test-Path -LiteralPath $logDir)) { return }
+
+    foreach ($legacyName in @('popup-payload.json', 'popup-dedupe.json', 'popup-stdout.log', 'popup-stderr.log')) {
+        Remove-Item -LiteralPath (Join-Path $logDir $legacyName) -Force -ErrorAction SilentlyContinue
+    }
+
+    foreach ($pattern in @('popup-stdout.*.log', 'popup-stderr.*.log')) {
+        foreach ($item in @(Get-ChildItem -LiteralPath $logDir -Filter $pattern -File -ErrorAction SilentlyContinue)) {
+            Remove-Item -LiteralPath $item.FullName -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    $cutoff = (Get-Date).AddMinutes(-[Math]::Max(1, $MaxAgeMinutes))
+    foreach ($item in @(Get-ChildItem -LiteralPath $logDir -Filter 'activation-*.json' -File -ErrorAction SilentlyContinue)) {
+        if ($Aggressive -or $item.LastWriteTime -lt $cutoff) {
+            Remove-Item -LiteralPath $item.FullName -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    foreach ($item in @(Get-ChildItem -LiteralPath $logDir -Filter 'popup-payload.*.json' -File -ErrorAction SilentlyContinue)) {
+        if ($Aggressive -or $item.LastWriteTime -lt $cutoff) {
+            Remove-Item -LiteralPath $item.FullName -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    foreach ($item in @(Get-ChildItem -LiteralPath $logDir -Filter 'popup-dedupe.*.json' -File -ErrorAction SilentlyContinue)) {
+        $remove = [bool]$Aggressive -or $item.LastWriteTime -lt $cutoff
+        if (-not $remove) {
+            try {
+                $state = [System.IO.File]::ReadAllText($item.FullName, [System.Text.UTF8Encoding]::new($false)) | ConvertFrom-Json
+                $ticks = [int64]0
+                if (-not ($state.PSObject.Properties['expiresAtTicks']) -or -not [int64]::TryParse([string]$state.expiresAtTicks, [ref]$ticks) -or $ticks -lt [DateTime]::UtcNow.Ticks) {
+                    $remove = $true
+                }
+            }
+            catch { $remove = $true }
+        }
+        if ($remove) {
+            Remove-Item -LiteralPath $item.FullName -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    if ($Aggressive) {
+        Remove-Item -LiteralPath (Join-Path $logDir 'popup-cache.json') -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Get-NotifyBridgeProtocolName {
     [CmdletBinding()]
     param()
@@ -68,22 +200,185 @@ function Get-NotifyBridgeProtocolName {
     return 'pi-notify'
 }
 
-function Resolve-NotifyBridgePythonExecutable {
+function Register-NotifyBridgeProtocolHandler {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$PowerShellExe,
+        [Parameter(Mandatory = $true)]
+        [string]$ActivationScript,
+        [Parameter(Mandatory = $true)]
+        [string]$ConfigPathValue
+    )
+
+    $protocolName = Get-NotifyBridgeProtocolName
+    $protocolRoot = ('Registry::HKEY_CURRENT_USER\Software\Classes\{0}' -f $protocolName)
+    $commandKey = Join-Path $protocolRoot 'shell\open\command'
+    $commandValue = ('"{0}" -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{1}" -ConfigPath "{2}" "%1"' -f $PowerShellExe, $ActivationScript, $ConfigPathValue)
+
+    New-Item -Path $protocolRoot -Force | Out-Null
+    Set-Item -Path $protocolRoot -Value ('URL:{0} Protocol' -f $protocolName)
+    New-ItemProperty -Path $protocolRoot -Name 'URL Protocol' -Value '' -PropertyType String -Force | Out-Null
+    New-Item -Path $commandKey -Force | Out-Null
+    Set-Item -Path $commandKey -Value $commandValue
+
+    return ('{0}://focus' -f $protocolName)
+}
+
+function Add-NotifyBridgeShortcutPropertyStoreType {
     [CmdletBinding()]
     param()
 
-    foreach ($name in @('python.exe', 'python', 'py.exe', 'py')) {
-        try {
-            $command = Get-Command $name -ErrorAction Stop
-            if ($command.Source) {
-                return $command.Source
-            }
+    if ('PiNotifyShortcutProperty' -as [type]) { return }
+
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+[StructLayout(LayoutKind.Sequential, Pack = 4)]
+public struct PROPERTYKEY
+{
+    public Guid fmtid;
+    public uint pid;
+
+    public PROPERTYKEY(Guid fmtid, uint pid)
+    {
+        this.fmtid = fmtid;
+        this.pid = pid;
+    }
+}
+
+[StructLayout(LayoutKind.Sequential)]
+public struct PROPVARIANT
+{
+    public ushort vt;
+    public ushort wReserved1;
+    public ushort wReserved2;
+    public ushort wReserved3;
+    public IntPtr pwszVal;
+
+    public static PROPVARIANT FromString(string value)
+    {
+        return new PROPVARIANT
+        {
+            vt = 31,
+            pwszVal = Marshal.StringToCoTaskMemUni(value ?? String.Empty)
+        };
+    }
+}
+
+[ComImport]
+[InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+[Guid("886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99")]
+public interface IPropertyStore
+{
+    void GetCount(out uint cProps);
+    void GetAt(uint iProp, out PROPERTYKEY pkey);
+    void GetValue(ref PROPERTYKEY key, out PROPVARIANT pv);
+    void SetValue(ref PROPERTYKEY key, ref PROPVARIANT pv);
+    void Commit();
+}
+
+public static class PiNotifyShortcutProperty
+{
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode, PreserveSig = false)]
+    private static extern void SHGetPropertyStoreFromParsingName(
+        string pszPath,
+        IntPtr pbc,
+        uint flags,
+        ref Guid riid,
+        out IPropertyStore propertyStore);
+
+    [DllImport("ole32.dll")]
+    private static extern int PropVariantClear(ref PROPVARIANT pvar);
+
+    public static void SetAppUserModelId(string shortcutPath, string appId)
+    {
+        Guid iidPropertyStore = new Guid("886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99");
+        IPropertyStore store;
+        SHGetPropertyStoreFromParsingName(shortcutPath, IntPtr.Zero, 0x00000002, ref iidPropertyStore, out store);
+        PROPERTYKEY appIdKey = new PROPERTYKEY(new Guid("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3"), 5);
+        PROPVARIANT value = PROPVARIANT.FromString(appId);
+        try
+        {
+            store.SetValue(ref appIdKey, ref value);
+            store.Commit();
         }
-        catch {
+        finally
+        {
+            PropVariantClear(ref value);
+            if (store != null) Marshal.ReleaseComObject(store);
+        }
+    }
+}
+'@
+}
+
+function Register-NotifyBridgeToastShortcut {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$BinDir,
+        [string]$ToastAppId = 'Pi Remote'
+    )
+
+    $noopScript = Join-Path $BinDir 'pi-notify-noop.ps1'
+    if (-not (Test-Path -LiteralPath $noopScript)) {
+        $noopScript = Join-Path $PSScriptRoot 'pi-notify-noop.ps1'
+    }
+    $shortcutPath = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Pi Remote.lnk'
+    if (-not (Test-Path -LiteralPath $noopScript)) {
+        throw ('Toast noop target not found: {0}' -f $noopScript)
+    }
+
+    $shortcutArgs = ('-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}"' -f $noopScript)
+    $shortcutIcon = ('{0},0' -f (Get-NotifyBridgePowerShellExe))
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $shortcutPath) | Out-Null
+    $shell = New-Object -ComObject WScript.Shell
+    $shortcut = $shell.CreateShortcut($shortcutPath)
+    $shortcut.TargetPath = Get-NotifyBridgePowerShellExe
+    $shortcut.Arguments = $shortcutArgs
+    $shortcut.WorkingDirectory = Get-NotifyBridgeBaseDir
+    $shortcut.IconLocation = $shortcutIcon
+    $shortcut.Save()
+
+    Add-NotifyBridgeShortcutPropertyStoreType
+    [PiNotifyShortcutProperty]::SetAppUserModelId($shortcutPath, $ToastAppId)
+    if (-not (Test-Path -LiteralPath $shortcutPath)) {
+        throw ('Toast shortcut/AUMID registration failed: {0}' -f $shortcutPath)
+    }
+    return $shortcutPath
+}
+
+function Register-NotifyBridgeSystemToastSupport {
+    [CmdletBinding()]
+    param(
+        [string]$ConfigPathValue,
+        [string]$ToastAppId = 'Pi Remote'
+    )
+
+    if ([string]::IsNullOrWhiteSpace($ConfigPathValue)) {
+        if (-not [string]::IsNullOrWhiteSpace($script:NotifyBridgeActiveConfigPath)) {
+            $ConfigPathValue = $script:NotifyBridgeActiveConfigPath
+        }
+        else {
+            $ConfigPathValue = Get-NotifyBridgeDefaultConfigPath
         }
     }
 
-    return $null
+    $binDir = Get-NotifyBridgeBinDir
+    $activationScript = Join-Path $binDir 'pi-notify-activate.ps1'
+    if (-not (Test-Path -LiteralPath $activationScript)) {
+        $activationScript = Join-Path $PSScriptRoot 'pi-notify-activate.ps1'
+    }
+    $powerShellExe = Get-NotifyBridgePowerShellExe
+    $protocolUri = Register-NotifyBridgeProtocolHandler -PowerShellExe $powerShellExe -ActivationScript $activationScript -ConfigPathValue $ConfigPathValue
+    $shortcutPath = Register-NotifyBridgeToastShortcut -BinDir $binDir -ToastAppId $ToastAppId
+    return [pscustomobject]@{
+        ProtocolUri  = $protocolUri
+        ShortcutPath = $shortcutPath
+        AppId        = $ToastAppId
+    }
 }
 
 function Resolve-NotifyBridgeWtExecutable {
@@ -127,68 +422,47 @@ function Resolve-NotifyBridgeSshExecutable {
     }
 }
 
-function Resolve-NotifyBridgeScpExecutable {
+function Resolve-NotifyBridgeExecutableValue {
     [CmdletBinding()]
     param(
-        [string]$SshExecutable
+        [Parameter(Mandatory = $true)]
+        [string]$Value
     )
 
-    if (-not [string]::IsNullOrWhiteSpace($SshExecutable)) {
-        $sshPath = $SshExecutable
-        try {
-            $sshPath = [System.IO.Path]::GetFullPath($SshExecutable)
-        }
-        catch {
-        }
-
-        $sshDir = Split-Path -Parent $sshPath
-        if ($sshDir) {
-            foreach ($name in @('scp.exe', 'scp')) {
-                $candidate = Join-Path $sshDir $name
-                if (Test-Path -LiteralPath $candidate) {
-                    return [System.IO.Path]::GetFullPath($candidate)
-                }
-            }
-        }
+    $trimmed = $Value.Trim()
+    if ([string]::IsNullOrWhiteSpace($trimmed)) {
+        return $trimmed
     }
 
-    foreach ($name in @('scp.exe', 'scp')) {
-        try {
-            $command = Get-Command $name -ErrorAction Stop
-            if ($command.Source) {
-                return $command.Source
-            }
-        }
-        catch {
-        }
+    $hasDirectory = -not [string]::IsNullOrWhiteSpace([System.IO.Path]::GetDirectoryName($trimmed))
+    if ([System.IO.Path]::IsPathRooted($trimmed) -or $hasDirectory) {
+        return [System.IO.Path]::GetFullPath($trimmed)
     }
 
-    return 'scp'
+    return $trimmed
 }
 
-function Resolve-NotifyBridgeRemotePath {
+function Test-NotifyBridgeExecutableAvailable {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
-        [string]$RemotePath,
-
-        [Parameter(Mandatory = $true)]
-        [string]$RemoteHome
+        [string]$Value
     )
 
-    if ([string]::IsNullOrWhiteSpace($RemotePath)) {
-        throw 'Remote Pi directory cannot be empty.'
+    $resolved = Resolve-NotifyBridgeExecutableValue -Value $Value
+    if ([string]::IsNullOrWhiteSpace($resolved)) { return $false }
+    $hasDirectory = -not [string]::IsNullOrWhiteSpace([System.IO.Path]::GetDirectoryName($resolved))
+    if ([System.IO.Path]::IsPathRooted($resolved) -or $hasDirectory) {
+        return (Test-Path -LiteralPath $resolved)
     }
 
-    $trimmed = $RemotePath.Trim()
-    $home = $RemoteHome.TrimEnd('/')
-    if ($trimmed -eq '~') {
-        return $home
+    try {
+        $null = Get-Command $resolved -ErrorAction Stop
+        return $true
     }
-    if ($trimmed.StartsWith('~/')) {
-        return ('{0}/{1}' -f $home, $trimmed.Substring(2))
+    catch {
+        return $false
     }
-    return $trimmed
 }
 
 function Normalize-NotifyBridgeDisplayMode {
@@ -226,7 +500,13 @@ function New-NotifyBridgeToken {
     )
 
     $buffer = [byte[]]::new($Bytes)
-    [System.Security.Cryptography.RandomNumberGenerator]::Fill($buffer)
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    try {
+        $rng.GetBytes($buffer)
+    }
+    finally {
+        if ($null -ne $rng) { $rng.Dispose() }
+    }
     return ([Convert]::ToBase64String($buffer).TrimEnd('=' )).Replace('+', '-').Replace('/', '_')
 }
 
@@ -287,7 +567,7 @@ function Ensure-NotifyBridgeConfig {
         [int]$PopupWallpaperOffsetYPixels
     )
 
-    $resolvedPath = [System.IO.Path]::GetFullPath($ConfigPath)
+    $resolvedPath = Set-NotifyBridgeActiveConfigPath -ConfigPath $ConfigPath
     $existing = @{}
 
     if (Test-Path -LiteralPath $resolvedPath) {
@@ -343,10 +623,10 @@ function Ensure-NotifyBridgeConfig {
     }
 
     $finalSshExecutable = if ($PSBoundParameters.ContainsKey('SshExecutable') -and -not [string]::IsNullOrWhiteSpace($SshExecutable)) {
-        [System.IO.Path]::GetFullPath($SshExecutable)
+        Resolve-NotifyBridgeExecutableValue -Value $SshExecutable
     }
-    elseif ($existing.ContainsKey('sshExecutable') -and -not [string]::IsNullOrWhiteSpace([string]$existing['sshExecutable']) -and (Test-Path -LiteralPath ([string]$existing['sshExecutable']))) {
-        [System.IO.Path]::GetFullPath([string]$existing['sshExecutable'])
+    elseif ($existing.ContainsKey('sshExecutable') -and -not [string]::IsNullOrWhiteSpace([string]$existing['sshExecutable']) -and (Test-NotifyBridgeExecutableAvailable -Value ([string]$existing['sshExecutable']))) {
+        Resolve-NotifyBridgeExecutableValue -Value ([string]$existing['sshExecutable'])
     }
     else {
         Resolve-NotifyBridgeSshExecutable
@@ -362,10 +642,10 @@ function Ensure-NotifyBridgeConfig {
         5
     }
 
-    $finalTunnelStartupDelaySeconds = if ($PSBoundParameters.ContainsKey('TunnelStartupDelaySeconds') -and $TunnelStartupDelaySeconds -ge 0) {
+    $finalTunnelStartupDelaySeconds = if ($PSBoundParameters.ContainsKey('TunnelStartupDelaySeconds') -and $TunnelStartupDelaySeconds -ge 5) {
         $TunnelStartupDelaySeconds
     }
-    elseif ($existing.ContainsKey('tunnelStartupDelaySeconds') -and [int]$existing['tunnelStartupDelaySeconds'] -ge 0) {
+    elseif ($existing.ContainsKey('tunnelStartupDelaySeconds') -and [int]$existing['tunnelStartupDelaySeconds'] -ge 5) {
         [int]$existing['tunnelStartupDelaySeconds']
     }
     else {
@@ -389,7 +669,7 @@ function Ensure-NotifyBridgeConfig {
         [int]$existing['popupTimeoutSeconds']
     }
     else {
-        300
+        18
     }
 
     $finalPopupPlacement = if ($PSBoundParameters.ContainsKey('PopupPlacement')) {
@@ -409,7 +689,9 @@ function Ensure-NotifyBridgeConfig {
         [string]$existing['popupWallpaperPath']
     }
     else {
-        ''
+        $bundledWallpaper = Join-Path (Get-NotifyBridgeBinDir) 'popup-wallpaper.png'
+        $sourceWallpaper = Join-Path $PSScriptRoot 'popup-wallpaper.png'
+        if ((Test-Path -LiteralPath $bundledWallpaper) -or (Test-Path -LiteralPath $sourceWallpaper)) { $bundledWallpaper } else { '' }
     }
 
     $finalPopupWallpaperOffsetYPixels = if ($PSBoundParameters.ContainsKey('PopupWallpaperOffsetYPixels')) {

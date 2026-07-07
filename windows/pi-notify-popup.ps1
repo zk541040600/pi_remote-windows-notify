@@ -4,12 +4,12 @@ param(
     [string]$Body,
     [string]$FocusTarget,
     [string]$CwdBase,
-    [string]$TabTitle,
+    [string]$SourceTabTitle,
     [string]$PayloadPath,
-    [string]$TargetKey,
+    [string]$TargetFingerprint,
     [string]$ConfigPath,
-    [int]$TimeoutSeconds = 300,
-    [switch]$Daemon
+    [int]$TimeoutSeconds = 18,
+    [int]$StackIndex = 0
 )
 
 Set-StrictMode -Version Latest
@@ -21,10 +21,26 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
-Add-Type @"
+Add-Type -ReferencedAssemblies System.Windows.Forms,System.Drawing @"
 using System;
 using System.Runtime.InteropServices;
 using System.Text;
+
+public class PiNotifyNoActivateForm : System.Windows.Forms.Form {
+    protected override bool ShowWithoutActivation {
+        get { return true; }
+    }
+
+    protected override System.Windows.Forms.CreateParams CreateParams {
+        get {
+            const int WS_EX_NOACTIVATE = 0x08000000;
+            const int WS_EX_TOOLWINDOW = 0x00000080;
+            System.Windows.Forms.CreateParams cp = base.CreateParams;
+            cp.ExStyle |= WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW;
+            return cp;
+        }
+    }
+}
 
 public static class PiNotifyConsoleWindow {
     [DllImport("kernel32.dll")]
@@ -56,30 +72,32 @@ public static class PiNotifyPopupUser32 {
     public static extern bool SetForegroundWindow(IntPtr hWnd);
 
     [DllImport("user32.dll")]
+    public static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll")]
     public static extern bool IsIconic(IntPtr hWnd);
 
     [DllImport("user32.dll")]
     public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
-
-    [DllImport("user32.dll")]
-    public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
-
-    [DllImport("user32.dll")]
-    public static extern IntPtr GetForegroundWindow();
-
-    public static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
-    public const uint SWP_NOACTIVATE = 0x0010;
-    public const uint SWP_SHOWWINDOW = 0x0040;
-    public const uint SWP_NOMOVE = 0x0002;
-    public const uint SWP_NOSIZE = 0x0001;
 }
 "@
 
 $configArgs = @{}
 if ($PSBoundParameters.ContainsKey('ConfigPath')) { $configArgs.ConfigPath = $ConfigPath }
 $config = Ensure-NotifyBridgeConfig @configArgs
+$PopupPlacement = if ([string]::IsNullOrWhiteSpace([string]$config.PopupPlacement)) { 'cursor' } else { [string]$config.PopupPlacement }
+if ([string]::IsNullOrWhiteSpace($Title) -and -not [string]::IsNullOrWhiteSpace($env:PI_NOTIFY_TITLE)) { $Title = $env:PI_NOTIFY_TITLE }
+if ([string]::IsNullOrWhiteSpace($Body) -and -not [string]::IsNullOrWhiteSpace($env:PI_NOTIFY_BODY)) { $Body = $env:PI_NOTIFY_BODY }
+if ([string]::IsNullOrWhiteSpace($FocusTarget) -and -not [string]::IsNullOrWhiteSpace($env:PI_NOTIFY_FOCUS_TARGET)) { $FocusTarget = $env:PI_NOTIFY_FOCUS_TARGET }
+if ([string]::IsNullOrWhiteSpace($CwdBase) -and -not [string]::IsNullOrWhiteSpace($env:PI_NOTIFY_CWD_BASE)) { $CwdBase = $env:PI_NOTIFY_CWD_BASE }
+if ([string]::IsNullOrWhiteSpace($SourceTabTitle) -and -not [string]::IsNullOrWhiteSpace($env:PI_NOTIFY_TAB_TITLE)) { $SourceTabTitle = $env:PI_NOTIFY_TAB_TITLE }
 $script:NotifyPopupLogPath = Join-Path (Get-NotifyBridgeLogDir) 'popup.log'
 $script:NotifyPopupCachePath = Join-Path (Get-NotifyBridgeLogDir) 'popup-cache.json'
+$popupWallpaperPath = if ($config.PSObject.Properties['PopupWallpaperPath']) { [string]$config.PopupWallpaperPath } else { '' }
+$script:NotifyPopupWallpaperOffsetYPixels = 0
+if ($config.PSObject.Properties['PopupWallpaperOffsetYPixels']) {
+    try { $script:NotifyPopupWallpaperOffsetYPixels = [int]$config.PopupWallpaperOffsetYPixels } catch { }
+}
 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $script:NotifyPopupLogPath) | Out-Null
 
 function Write-NotifyPopupLog {
@@ -93,13 +111,9 @@ function Write-NotifyPopupLog {
 }
 
 function Get-NotifyPopupWallpaperImage {
-    param(
-        [string]$Path
-    )
+    param([string]$Path)
 
-    if ([string]::IsNullOrWhiteSpace($Path)) {
-        return $null
-    }
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $null }
 
     try {
         $resolved = [System.IO.Path]::GetFullPath($Path.Trim())
@@ -153,7 +167,6 @@ function Get-NotifyPopupCoverSourceRectangle {
     $maxSourceY = [Math]::Max(0, $Image.Height - $sourceHeight)
     $sourceY = [int][Math]::Round($maxSourceY / 2)
     if ($VerticalOffsetPixels -ne 0) {
-        # Positive offset moves the wallpaper down in the popup.
         $sourceOffsetY = [int][Math]::Round(([double]$VerticalOffsetPixels * [double]$sourceHeight) / [Math]::Max(1, $TargetHeight))
         $sourceY -= $sourceOffsetY
     }
@@ -161,62 +174,109 @@ function Get-NotifyPopupCoverSourceRectangle {
     return [System.Drawing.Rectangle]::new(0, $sourceY, $Image.Width, $sourceHeight)
 }
 
-$popupWallpaperPath = if ($config.PSObject.Properties['PopupWallpaperPath']) { [string]$config.PopupWallpaperPath } else { '' }
-$script:NotifyPopupWallpaperOffsetYPixels = 0
-if ($config.PSObject.Properties['PopupWallpaperOffsetYPixels']) {
-    try { $script:NotifyPopupWallpaperOffsetYPixels = [int]$config.PopupWallpaperOffsetYPixels } catch { }
+function Get-NotifyPopupContextFingerprint {
+    param([string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return '' }
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $hash = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes(([string]$Value).Trim()))
+        return ([System.BitConverter]::ToString($hash).Replace('-', '').ToLowerInvariant()).Substring(0, 12)
+    }
+    finally {
+        $sha.Dispose()
+    }
 }
-$script:NotifyPopupPlacement = if ($config.PSObject.Properties['PopupPlacement']) { [string]$config.PopupPlacement } else { 'cursor' }
+
 $script:NotifyPopupWallpaperImage = Get-NotifyPopupWallpaperImage -Path $popupWallpaperPath
 
-function Read-NotifyPopupPayload {
+function Get-NotifyPopupDedupeSignature {
+    param(
+        [string]$TitleValue,
+        [string]$BodyValue,
+        [string]$FocusTargetValue
+    )
+
+    $text = ('{0}`n{1}`n{2}' -f ([string]$FocusTargetValue).Trim().ToLowerInvariant(), ([string]$TitleValue).Trim(), ([string]$BodyValue).Trim())
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $hash = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($text))
+        return ([System.BitConverter]::ToString($hash).Replace('-', '').ToLowerInvariant())
+    }
+    finally {
+        $sha.Dispose()
+    }
+}
+
+function Get-NotifyPopupDedupeState {
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path)) { return $null }
+    try { return ([System.IO.File]::ReadAllText($Path, [System.Text.UTF8Encoding]::new($false)) | ConvertFrom-Json) }
+    catch { return $null }
+}
+
+function Test-NotifyPopupDedupeStateFresh {
+    param($State)
+
+    if ($null -eq $State -or -not $State.PSObject.Properties['expiresAtTicks']) { return $false }
+    $expiresAtTicks = [int64]0
+    if (-not [int64]::TryParse([string]$State.expiresAtTicks, [ref]$expiresAtTicks)) { return $false }
+    return ($expiresAtTicks -gt [DateTime]::UtcNow.Ticks)
+}
+
+function Save-NotifyPopupDedupeState {
     param(
         [Parameter(Mandatory = $true)]
         [string]$Path,
-        [int]$MaxAttempts = 5
+        [bool]$Precise,
+        [string]$PayloadPathValue
     )
 
-    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path)) {
-        return $null
-    }
-
-    $lastError = $null
-    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
-        try {
-            $payloadText = [System.IO.File]::ReadAllText($Path, [System.Text.UTF8Encoding]::new($false))
-            if ([string]::IsNullOrWhiteSpace($payloadText)) {
-                return $null
-            }
-            return ($payloadText | ConvertFrom-Json)
-        }
-        catch {
-            $lastError = $_.Exception.Message
-            if ($attempt -lt $MaxAttempts) {
-                Start-Sleep -Milliseconds 40
-            }
-        }
-    }
-
-    Write-NotifyPopupLog -Message ('popup-payload-read-error attempts={0} "{1}"' -f $MaxAttempts, $lastError)
-    return $null
+    # Dedupe state is kept in the listener process; live popups must not leave
+    # popup-dedupe.*.json files behind for auditors/users to clean up.
+    return
 }
 
-if (-not [string]::IsNullOrWhiteSpace($PayloadPath)) {
-    $payload = Read-NotifyPopupPayload -Path $PayloadPath
-    if ($null -ne $payload) {
-        if ($payload.PSObject.Properties['title']) { $Title = [string]$payload.title }
-        if ($payload.PSObject.Properties['body']) { $Body = [string]$payload.body }
-        if ($payload.PSObject.Properties['focusTarget']) { $FocusTarget = [string]$payload.focusTarget }
-        if ($payload.PSObject.Properties['cwdBase']) { $CwdBase = [string]$payload.cwdBase }
-        if ($payload.PSObject.Properties['tabTitle']) { $TabTitle = [string]$payload.tabTitle }
-        if ($payload.PSObject.Properties['timeoutSeconds']) { $TimeoutSeconds = [int]$payload.timeoutSeconds }
-    }
+function Initialize-NotifyPopupDedupe {
+    param(
+        [string]$TitleValue,
+        [string]$BodyValue,
+        [string]$FocusTargetValue,
+        [string]$CwdBaseValue,
+        [string]$SourceTabTitleValue,
+        [string]$PayloadPathValue
+    )
+
+    $precise = -not [string]::IsNullOrWhiteSpace($CwdBaseValue) -or -not [string]::IsNullOrWhiteSpace($SourceTabTitleValue)
+    $signature = Get-NotifyPopupDedupeSignature -TitleValue $TitleValue -BodyValue $BodyValue -FocusTargetValue $FocusTargetValue
+    return [pscustomobject]@{ Drop = $false; Path = ''; Precise = $precise }
+}
+
+function Test-NotifyPopupDedupeSuperseded {
+    if ($script:NotifyPopupIsPrecise) { return $false }
+    $state = Get-NotifyPopupDedupeState -Path $script:NotifyPopupDedupePath
+    if (-not (Test-NotifyPopupDedupeStateFresh -State $state)) { return $false }
+    if (-not ($state.PSObject.Properties['precise']) -or -not ([bool]$state.precise)) { return $false }
+    if ($state.PSObject.Properties['pid'] -and ([string]$state.pid -eq [string]$PID)) { return $false }
+    return $true
 }
 
 $Title = if ([string]::IsNullOrWhiteSpace($Title)) { 'Ready for input' } else { $Title }
 $Body = if ([string]::IsNullOrWhiteSpace($Body)) { '' } else { $Body }
 $FocusTarget = if ([string]::IsNullOrWhiteSpace($FocusTarget)) { $config.RemoteHostAlias } else { $FocusTarget }
-$TabTitle = if ([string]::IsNullOrWhiteSpace($TabTitle)) { '' } else { $TabTitle.Trim() }
+
+if (([string]$CwdBase).Trim() -match '^\{[^}]+\}$') { $CwdBase = '' }
+if (([string]$SourceTabTitle).Trim() -match '^\{[^}]+\}$') { $SourceTabTitle = '' }
+if ([string]::IsNullOrWhiteSpace($CwdBase) -and [string]::IsNullOrWhiteSpace($SourceTabTitle)) {
+    Write-NotifyPopupLog -Message ('popup-drop missing-target-metadata targetFingerprint={0}' -f (Get-NotifyPopupContextFingerprint -Value $FocusTarget))
+    exit 0
+}
+
+$dedupe = Initialize-NotifyPopupDedupe -TitleValue $Title -BodyValue $Body -FocusTargetValue $FocusTarget -CwdBaseValue $CwdBase -SourceTabTitleValue $SourceTabTitle -PayloadPathValue $PayloadPath
+$script:NotifyPopupDedupePath = [string]$dedupe.Path
+$script:NotifyPopupIsPrecise = [bool]$dedupe.Precise
+if ([bool]$dedupe.Drop) { exit 0 }
 
 try {
     $consoleHandle = [PiNotifyConsoleWindow]::GetConsoleWindow()
@@ -227,7 +287,7 @@ try {
 catch {
 }
 
-Write-NotifyPopupLog -Message ('popup-start title="{0}" focusTarget="{1}" cwdBase="{2}" tabTitle="{3}" timeout={4}' -f $Title, $FocusTarget, $CwdBase, $TabTitle, $TimeoutSeconds)
+Write-NotifyPopupLog -Message ('popup-start targetFingerprint={0} hasCwd={1} hasTab={2} timeout={3} stackIndex={4}' -f (Get-NotifyPopupContextFingerprint -Value $FocusTarget), (-not [string]::IsNullOrWhiteSpace($CwdBase)), (-not [string]::IsNullOrWhiteSpace($SourceTabTitle)), $TimeoutSeconds, $StackIndex)
 
 function Get-NotifyPopupWindows {
     param(
@@ -299,16 +359,18 @@ function Save-NotifyPopupCache {
         [string]$TargetHostValue,
         [string]$CwdBaseValue,
         [string]$WindowTitle,
-        [string]$TabTitle
+        [string]$TabTitle,
+        [int]$TabIndex = -1
     )
 
     try {
         $payload = @{
-            host      = $TargetHostValue
-            cwdBase   = $CwdBaseValue
-            windowTitle = $WindowTitle
-            tabTitle  = $TabTitle
-            updatedAt = [DateTime]::UtcNow.ToString('o')
+            hostFingerprint   = Get-NotifyPopupContextFingerprint -Value $TargetHostValue
+            cwdFingerprint    = Get-NotifyPopupContextFingerprint -Value $CwdBaseValue
+            windowFingerprint = Get-NotifyPopupContextFingerprint -Value $WindowTitle
+            tabFingerprint    = Get-NotifyPopupContextFingerprint -Value $TabTitle
+            tabIndex          = $TabIndex
+            updatedAt         = [DateTime]::UtcNow.ToString('o')
         }
         [System.IO.File]::WriteAllText($script:NotifyPopupCachePath, ($payload | ConvertTo-Json -Depth 4), [System.Text.UTF8Encoding]::new($false))
     }
@@ -335,11 +397,25 @@ function Get-NotifyPopupTabs {
             [System.Windows.Automation.ControlType]::TabItem
         )
         $tabs = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $condition)
+        $tabIndex = 0
         foreach ($tab in $tabs) {
+            $isSelected = $false
+            try {
+                $patternObj = $null
+                if ($tab.TryGetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern, [ref]$patternObj)) {
+                    $isSelected = ([System.Windows.Automation.SelectionItemPattern]$patternObj).Current.IsSelected
+                }
+            }
+            catch {
+            }
+
             $rows.Add([pscustomobject]@{
-                Name    = [string]$tab.Current.Name
-                Element = $tab
+                Name       = [string]$tab.Current.Name
+                Element    = $tab
+                IsSelected = $isSelected
+                Index      = $tabIndex
             }) | Out-Null
+            $tabIndex += 1
         }
     }
     catch {
@@ -378,109 +454,210 @@ function Select-NotifyPopupTab {
     return $false
 }
 
+function Get-NotifyPopupSelectedTerminalTarget {
+    foreach ($window in @(Get-NotifyPopupWindows -TerminalOnly)) {
+        foreach ($tab in @(Get-NotifyPopupTabs -Handle $window.Handle)) {
+            if ($tab.IsSelected) {
+                return [pscustomobject]@{
+                    WindowTitle = $window.Title
+                    TabTitle    = $tab.Name
+                    TabIndex    = $tab.Index
+                }
+            }
+        }
+    }
+
+    return $null
+}
+
+function Test-NotifyPopupForegroundTarget {
+    param(
+        [string]$CurrentDirBase,
+        [string]$SourceTabTitleValue
+    )
+
+    if ([string]::IsNullOrWhiteSpace($CurrentDirBase) -and [string]::IsNullOrWhiteSpace($SourceTabTitleValue)) {
+        return $false
+    }
+
+    try {
+        $handle = [PiNotifyPopupUser32]::GetForegroundWindow()
+        if ($handle -eq [IntPtr]::Zero) {
+            return $false
+        }
+
+        $processId = [uint32]0
+        [void][PiNotifyPopupUser32]::GetWindowThreadProcessId($handle, [ref]$processId)
+        $process = Get-Process -Id $processId -ErrorAction Stop
+        if ($process.ProcessName -notmatch 'WindowsTerminal|Terminal') {
+            return $false
+        }
+
+        $titleLength = [PiNotifyPopupUser32]::GetWindowTextLength($handle)
+        $windowTitle = ''
+        if ($titleLength -gt 0) {
+            $builder = New-Object System.Text.StringBuilder ($titleLength + 1)
+            [void][PiNotifyPopupUser32]::GetWindowText($handle, $builder, $builder.Capacity)
+            $windowTitle = $builder.ToString().Trim()
+        }
+
+        $selectedTab = @(Get-NotifyPopupTabs -Handle $handle | Where-Object { $_.IsSelected } | Select-Object -First 1)
+        $selectedTitle = if ($selectedTab.Count -gt 0) { [string]$selectedTab[0].Name } else { '' }
+        $haystack = @($selectedTitle, $windowTitle) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+
+        if (-not [string]::IsNullOrWhiteSpace($SourceTabTitleValue)) {
+            foreach ($value in $haystack) {
+                if ($value.IndexOf($SourceTabTitleValue, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                                Write-NotifyPopupLog -Message ('popup-foreground-target-match sourceTabFingerprint={0} selectedTabFingerprint={1} windowFingerprint={2}' -f (Get-NotifyPopupContextFingerprint -Value $SourceTabTitleValue), (Get-NotifyPopupContextFingerprint -Value $selectedTitle), (Get-NotifyPopupContextFingerprint -Value $windowTitle))
+                    return $true
+                }
+            }
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($CurrentDirBase)) {
+            foreach ($value in $haystack) {
+                if ($value.IndexOf($CurrentDirBase, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                    Write-NotifyPopupLog -Message ('popup-foreground-target-match cwdFingerprint={0} selectedTabFingerprint={1} windowFingerprint={2}' -f (Get-NotifyPopupContextFingerprint -Value $CurrentDirBase), (Get-NotifyPopupContextFingerprint -Value $selectedTitle), (Get-NotifyPopupContextFingerprint -Value $windowTitle))
+                    return $true
+                }
+            }
+        }
+    }
+    catch {
+    }
+
+    return $false
+}
+
 function Invoke-NotifyPopupActivation {
     param(
         [string]$TargetHost,
         [string]$CurrentDirBase,
-        [string]$TargetTabTitle
+        [string]$SourceTabTitleValue
     )
 
     try {
         $startedAt = [DateTime]::UtcNow
-        Write-NotifyPopupLog -Message ('popup-activate host="{0}" cwdBase="{1}" tabTitle="{2}"' -f $TargetHost, $CurrentDirBase, $TargetTabTitle)
+        $requiresCwdMatch = -not [string]::IsNullOrWhiteSpace($CurrentDirBase)
+        $hasPreciseSourceTitle = -not [string]::IsNullOrWhiteSpace($SourceTabTitleValue)
+        Write-NotifyPopupLog -Message ('popup-activate targetFingerprint={0} cwdFingerprint={1} sourceTabFingerprint={2}' -f (Get-NotifyPopupContextFingerprint -Value $TargetHost), (Get-NotifyPopupContextFingerprint -Value $CurrentDirBase), (Get-NotifyPopupContextFingerprint -Value $SourceTabTitleValue))
+        if (-not $requiresCwdMatch -and -not $hasPreciseSourceTitle) {
+            Write-NotifyPopupLog -Message ('popup-focus-miss missing-target-metadata no-target-open-skipped targetFingerprint={0} elapsedMs={1}' -f (Get-NotifyPopupContextFingerprint -Value $TargetHost), [int]([DateTime]::UtcNow - $startedAt).TotalMilliseconds)
+            return
+        }
+        Write-NotifyPopupLog -Message ('popup-focus-policy requiresCwdMatch={0} requiresSourceTabTitle={1} allowSelectedFallback={2} allowOpenNew={3}' -f $requiresCwdMatch, $hasPreciseSourceTitle, $false, $false)
 
-        $keywords = @($TargetTabTitle, $TargetHost, $CurrentDirBase) |
+        $keywords = @($SourceTabTitleValue, $CurrentDirBase, $TargetHost) |
             Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
             ForEach-Object { $_.Trim() } |
             Select-Object -Unique
-        Write-NotifyPopupLog -Message ('popup-keywords "{0}"' -f ($keywords -join ','))
+        Write-NotifyPopupLog -Message ('popup-keywords count={0}' -f @($keywords).Count)
 
         $cache = Get-NotifyPopupCache
-        $cacheMatchesTarget = $false
-        $cacheWindowUsable = $false
-        $cacheTabUsable = $false
+        $cacheMatches = $false
+        $cacheWindowFingerprint = ''
+        $cacheTabFingerprint = ''
         if ($null -ne $cache) {
-            Write-NotifyPopupLog -Message ('popup-cache host="{0}" cwdBase="{1}" windowTitle="{2}" tabTitle="{3}"' -f $cache.host, $cache.cwdBase, $cache.windowTitle, $cache.tabTitle)
-            $cacheMatchesTarget =
-                [string]::Equals([string]$cache.host, [string]$TargetHost, [System.StringComparison]::OrdinalIgnoreCase) -and
-                [string]::Equals([string]$cache.cwdBase, [string]$CurrentDirBase, [System.StringComparison]::OrdinalIgnoreCase)
-            if ($cacheMatchesTarget) {
-                $cacheWindowTitle = [string]$cache.windowTitle
-                $cacheTabTitle = [string]$cache.tabTitle
-                $cacheWindowUsable = -not [string]::IsNullOrWhiteSpace($cacheWindowTitle) -and (
-                    ([string]::IsNullOrWhiteSpace($CurrentDirBase) -or $cacheWindowTitle.IndexOf($CurrentDirBase, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) -or
-                    (-not [string]::IsNullOrWhiteSpace($TargetTabTitle) -and $cacheWindowTitle.IndexOf($TargetTabTitle, [System.StringComparison]::OrdinalIgnoreCase) -ge 0)
-                )
-                $cacheTabUsable = -not [string]::IsNullOrWhiteSpace($cacheTabTitle) -and (
-                    ([string]::IsNullOrWhiteSpace($CurrentDirBase) -or $cacheTabTitle.IndexOf($CurrentDirBase, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) -or
-                    (-not [string]::IsNullOrWhiteSpace($TargetTabTitle) -and $cacheTabTitle.IndexOf($TargetTabTitle, [System.StringComparison]::OrdinalIgnoreCase) -ge 0)
-                )
-            }
+            $cachedTabIndex = if ($cache.PSObject.Properties['tabIndex']) { [string]$cache.tabIndex } else { '' }
+            $cacheWindowFingerprint = if ($cache.PSObject.Properties['windowFingerprint']) { [string]$cache.windowFingerprint } else { '' }
+            $cacheTabFingerprint = if ($cache.PSObject.Properties['tabFingerprint']) { [string]$cache.tabFingerprint } else { '' }
+            $cacheHostFingerprint = if ($cache.PSObject.Properties['hostFingerprint']) { [string]$cache.hostFingerprint } else { '' }
+            $cacheCwdFingerprint = if ($cache.PSObject.Properties['cwdFingerprint']) { [string]$cache.cwdFingerprint } else { '' }
+            Write-NotifyPopupLog -Message ('popup-cache hostFingerprint={0} cwdFingerprint={1} windowFingerprint={2} tabFingerprint={3} tabIndex={4}' -f $cacheHostFingerprint, $cacheCwdFingerprint, $cacheWindowFingerprint, $cacheTabFingerprint, $cachedTabIndex)
+            $cacheMatches = -not [string]::IsNullOrWhiteSpace($CurrentDirBase) -and
+                $cacheHostFingerprint -eq (Get-NotifyPopupContextFingerprint -Value $TargetHost) -and
+                $cacheCwdFingerprint -eq (Get-NotifyPopupContextFingerprint -Value $CurrentDirBase)
+            Write-NotifyPopupLog -Message ('popup-cache-match {0}' -f $cacheMatches)
+        }
+        if ($null -ne $script:NotifyPopupInitialTarget) {
+            Write-NotifyPopupLog -Message ('popup-initial windowFingerprint={0} tabFingerprint={1} tabIndex={2}' -f (Get-NotifyPopupContextFingerprint -Value $script:NotifyPopupInitialTarget.WindowTitle), (Get-NotifyPopupContextFingerprint -Value $script:NotifyPopupInitialTarget.TabTitle), $script:NotifyPopupInitialTarget.TabIndex)
         }
 
         $windows = @(Get-NotifyPopupWindows -TerminalOnly)
         Write-NotifyPopupLog -Message ('popup-terminal-window-count {0}' -f $windows.Count)
         $best = $null
         foreach ($window in $windows) {
-            $baseScore = 100
+            $baseScore = 0
             foreach ($keyword in $keywords) {
                 if ($window.Title.IndexOf($keyword, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
                     $baseScore += 20
                 }
             }
-            if ($cacheWindowUsable -and $window.Title -eq [string]$cache.windowTitle) {
+            if ($cacheMatches -and -not [string]::IsNullOrWhiteSpace($cacheWindowFingerprint) -and (Get-NotifyPopupContextFingerprint -Value $window.Title) -eq $cacheWindowFingerprint) {
                 $baseScore += 80
+            }
+            if ([string]::IsNullOrWhiteSpace($CurrentDirBase) -and $null -ne $script:NotifyPopupInitialTarget -and $window.Title -eq $script:NotifyPopupInitialTarget.WindowTitle) {
+                $baseScore += 50
             }
 
             $tabs = @(Get-NotifyPopupTabs -Handle $window.Handle)
-            Write-NotifyPopupLog -Message ('popup-window title="{0}" process="{1}" tabs={2} baseScore={3}' -f $window.Title, $window.ProcessName, $tabs.Count, $baseScore)
+            Write-NotifyPopupLog -Message ('popup-window titleFingerprint={0} process="{1}" tabs={2} baseScore={3}' -f (Get-NotifyPopupContextFingerprint -Value $window.Title), $window.ProcessName, $tabs.Count, $baseScore)
             if ($tabs.Count -eq 0) {
-                $candidate = [pscustomobject]@{ Window = $window; Score = $baseScore; Tab = $null; TabName = '' }
-                if ($null -eq $best -or $candidate.Score -gt $best.Score) {
-                    $best = $candidate
+                if (-not $requiresCwdMatch -and -not $hasPreciseSourceTitle -and $baseScore -gt 0) {
+                    $candidate = [pscustomobject]@{ Window = $window; Score = $baseScore; Tab = $null; TabName = ''; TabIndex = -1 }
+                    if ($null -eq $best -or $candidate.Score -gt $best.Score) {
+                        $best = $candidate
+                    }
                 }
                 continue
             }
 
             foreach ($tab in $tabs) {
                 $score = $baseScore
+                $matchedKeywords = New-Object System.Collections.Generic.List[string]
                 foreach ($keyword in $keywords) {
                     if (-not [string]::IsNullOrWhiteSpace($tab.Name) -and $tab.Name.IndexOf($keyword, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
                         $score += 120
+                        [void]$matchedKeywords.Add($keyword)
                     }
                 }
-                if (-not [string]::IsNullOrWhiteSpace($TargetTabTitle) -and $tab.Name -eq $TargetTabTitle) {
-                    $score += 260
+                $sourceTabTitleMatch = -not [string]::IsNullOrWhiteSpace($SourceTabTitleValue) -and -not [string]::IsNullOrWhiteSpace($tab.Name) -and $tab.Name.IndexOf($SourceTabTitleValue, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+                if ($sourceTabTitleMatch) {
+                    $score += 300
                 }
-                if ($cacheTabUsable -and $tab.Name -eq [string]$cache.tabTitle) {
+                $cacheTitleMatchesSource = -not $hasPreciseSourceTitle -or (-not [string]::IsNullOrWhiteSpace($cacheTabFingerprint) -and $cacheTabFingerprint -eq (Get-NotifyPopupContextFingerprint -Value $SourceTabTitleValue))
+                $cacheTabMatch = $cacheMatches -and $cacheTitleMatchesSource -and -not [string]::IsNullOrWhiteSpace($cacheTabFingerprint) -and (Get-NotifyPopupContextFingerprint -Value $tab.Name) -eq $cacheTabFingerprint -and $cacheTabFingerprint -ne ''
+                if ($cacheTabMatch) {
                     $score += 200
                 }
-                Write-NotifyPopupLog -Message ('popup-tab name="{0}" score={1}' -f $tab.Name, $score)
+                $windowCwdMatch = $requiresCwdMatch -and $window.Title.IndexOf($CurrentDirBase, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+                $cwdKeywordMatch = $requiresCwdMatch -and (($matchedKeywords -contains $CurrentDirBase) -or $windowCwdMatch)
+                if ($hasPreciseSourceTitle -and -not $sourceTabTitleMatch -and -not $cacheTabMatch -and -not $cwdKeywordMatch) {
+                    $score = 0
+                }
+                elseif ($requiresCwdMatch -and -not $sourceTabTitleMatch -and -not $cacheTabMatch -and -not $cwdKeywordMatch) {
+                    $score = 0
+                }
+                $initialTabMatch = [string]::IsNullOrWhiteSpace($CurrentDirBase) -and $null -ne $script:NotifyPopupInitialTarget -and $tab.Name -eq $script:NotifyPopupInitialTarget.TabTitle
+                if ($initialTabMatch) {
+                    $score += 500
+                }
+                $selectedFallback = $false
+                if ($score -le 0 -and $tab.IsSelected -and [string]::IsNullOrWhiteSpace($CurrentDirBase) -and -not $hasPreciseSourceTitle) {
+                    $score = 1
+                    $selectedFallback = $true
+                }
+                Write-NotifyPopupLog -Message ('popup-tab index={0} nameFingerprint={1} selected={2} score={3} matchedKeywordCount={4} sourceTabTitleMatch={5} cacheTabMatch={6} initialTabMatch={7} selectedFallback={8}' -f $tab.Index, (Get-NotifyPopupContextFingerprint -Value $tab.Name), $tab.IsSelected, $score, @($matchedKeywords).Count, $sourceTabTitleMatch, $cacheTabMatch, $initialTabMatch, $selectedFallback)
                 if ($score -le 0) {
                     continue
                 }
 
-                $candidate = [pscustomobject]@{ Window = $window; Score = $score; Tab = $tab.Element; TabName = $tab.Name }
+                $candidate = [pscustomobject]@{ Window = $window; Score = $score; Tab = $tab.Element; TabName = $tab.Name; TabIndex = $tab.Index }
                 if ($null -eq $best -or $candidate.Score -gt $best.Score) {
                     $best = $candidate
                 }
             }
         }
 
-        if ($null -ne $best -and $best.Score -lt 220 -and (-not [string]::IsNullOrWhiteSpace($CurrentDirBase) -or -not [string]::IsNullOrWhiteSpace($TargetTabTitle))) {
-            Write-NotifyPopupLog -Message ('popup-focus-low-confidence tabTitle="{0}" score={1}' -f $best.TabName, $best.Score)
-            $best = $null
-        }
-
         if ($null -eq $best) {
-            Write-NotifyPopupLog -Message ('popup-focus-miss no-target-open-skipped host="{0}" cwdBase="{1}" tabTitle="{2}" elapsedMs={3}' -f $TargetHost, $CurrentDirBase, $TargetTabTitle, [int]([DateTime]::UtcNow - $startedAt).TotalMilliseconds)
+            Write-NotifyPopupLog -Message ('popup-focus-miss no-target-open-skipped targetFingerprint={0} cwdFingerprint={1} keywordCount={2} elapsedMs={3}' -f (Get-NotifyPopupContextFingerprint -Value $TargetHost), (Get-NotifyPopupContextFingerprint -Value $CurrentDirBase), @($keywords).Count, [int]([DateTime]::UtcNow - $startedAt).TotalMilliseconds)
             return
         }
 
-        Write-NotifyPopupLog -Message ('popup-focus-best windowTitle="{0}" tabTitle="{1}" score={2}' -f $best.Window.Title, $best.TabName, $best.Score)
+        Write-NotifyPopupLog -Message ('popup-focus-best windowFingerprint={0} tabFingerprint={1} tabIndex={2} score={3}' -f (Get-NotifyPopupContextFingerprint -Value $best.Window.Title), (Get-NotifyPopupContextFingerprint -Value $best.TabName), $best.TabIndex, $best.Score)
         if ([PiNotifyPopupUser32]::IsIconic($best.Window.Handle)) {
             [void][PiNotifyPopupUser32]::ShowWindowAsync($best.Window.Handle, 9)
-            Start-Sleep -Milliseconds 40
+            Start-Sleep -Milliseconds 120
         }
 
         try {
@@ -490,21 +667,25 @@ function Invoke-NotifyPopupActivation {
         catch {
             Write-NotifyPopupLog -Message ('popup-appactivate-error "{0}"' -f $_.Exception.Message)
         }
-        Start-Sleep -Milliseconds 30
+        Start-Sleep -Milliseconds 80
         [void][PiNotifyPopupUser32]::SetForegroundWindow($best.Window.Handle)
-        Start-Sleep -Milliseconds 30
+        Start-Sleep -Milliseconds 80
 
         if ($null -ne $best.Tab) {
             if (Select-NotifyPopupTab -TabElement $best.Tab) {
-                Write-NotifyPopupLog -Message ('popup-tab-selected "{0}" elapsedMs={1}' -f $best.TabName, [int]([DateTime]::UtcNow - $startedAt).TotalMilliseconds)
-                Save-NotifyPopupCache -TargetHostValue $TargetHost -CwdBaseValue $CurrentDirBase -WindowTitle $best.Window.Title -TabTitle $best.TabName
+                Write-NotifyPopupLog -Message ('popup-tab-selected tabFingerprint={0} elapsedMs={1}' -f (Get-NotifyPopupContextFingerprint -Value $best.TabName), [int]([DateTime]::UtcNow - $startedAt).TotalMilliseconds)
+                if (-not [string]::IsNullOrWhiteSpace($CurrentDirBase)) {
+                    Save-NotifyPopupCache -TargetHostValue $TargetHost -CwdBaseValue $CurrentDirBase -WindowTitle $best.Window.Title -TabTitle $best.TabName -TabIndex $best.TabIndex
+                }
             }
             else {
-                Write-NotifyPopupLog -Message ('popup-tab-select-failed "{0}" elapsedMs={1}' -f $best.TabName, [int]([DateTime]::UtcNow - $startedAt).TotalMilliseconds)
+                Write-NotifyPopupLog -Message ('popup-tab-select-failed tabFingerprint={0} elapsedMs={1}' -f (Get-NotifyPopupContextFingerprint -Value $best.TabName), [int]([DateTime]::UtcNow - $startedAt).TotalMilliseconds)
             }
         }
         else {
-            Save-NotifyPopupCache -TargetHostValue $TargetHost -CwdBaseValue $CurrentDirBase -WindowTitle $best.Window.Title -TabTitle ''
+            if (-not [string]::IsNullOrWhiteSpace($CurrentDirBase)) {
+                Save-NotifyPopupCache -TargetHostValue $TargetHost -CwdBaseValue $CurrentDirBase -WindowTitle $best.Window.Title -TabTitle '' -TabIndex -1
+            }
         }
     }
     catch {
@@ -512,115 +693,113 @@ function Invoke-NotifyPopupActivation {
     }
 }
 
-function Get-NotifyPopupWorkingArea {
-    param(
-        [string]$Placement
-    )
-
-    $normalized = if ([string]::IsNullOrWhiteSpace($Placement)) { 'cursor' } else { $Placement.Trim().ToLowerInvariant() }
-    if ($normalized -eq 'cursor') {
-        return [System.Windows.Forms.Screen]::FromPoint([System.Windows.Forms.Cursor]::Position).WorkingArea
-    }
-    if ($normalized -eq 'right') {
-        $best = [System.Windows.Forms.Screen]::AllScreens | Sort-Object { $_.WorkingArea.Right } -Descending | Select-Object -First 1
-        return $best.WorkingArea
-    }
-    return [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
-}
-
-function Get-NotifyPopupLocation {
-    param(
-        [int]$Width,
-        [int]$Height,
-        [string]$Placement
-    )
-
-    $workingArea = Get-NotifyPopupWorkingArea -Placement $Placement
-    $margin = 16
-    $x = [Math]::Max($workingArea.Left, $workingArea.Right - $Width - $margin)
-    $y = [Math]::Max($workingArea.Top, $workingArea.Bottom - $Height - $margin)
-    return [System.Drawing.Point]::new($x, $y)
+$script:NotifyPopupInitialTarget = Get-NotifyPopupSelectedTerminalTarget
+if ($null -ne $script:NotifyPopupInitialTarget) {
+    Write-NotifyPopupLog -Message ('popup-initial-captured windowFingerprint={0} tabFingerprint={1} tabIndex={2}' -f (Get-NotifyPopupContextFingerprint -Value $script:NotifyPopupInitialTarget.WindowTitle), (Get-NotifyPopupContextFingerprint -Value $script:NotifyPopupInitialTarget.TabTitle), $script:NotifyPopupInitialTarget.TabIndex)
 }
 
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
-$form = New-Object System.Windows.Forms.Form
+function New-NotifyPopupRoundedPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Drawing.Rectangle]$Rectangle,
+        [int]$Radius = 14
+    )
+
+    $diameter = $Radius * 2
+    $path = New-Object System.Drawing.Drawing2D.GraphicsPath
+    $path.AddArc($Rectangle.X, $Rectangle.Y, $diameter, $diameter, 180, 90)
+    $path.AddArc($Rectangle.Right - $diameter, $Rectangle.Y, $diameter, $diameter, 270, 90)
+    $path.AddArc($Rectangle.Right - $diameter, $Rectangle.Bottom - $diameter, $diameter, $diameter, 0, 90)
+    $path.AddArc($Rectangle.X, $Rectangle.Bottom - $diameter, $diameter, $diameter, 90, 90)
+    $path.CloseFigure()
+    return $path
+}
+
+$cardColor = [System.Drawing.Color]::FromArgb(28, 30, 36)
+$borderColor = [System.Drawing.Color]::FromArgb(74, 80, 96)
+$accentColor = [System.Drawing.Color]::FromArgb(94, 234, 212)
+$mutedColor = [System.Drawing.Color]::FromArgb(168, 178, 195)
+
+$form = New-Object PiNotifyNoActivateForm
 $form.Text = 'Pi'
-$form.Size = New-Object System.Drawing.Size(380, 110)
+$form.Size = New-Object System.Drawing.Size(420, 128)
 $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::None
 $form.StartPosition = [System.Windows.Forms.FormStartPosition]::Manual
 $form.ShowInTaskbar = $false
-# ponytail: not using $form.TopMost — it can trigger WM_ACTIVATE and steal
-# keyboard focus on some Windows versions. Instead use SetWindowPos with
-# SWP_NOACTIVATE in the Shown handler to display on top without activation.
-$form.TopMost = $false
-$form.BackColor = [System.Drawing.Color]::FromArgb(58, 58, 58)
-$form.Opacity = 0.985
+$form.TopMost = $true
+$form.BackColor = $cardColor
+$form.Opacity = 0.98
 $form.Cursor = [System.Windows.Forms.Cursors]::Hand
 
 $panel = New-Object System.Windows.Forms.Panel
 $panel.Dock = [System.Windows.Forms.DockStyle]::Fill
-$panel.BackColor = [System.Drawing.Color]::FromArgb(58, 58, 58)
+$panel.BackColor = $cardColor
 $panel.Cursor = [System.Windows.Forms.Cursors]::Hand
-if ($null -ne $script:NotifyPopupWallpaperImage) {
-    $panel.Add_Paint({
-        param($sender, $eventArgs)
+$panel.Add_Paint({
+    $graphics = $_.Graphics
+    $graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+    $rect = New-Object System.Drawing.Rectangle(0, 0, ($panel.Width - 1), ($panel.Height - 1))
 
-        $dest = [System.Drawing.Rectangle]::new(0, 0, $sender.Width, $sender.Height)
-        $source = Get-NotifyPopupCoverSourceRectangle -Image $script:NotifyPopupWallpaperImage -TargetWidth $sender.Width -TargetHeight $sender.Height -VerticalOffsetPixels $script:NotifyPopupWallpaperOffsetYPixels
-        $eventArgs.Graphics.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
-        $eventArgs.Graphics.DrawImage($script:NotifyPopupWallpaperImage, $dest, $source, [System.Drawing.GraphicsUnit]::Pixel)
-        # ponytail: one horizontal gradient is enough: readable text on the left,
-        # visible wallpaper detail on the right.
+    if ($null -ne $script:NotifyPopupWallpaperImage) {
+        $dest = New-Object System.Drawing.Rectangle(0, 0, $panel.Width, $panel.Height)
+        $source = Get-NotifyPopupCoverSourceRectangle -Image $script:NotifyPopupWallpaperImage -TargetWidth $panel.Width -TargetHeight $panel.Height -VerticalOffsetPixels $script:NotifyPopupWallpaperOffsetYPixels
+        $graphics.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+        $graphics.DrawImage($script:NotifyPopupWallpaperImage, $dest, $source, [System.Drawing.GraphicsUnit]::Pixel)
         $overlay = [System.Drawing.Drawing2D.LinearGradientBrush]::new(
             $dest,
-            [System.Drawing.Color]::FromArgb(152, 0, 0, 0),
-            [System.Drawing.Color]::FromArgb(58, 0, 0, 0),
+            [System.Drawing.Color]::FromArgb(170, 0, 0, 0),
+            [System.Drawing.Color]::FromArgb(70, 0, 0, 0),
             [System.Drawing.Drawing2D.LinearGradientMode]::Horizontal)
-        try {
-            $eventArgs.Graphics.FillRectangle($overlay, $dest)
-        }
-        finally {
-            $overlay.Dispose()
-        }
-    })
-}
+        try { $graphics.FillRectangle($overlay, $dest) } finally { $overlay.Dispose() }
+    }
+
+    $path = New-NotifyPopupRoundedPath -Rectangle $rect -Radius 14
+    $pen = New-Object System.Drawing.Pen($borderColor, 1)
+    $accentBrush = New-Object System.Drawing.SolidBrush($accentColor)
+    $graphics.DrawPath($pen, $path)
+    $graphics.FillRectangle($accentBrush, 0, 0, 5, $panel.Height)
+    $accentBrush.Dispose()
+    $pen.Dispose()
+    $path.Dispose()
+})
 [void]$form.Controls.Add($panel)
 
 $appLabel = New-Object System.Windows.Forms.Label
-$appLabel.Location = New-Object System.Drawing.Point(18, 12)
-$appLabel.Size = New-Object System.Drawing.Size(200, 18)
+$appLabel.Location = New-Object System.Drawing.Point(22, 13)
+$appLabel.Size = New-Object System.Drawing.Size(240, 18)
 $appLabel.Font = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Regular)
-$appLabel.ForeColor = [System.Drawing.Color]::FromArgb(245, 245, 245)
-$appLabel.Text = 'Pi'
+$appLabel.ForeColor = $mutedColor
+$appLabel.Text = 'Pi Remote'
 $appLabel.Cursor = [System.Windows.Forms.Cursors]::Hand
 [void]$panel.Controls.Add($appLabel)
 
 $closeLabel = New-Object System.Windows.Forms.Label
-$closeLabel.Location = New-Object System.Drawing.Point(338, 9)
+$closeLabel.Location = New-Object System.Drawing.Point(384, 10)
 $closeLabel.Size = New-Object System.Drawing.Size(24, 24)
-$closeLabel.Font = New-Object System.Drawing.Font('Segoe UI Symbol', 11, [System.Drawing.FontStyle]::Regular)
-$closeLabel.ForeColor = [System.Drawing.Color]::FromArgb(210, 210, 210)
+$closeLabel.Font = New-Object System.Drawing.Font('Segoe UI Symbol', 12, [System.Drawing.FontStyle]::Regular)
+$closeLabel.ForeColor = [System.Drawing.Color]::FromArgb(198, 207, 222)
 $closeLabel.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
-$closeLabel.Text = [string][char]0x00D7
+$closeLabel.Text = 'x'
 $closeLabel.Cursor = [System.Windows.Forms.Cursors]::Hand
 [void]$panel.Controls.Add($closeLabel)
 
 $titleLabel = New-Object System.Windows.Forms.Label
-$titleLabel.Location = New-Object System.Drawing.Point(18, 38)
-$titleLabel.Size = New-Object System.Drawing.Size(320, 26)
-$titleLabel.Font = New-Object System.Drawing.Font('Segoe UI', 12, [System.Drawing.FontStyle]::Bold)
-$titleLabel.ForeColor = [System.Drawing.Color]::White
+$titleLabel.Location = New-Object System.Drawing.Point(22, 40)
+$titleLabel.Size = New-Object System.Drawing.Size(354, 28)
+$titleLabel.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 12, [System.Drawing.FontStyle]::Regular)
+$titleLabel.ForeColor = [System.Drawing.Color]::FromArgb(248, 250, 252)
 $titleLabel.Text = $Title
 $titleLabel.AutoEllipsis = $true
 $titleLabel.Cursor = [System.Windows.Forms.Cursors]::Hand
 [void]$panel.Controls.Add($titleLabel)
 
 $bodyLabel = New-Object System.Windows.Forms.Label
-$bodyLabel.Location = New-Object System.Drawing.Point(18, 66)
-$bodyLabel.Size = New-Object System.Drawing.Size(344, 28)
+$bodyLabel.Location = New-Object System.Drawing.Point(22, 72)
+$bodyLabel.Size = New-Object System.Drawing.Size(374, 38)
 $bodyLabel.Font = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Regular)
-$bodyLabel.ForeColor = [System.Drawing.Color]::FromArgb(232, 232, 232)
+$bodyLabel.ForeColor = [System.Drawing.Color]::FromArgb(214, 221, 233)
 $bodyLabel.Text = $Body
 $bodyLabel.AutoEllipsis = $true
 $bodyLabel.Cursor = [System.Windows.Forms.Cursors]::Hand
@@ -634,168 +813,119 @@ if ($null -ne $script:NotifyPopupWallpaperImage) {
 
 $targetHost = $FocusTarget
 $targetCwdBase = $CwdBase
-$targetTabTitle = $TabTitle
+$targetSourceTabTitle = $SourceTabTitle
 $didActivate = $false
 $shouldActivate = $false
-$daemonActivating = $false
 
-if ($Daemon) {
-    # Daemon mode: persistent process, FileSystemWatcher triggers popup updates.
-    # MouseDown and Click can both fire for one user click; guard so one toast
-    # activation does not spawn duplicate focus attempts.
-    $activateAction = {
-        if ($script:daemonActivating) {
-            return
-        }
-        $script:daemonActivating = $true
-        try {
-            Write-NotifyPopupLog -Message 'popup-click (daemon)'
-            $form.Hide()
-            $timer.Stop()
-            Invoke-NotifyPopupActivation -TargetHost $script:targetHost -CurrentDirBase $script:targetCwdBase -TargetTabTitle $script:targetTabTitle
-        }
-        finally {
-            $script:daemonActivating = $false
-        }
+$activateAction = {
+    if ($didActivate) {
+        return
     }
-
-    $closeAction = {
-        Write-NotifyPopupLog -Message 'popup-close-button (daemon)'
-        $form.Hide()
-        $timer.Stop()
-    }
-
-    foreach ($control in @($form, $panel, $appLabel, $titleLabel, $bodyLabel)) {
-        $control.Add_Click($activateAction)
-        $control.Add_MouseDown($activateAction)
-    }
-    $closeLabel.Add_Click($closeAction)
-    $closeLabel.Add_MouseDown($closeAction)
-
-    $timer = New-Object System.Windows.Forms.Timer
-    $timer.Interval = [Math]::Max(3000, ($TimeoutSeconds * 1000))
-    $timer.Add_Tick({
-        Write-NotifyPopupLog -Message 'popup-timeout-hide (daemon)'
-        $timer.Stop()
-        $form.Hide()
-    })
-
-    # Prevent actual close — hide instead
-    $form.Add_FormClosing({
-        $_.Cancel = $true
-        $form.Hide()
-    })
-
-    $form.Add_Shown({
-        $form.Hide() # Hide initially; watcher will show it
-    })
-
-    # FileSystemWatcher to monitor payload file
-    $payloadDir = Split-Path $PayloadPath -Parent
-    $payloadFile = Split-Path $PayloadPath -Leaf
-    $watcher = New-Object System.IO.FileSystemWatcher ($payloadDir, $payloadFile)
-    $watcher.SynchronizingObject = $form  # Marshal events to UI thread
-    $watcher.EnableRaisingEvents = $true
-
-    $onPayloadChanged = {
-        try {
-            $payload = Read-NotifyPopupPayload -Path $script:PayloadPath
-            if ($null -eq $payload) { return }
-            if ($payload.PSObject.Properties['title']) { $script:titleLabel.Text = [string]$payload.title }
-            if ($payload.PSObject.Properties['body']) { $script:bodyLabel.Text = [string]$payload.body }
-            if ($payload.PSObject.Properties['focusTarget']) { $script:targetHost = [string]$payload.focusTarget }
-            if ($payload.PSObject.Properties['cwdBase']) { $script:targetCwdBase = [string]$payload.cwdBase }
-            if ($payload.PSObject.Properties['tabTitle']) { $script:targetTabTitle = [string]$payload.tabTitle }
-            if ($payload.PSObject.Properties['timeoutSeconds']) { $script:timer.Interval = [Math]::Max(3000, ([int]$payload.timeoutSeconds * 1000)) }
-
-            # Reposition and show form on top without stealing focus
-            $location = Get-NotifyPopupLocation -Width $script:form.Width -Height $script:form.Height -Placement $script:NotifyPopupPlacement
-            $x = $location.X
-            $y = $location.Y
-            $script:form.Location = $location
-            [void][PiNotifyPopupUser32]::SetWindowPos(
-                $script:form.Handle,
-                [PiNotifyPopupUser32]::HWND_TOPMOST,
-                $x, $y, $script:form.Width, $script:form.Height,
-                [PiNotifyPopupUser32]::SWP_NOACTIVATE -bor [PiNotifyPopupUser32]::SWP_SHOWWINDOW)
-            $script:timer.Start()
-            Write-NotifyPopupLog -Message ('popup-daemon-show title="{0}"' -f $script:titleLabel.Text)
-        }
-        catch {
-            Write-NotifyPopupLog -Message ('popup-daemon-payload-error "{0}"' -f $_.Exception.Message)
-        }
-    }
-
-    Register-ObjectEvent -InputObject $watcher -EventName Changed -Action $onPayloadChanged | Out-Null
-
-    # Show immediately if payload exists at startup
-    if (Test-Path -LiteralPath $PayloadPath) {
-        & $onPayloadChanged
-    }
-
-    Write-NotifyPopupLog -Message 'popup-daemon-start'
-    [System.Windows.Forms.Application]::Run()
+    $script:didActivate = $true
+    $script:shouldActivate = $true
+    Write-NotifyPopupLog -Message 'popup-click'
+    Write-NotifyPopupLog -Message ('popup-action activate targetFingerprint={0}' -f (Get-NotifyPopupContextFingerprint -Value $targetHost))
+    $form.Close()
 }
-else {
-    # Non-daemon mode: original behavior
-    $activateAction = {
-        if ($didActivate) {
-            return
-        }
-        $script:didActivate = $true
-        $script:shouldActivate = $true
-        Write-NotifyPopupLog -Message 'popup-click'
-        $form.Close()
-    }
 
-    $closeAction = {
-        Write-NotifyPopupLog -Message 'popup-close-button'
-        $form.Close()
-    }
+$closeAction = {
+    Write-NotifyPopupLog -Message 'popup-close-button'
+    Write-NotifyPopupLog -Message 'popup-action dismiss source="close-button"'
+    $form.Close()
+}
 
-    foreach ($control in @($form, $panel, $appLabel, $titleLabel, $bodyLabel)) {
-        $control.Add_Click($activateAction)
-        $control.Add_MouseDown($activateAction)
-    }
-    $closeLabel.Add_Click($closeAction)
-    $closeLabel.Add_MouseDown($closeAction)
+foreach ($control in @($form, $panel, $appLabel, $titleLabel, $bodyLabel)) {
+    $control.Add_Click($activateAction)
+    $control.Add_MouseDown($activateAction)
+}
+$closeLabel.Add_Click($closeAction)
+$closeLabel.Add_MouseDown($closeAction)
 
-    $timer = New-Object System.Windows.Forms.Timer
-    $timer.Interval = [Math]::Max(3000, ($TimeoutSeconds * 1000))
-    $timer.Add_Tick({
-        Write-NotifyPopupLog -Message 'popup-timeout-close'
+$timer = New-Object System.Windows.Forms.Timer
+$timer.Interval = [Math]::Max(3000, ($TimeoutSeconds * 1000))
+$timer.Add_Tick({
+    Write-NotifyPopupLog -Message 'popup-timeout-close'
+    Write-NotifyPopupLog -Message 'popup-action dismiss source="timeout"'
+    $timer.Stop()
+    $form.Close()
+})
+
+$focusWatchTimer = New-Object System.Windows.Forms.Timer
+$focusWatchTimer.Interval = 800
+$focusWatchTimer.Add_Tick({
+    if (Test-NotifyPopupDedupeSuperseded) {
+        Write-NotifyPopupLog -Message 'popup-action dismiss source="dedupe-superseded"'
+        $focusWatchTimer.Stop()
         $timer.Stop()
         $form.Close()
-    })
+        return
+    }
 
-    $form.Add_Shown({
-        $location = Get-NotifyPopupLocation -Width $form.Width -Height $form.Height -Placement $script:NotifyPopupPlacement
-        $x = $location.X
-        $y = $location.Y
-        $form.Location = $location
-        # Display on top without stealing keyboard focus (SWP_NOACTIVATE)
-        [void][PiNotifyPopupUser32]::SetWindowPos(
-            $form.Handle,
-            [PiNotifyPopupUser32]::HWND_TOPMOST,
-            $x, $y, $form.Width, $form.Height,
-            [PiNotifyPopupUser32]::SWP_NOACTIVATE -bor [PiNotifyPopupUser32]::SWP_SHOWWINDOW)
-        Write-NotifyPopupLog -Message ('popup-shown x={0} y={1} w={2} h={3} placement={4}' -f $x, $y, $form.Width, $form.Height, $script:NotifyPopupPlacement)
-        $timer.Start()
-    })
+    if (Test-NotifyPopupForegroundTarget -CurrentDirBase $targetCwdBase -SourceTabTitleValue $targetSourceTabTitle) {
+        Write-NotifyPopupLog -Message 'popup-action dismiss source="foreground-target"'
+        $focusWatchTimer.Stop()
+        $timer.Stop()
+        $form.Close()
+    }
+})
 
-    $form.Add_FormClosed({
-        Write-NotifyPopupLog -Message 'popup-closed'
+function Get-NotifyPopupWorkingArea {
+    param([string]$Placement)
+
+    if ($Placement -eq 'cursor') {
+        try { return [System.Windows.Forms.Screen]::FromPoint([System.Windows.Forms.Cursor]::Position).WorkingArea } catch {}
+    }
+    if ($Placement -eq 'right') {
         try {
-            $timer.Stop()
-            $timer.Dispose()
+            $screens = @([System.Windows.Forms.Screen]::AllScreens)
+            $rightScreen = @($screens | Sort-Object { $_.WorkingArea.Right } -Descending | Select-Object -First 1)
+            if ($rightScreen.Count -gt 0) { return $rightScreen[0].WorkingArea }
         }
         catch {
         }
-    })
-
-    [System.Windows.Forms.Application]::Run($form)
-
-    if ($shouldActivate) {
-        Invoke-NotifyPopupActivation -TargetHost $targetHost -CurrentDirBase $targetCwdBase -TargetTabTitle $targetTabTitle
     }
+
+    return [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+}
+
+$form.Add_Shown({
+    $workingArea = Get-NotifyPopupWorkingArea -Placement $PopupPlacement
+    $margin = 16
+    $gap = 12
+    $slot = [Math]::Max(0, $StackIndex)
+    $x = [Math]::Max($workingArea.Left, $workingArea.Right - $form.Width - $margin)
+    $bottomY = $workingArea.Bottom - $form.Height - $margin
+    $stackY = $bottomY - ($slot * ($form.Height + $gap))
+    $y = [Math]::Max($workingArea.Top + $margin, $stackY)
+    $form.Location = New-Object System.Drawing.Point($x, $y)
+    $roundedRect = New-Object System.Drawing.Rectangle(0, 0, $form.Width, $form.Height)
+    $roundedPath = New-NotifyPopupRoundedPath -Rectangle $roundedRect -Radius 14
+    $form.Region = New-Object System.Drawing.Region($roundedPath)
+    $roundedPath.Dispose()
+    [void][PiNotifyPopupUser32]::ShowWindowAsync($form.Handle, 4)
+    Write-NotifyPopupLog -Message ('popup-shown-noactivate x={0} y={1} w={2} h={3} stackIndex={4} placement={5}' -f $x, $y, $form.Width, $form.Height, $slot, $PopupPlacement)
+    $timer.Start()
+    $focusWatchTimer.Start()
+})
+
+$form.Add_FormClosed({
+    Write-NotifyPopupLog -Message ('popup-closed shouldActivate={0}' -f $shouldActivate)
+    try {
+        $timer.Stop()
+        $timer.Dispose()
+        $focusWatchTimer.Stop()
+        $focusWatchTimer.Dispose()
+        if ($null -ne $script:NotifyPopupWallpaperImage) {
+            $script:NotifyPopupWallpaperImage.Dispose()
+            $script:NotifyPopupWallpaperImage = $null
+        }
+    }
+    catch {
+    }
+})
+
+[System.Windows.Forms.Application]::Run($form)
+
+if ($shouldActivate) {
+    Invoke-NotifyPopupActivation -TargetHost $targetHost -CurrentDirBase $targetCwdBase -SourceTabTitleValue $targetSourceTabTitle
 }

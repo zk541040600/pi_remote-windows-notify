@@ -10,6 +10,8 @@ $ErrorActionPreference = 'Stop'
 
 . "$PSScriptRoot/NotifyBridge.Common.ps1"
 
+Add-Type -AssemblyName System.Security
+
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
 
@@ -63,6 +65,19 @@ function Write-NotifyActivateLog {
     Add-Content -LiteralPath $script:NotifyActivateLogPath -Value $line -Encoding UTF8
 }
 
+function Get-NotifyActivateFingerprint {
+    param([string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return '' }
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $hash = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes([string]$Value))
+        return ([System.BitConverter]::ToString($hash).Replace('-', '').ToLowerInvariant()).Substring(0, 16)
+    }
+    finally {
+        if ($null -ne $sha) { $sha.Dispose() }
+    }
+}
+
 function Get-NotifyQueryValue {
     param(
         [Parameter(Mandatory = $true)]
@@ -98,6 +113,42 @@ function Get-NotifyQueryValue {
     return ''
 }
 
+function Unprotect-NotifyActivationValue {
+    param([string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return '' }
+    $protected = [Convert]::FromBase64String($Value)
+    $bytes = [System.Security.Cryptography.ProtectedData]::Unprotect($protected, $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser)
+    return [System.Text.Encoding]::UTF8.GetString($bytes)
+}
+
+function Resolve-NotifyActivationState {
+    param([string]$ActivationId)
+    if ([string]::IsNullOrWhiteSpace($ActivationId) -or $ActivationId -notmatch '^[0-9a-fA-F]{32}$') { return $null }
+    $paths = @(
+        (Join-Path (Get-NotifyBridgeLogDir) ('activation-{0}.json' -f $ActivationId)),
+        (Join-Path (Join-Path (Get-NotifyBridgeDefaultBaseDir) 'logs') ('activation-{0}.json' -f $ActivationId))
+    ) | Select-Object -Unique
+    $path = @($paths | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1)
+    if (@($path).Count -eq 0) { return $null }
+    $path = [string]$path[0]
+    try {
+        $payload = [System.IO.File]::ReadAllText($path, [System.Text.UTF8Encoding]::new($false)) | ConvertFrom-Json
+        foreach ($candidate in $paths) { Remove-Item -LiteralPath $candidate -Force -ErrorAction SilentlyContinue }
+        $expiresAtTicks = [int64]0
+        if ($payload.PSObject.Properties['expiresAtTicks']) { [int64]::TryParse([string]$payload.expiresAtTicks, [ref]$expiresAtTicks) | Out-Null }
+        if ($expiresAtTicks -le [DateTime]::UtcNow.Ticks) { return $null }
+        return [pscustomobject]@{
+            FocusTarget = if ($payload.PSObject.Properties['protectedHost']) { Unprotect-NotifyActivationValue -Value ([string]$payload.protectedHost) } else { '' }
+            CwdBase     = if ($payload.PSObject.Properties['protectedCwd']) { Unprotect-NotifyActivationValue -Value ([string]$payload.protectedCwd) } else { '' }
+            TabTitle    = if ($payload.PSObject.Properties['protectedTab']) { Unprotect-NotifyActivationValue -Value ([string]$payload.protectedTab) } else { '' }
+        }
+    }
+    catch {
+        Write-NotifyActivateLog -Message ('activation-cache-read-error "{0}"' -f $_.Exception.Message)
+        return $null
+    }
+}
+
 function Get-CandidateWindows {
     $windows = New-Object System.Collections.Generic.List[object]
     $callback = [PiNotifyUser32+EnumWindowsProc]{
@@ -125,6 +176,10 @@ function Get-CandidateWindows {
             $process = Get-Process -Id $processId -ErrorAction Stop
         }
         catch {
+            return $true
+        }
+
+        if ($process.ProcessName -notmatch 'WindowsTerminal|Terminal') {
             return $true
         }
 
@@ -205,27 +260,25 @@ function Focus-NotifyWindow {
     param(
         [Parameter(Mandatory = $true)]
         [string[]]$Keywords,
-        [string]$TargetTabTitle
+        [string]$RequiredText
     )
 
     $normalized = @($Keywords | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { $_.Trim() } | Select-Object -Unique)
+    $required = if ([string]::IsNullOrWhiteSpace($RequiredText)) { '' } else { $RequiredText.Trim() }
     $windows = Get-CandidateWindows
 
     $best = $null
     foreach ($window in $windows) {
         $baseScore = 0
-        if ($window.ProcessName -match 'WindowsTerminal|Terminal') {
-            $baseScore += 100
-        }
         foreach ($keyword in $normalized) {
             if ($window.Title.IndexOf($keyword, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
                 $baseScore += 20
             }
         }
 
-        $tabs = Get-NotifyWindowTabs -Handle $window.Handle
+        $tabs = @(Get-NotifyWindowTabs -Handle $window.Handle)
         if ($tabs.Count -eq 0) {
-            if ($baseScore -gt 0) {
+            if ([string]::IsNullOrWhiteSpace($required) -and $baseScore -gt 0) {
                 $candidate = [pscustomobject]@{
                     Window   = $window
                     Score    = $baseScore
@@ -241,10 +294,12 @@ function Focus-NotifyWindow {
         }
 
         foreach ($tab in $tabs) {
-            $score = $baseScore
-            if (-not [string]::IsNullOrWhiteSpace($TargetTabTitle) -and $tab.Name -eq $TargetTabTitle) {
-                $score += 260
+            if (-not [string]::IsNullOrWhiteSpace($required) -and ([string]::IsNullOrWhiteSpace($tab.Name) -or $tab.Name.IndexOf($required, [System.StringComparison]::OrdinalIgnoreCase) -lt 0)) {
+                Write-NotifyActivateLog -Message ('focus-tab-skip-required tabFingerprint="{0}" requiredFingerprint="{1}"' -f (Get-NotifyActivateFingerprint $tab.Name), (Get-NotifyActivateFingerprint $required))
+                continue
             }
+
+            $score = $baseScore
             foreach ($keyword in $normalized) {
                 if (-not [string]::IsNullOrWhiteSpace($tab.Name) -and $tab.Name.IndexOf($keyword, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
                     $score += 120
@@ -272,7 +327,7 @@ function Focus-NotifyWindow {
         return $false
     }
 
-    Write-NotifyActivateLog -Message ('focus-best windowTitle="{0}" tabTitle="{1}" score={2}' -f $best.Window.Title, $best.TabName, $best.Score)
+    Write-NotifyActivateLog -Message ('focus-best windowFingerprint="{0}" tabFingerprint="{1}" score={2}' -f (Get-NotifyActivateFingerprint $best.Window.Title), (Get-NotifyActivateFingerprint $best.TabName), $best.Score)
 
     if ([PiNotifyUser32]::IsIconic($best.Window.Handle)) {
         [void][PiNotifyUser32]::ShowWindowAsync($best.Window.Handle, 9)
@@ -292,18 +347,18 @@ function Focus-NotifyWindow {
 
     if ($best.TabFound -and $null -ne $best.Tab) {
         if (Select-NotifyTab -TabElement $best.Tab) {
-            Write-NotifyActivateLog -Message ('focus-tab-selected "{0}"' -f $best.TabName)
+            Write-NotifyActivateLog -Message ('focus-tab-selected tabFingerprint="{0}"' -f (Get-NotifyActivateFingerprint $best.TabName))
             Start-Sleep -Milliseconds 150
             [void][PiNotifyUser32]::SetForegroundWindow($best.Window.Handle)
             return $true
         }
-        Write-NotifyActivateLog -Message ('focus-tab-select-failed "{0}"' -f $best.TabName)
+        Write-NotifyActivateLog -Message ('focus-tab-select-failed tabFingerprint="{0}"' -f (Get-NotifyActivateFingerprint $best.TabName))
     }
 
     return $true
 }
 
-Write-NotifyActivateLog -Message ('activate-start uri="{0}"' -f $Uri)
+Write-NotifyActivateLog -Message ('activate-start hasUri={0}' -f (-not [string]::IsNullOrWhiteSpace($Uri)))
 
 $targetHost = $config.RemoteHostAlias
 $cwdBase = ''
@@ -311,31 +366,41 @@ $tabTitle = ''
 if (-not [string]::IsNullOrWhiteSpace($Uri)) {
     try {
         $parsedUri = [Uri]$Uri
-        $hostValue = Get-NotifyQueryValue -ParsedUri $parsedUri -Name 'host'
-        $cwdBaseValue = Get-NotifyQueryValue -ParsedUri $parsedUri -Name 'cwdBase'
-        $tabTitleValue = Get-NotifyQueryValue -ParsedUri $parsedUri -Name 'tabTitle'
-        if (-not [string]::IsNullOrWhiteSpace($hostValue)) {
-            $targetHost = $hostValue.Trim()
+        $activationIdValue = Get-NotifyQueryValue -ParsedUri $parsedUri -Name 'id'
+        $state = Resolve-NotifyActivationState -ActivationId $activationIdValue
+        if ($null -ne $state) {
+            if (-not [string]::IsNullOrWhiteSpace($state.FocusTarget)) { $targetHost = ([string]$state.FocusTarget).Trim() }
+            if (-not [string]::IsNullOrWhiteSpace($state.CwdBase)) { $cwdBase = ([string]$state.CwdBase).Trim() }
+            if (-not [string]::IsNullOrWhiteSpace($state.TabTitle)) { $tabTitle = ([string]$state.TabTitle).Trim() }
         }
-        if (-not [string]::IsNullOrWhiteSpace($cwdBaseValue)) {
-            $cwdBase = $cwdBaseValue.Trim()
-        }
-        if (-not [string]::IsNullOrWhiteSpace($tabTitleValue)) {
-            $tabTitle = $tabTitleValue.Trim()
+        else {
+            $hostValue = Get-NotifyQueryValue -ParsedUri $parsedUri -Name 'host'
+            $cwdBaseValue = Get-NotifyQueryValue -ParsedUri $parsedUri -Name 'cwdBase'
+            $tabTitleValue = Get-NotifyQueryValue -ParsedUri $parsedUri -Name 'tabTitle'
+            if (-not [string]::IsNullOrWhiteSpace($hostValue)) { $targetHost = $hostValue.Trim() }
+            if (-not [string]::IsNullOrWhiteSpace($cwdBaseValue)) { $cwdBase = $cwdBaseValue.Trim() }
+            if (-not [string]::IsNullOrWhiteSpace($tabTitleValue)) { $tabTitle = $tabTitleValue.Trim() }
         }
     }
     catch {
     }
 }
 
-$keywords = @($tabTitle, $targetHost, $cwdBase)
-Write-NotifyActivateLog -Message ('activate-target host="{0}" cwdBase="{1}" tabTitle="{2}" keywords="{3}"' -f $targetHost, $cwdBase, $tabTitle, ($keywords -join ','))
-if (Focus-NotifyWindow -Keywords $keywords -TargetTabTitle $tabTitle) {
+if (-not [string]::IsNullOrWhiteSpace($env:PI_NOTIFY_FOCUS_TARGET)) { $targetHost = $env:PI_NOTIFY_FOCUS_TARGET.Trim() }
+if (-not [string]::IsNullOrWhiteSpace($env:PI_NOTIFY_CWD_BASE)) { $cwdBase = $env:PI_NOTIFY_CWD_BASE.Trim() }
+if (-not [string]::IsNullOrWhiteSpace($env:PI_NOTIFY_TAB_TITLE)) { $tabTitle = $env:PI_NOTIFY_TAB_TITLE.Trim() }
+
+$requiredText = if (-not [string]::IsNullOrWhiteSpace($tabTitle)) { $tabTitle } else { $cwdBase }
+$keywords = @($tabTitle, $cwdBase, $targetHost) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+Write-NotifyActivateLog -Message ('activate-target targetFingerprint="{0}" hasCwd={1} hasTab={2} requiredFingerprint="{3}" keywordCount={4}' -f (Get-NotifyActivateFingerprint $targetHost), (-not [string]::IsNullOrWhiteSpace($cwdBase)), (-not [string]::IsNullOrWhiteSpace($tabTitle)), (Get-NotifyActivateFingerprint $requiredText), @($keywords).Count)
+if ([string]::IsNullOrWhiteSpace($requiredText)) {
+    Write-NotifyActivateLog -Message ('activate-focus-miss missing-target-metadata no-target-open-skipped targetFingerprint="{0}"' -f (Get-NotifyActivateFingerprint $targetHost))
+    exit 1
+}
+if (Focus-NotifyWindow -Keywords $keywords -RequiredText $requiredText) {
     Write-NotifyActivateLog -Message 'activate-focus-success'
     exit 0
 }
 
-$wtExe = Resolve-NotifyBridgeWtExecutable
-$arguments = @('-w', '0', 'new-tab', '--title', ("Pi@{0}" -f $targetHost), 'ssh', $targetHost)
-Write-NotifyActivateLog -Message ('activate-focus-miss fallback-wt="{0}" args="{1}"' -f $wtExe, ($arguments -join ' '))
-Start-Process -FilePath $wtExe -ArgumentList $arguments | Out-Null
+Write-NotifyActivateLog -Message ('activate-focus-miss no-target-open-skipped targetFingerprint="{0}" hasCwd={1} hasTab={2}' -f (Get-NotifyActivateFingerprint $targetHost), (-not [string]::IsNullOrWhiteSpace($cwdBase)), (-not [string]::IsNullOrWhiteSpace($tabTitle)))
+exit 1
