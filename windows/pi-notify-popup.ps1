@@ -125,13 +125,20 @@ function Get-NotifyPopupWallpaperImage {
         $bytes = [System.IO.File]::ReadAllBytes($resolved)
         $stream = [System.IO.MemoryStream]::new($bytes)
         $loaded = $null
+        $graphics = $null
         try {
-            $loaded = [System.Drawing.Image]::FromStream($stream)
-            $bitmap = [System.Drawing.Bitmap]::new($loaded)
+            $loaded = [System.Drawing.Image]::FromStream($stream, $true, $true)
+            # Image.FromStream can lazily depend on the source stream. Copy pixels into
+            # a standalone bitmap before disposing the MemoryStream, otherwise later
+            # WinForms paint events may raise "Stream was not readable" dialogs.
+            $bitmap = [System.Drawing.Bitmap]::new($loaded.Width, $loaded.Height, [System.Drawing.Imaging.PixelFormat]::Format32bppPArgb)
+            $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+            $graphics.DrawImage($loaded, 0, 0, $loaded.Width, $loaded.Height)
             Write-NotifyPopupLog -Message ('popup-wallpaper-loaded "{0}" {1}x{2}' -f $resolved, $bitmap.Width, $bitmap.Height)
             return $bitmap
         }
         finally {
+            if ($null -ne $graphics) { $graphics.Dispose() }
             if ($null -ne $loaded) { $loaded.Dispose() }
             $stream.Dispose()
         }
@@ -738,31 +745,36 @@ $panel.Dock = [System.Windows.Forms.DockStyle]::Fill
 $panel.BackColor = $cardColor
 $panel.Cursor = [System.Windows.Forms.Cursors]::Hand
 $panel.Add_Paint({
-    $graphics = $_.Graphics
-    $graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
-    $rect = New-Object System.Drawing.Rectangle(0, 0, ($panel.Width - 1), ($panel.Height - 1))
+    try {
+        $graphics = $_.Graphics
+        $graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+        $rect = New-Object System.Drawing.Rectangle(0, 0, ($panel.Width - 1), ($panel.Height - 1))
 
-    if ($null -ne $script:NotifyPopupWallpaperImage) {
-        $dest = New-Object System.Drawing.Rectangle(0, 0, $panel.Width, $panel.Height)
-        $source = Get-NotifyPopupCoverSourceRectangle -Image $script:NotifyPopupWallpaperImage -TargetWidth $panel.Width -TargetHeight $panel.Height -VerticalOffsetPixels $script:NotifyPopupWallpaperOffsetYPixels
-        $graphics.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
-        $graphics.DrawImage($script:NotifyPopupWallpaperImage, $dest, $source, [System.Drawing.GraphicsUnit]::Pixel)
-        $overlay = [System.Drawing.Drawing2D.LinearGradientBrush]::new(
-            $dest,
-            [System.Drawing.Color]::FromArgb(170, 0, 0, 0),
-            [System.Drawing.Color]::FromArgb(70, 0, 0, 0),
-            [System.Drawing.Drawing2D.LinearGradientMode]::Horizontal)
-        try { $graphics.FillRectangle($overlay, $dest) } finally { $overlay.Dispose() }
+        if ($null -ne $script:NotifyPopupWallpaperImage) {
+            $dest = New-Object System.Drawing.Rectangle(0, 0, $panel.Width, $panel.Height)
+            $source = Get-NotifyPopupCoverSourceRectangle -Image $script:NotifyPopupWallpaperImage -TargetWidth $panel.Width -TargetHeight $panel.Height -VerticalOffsetPixels $script:NotifyPopupWallpaperOffsetYPixels
+            $graphics.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+            $graphics.DrawImage($script:NotifyPopupWallpaperImage, $dest, $source, [System.Drawing.GraphicsUnit]::Pixel)
+            $overlay = [System.Drawing.Drawing2D.LinearGradientBrush]::new(
+                $dest,
+                [System.Drawing.Color]::FromArgb(170, 0, 0, 0),
+                [System.Drawing.Color]::FromArgb(70, 0, 0, 0),
+                [System.Drawing.Drawing2D.LinearGradientMode]::Horizontal)
+            try { $graphics.FillRectangle($overlay, $dest) } finally { $overlay.Dispose() }
+        }
+
+        $path = New-NotifyPopupRoundedPath -Rectangle $rect -Radius 14
+        $pen = New-Object System.Drawing.Pen($borderColor, 1)
+        $accentBrush = New-Object System.Drawing.SolidBrush($accentColor)
+        $graphics.DrawPath($pen, $path)
+        $graphics.FillRectangle($accentBrush, 0, 0, 5, $panel.Height)
+        $accentBrush.Dispose()
+        $pen.Dispose()
+        $path.Dispose()
     }
-
-    $path = New-NotifyPopupRoundedPath -Rectangle $rect -Radius 14
-    $pen = New-Object System.Drawing.Pen($borderColor, 1)
-    $accentBrush = New-Object System.Drawing.SolidBrush($accentColor)
-    $graphics.DrawPath($pen, $path)
-    $graphics.FillRectangle($accentBrush, 0, 0, 5, $panel.Height)
-    $accentBrush.Dispose()
-    $pen.Dispose()
-    $path.Dispose()
+    catch {
+        Write-NotifyPopupLog -Message ('popup-paint-error "{0}"' -f $_.Exception.Message)
+    }
 })
 [void]$form.Controls.Add($panel)
 
