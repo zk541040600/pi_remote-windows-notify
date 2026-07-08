@@ -203,11 +203,12 @@ Notification payloads may include:
 {
   "focusTarget": "my",
   "cwdBase": "project-name",
-  "tabTitle": "π - project-name · sessionKey"
+  "tabTitle": "π - session-name-or-project · sessionKey",
+  "sessionName": "human-readable session name"
 }
 ```
 
-`popup-focus` uses `tabTitle` first, then `cwdBase`. It never opens a new Windows Terminal tab/window as a fallback.
+`popup-focus` uses `tabTitle` first, then `cwdBase`. It never opens a new Windows Terminal tab/window as a fallback. The custom popup renders `sessionName` as a large accent-colored line above the prompt/body; if no explicit session name is available, it falls back to the tab title/project name.
 
 `popupPlacement` controls which monitor gets the popup card:
 

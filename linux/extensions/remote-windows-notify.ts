@@ -102,6 +102,36 @@ function findLastTextForRole(messages: AgentMessageLike[], role: string): string
   return "";
 }
 
+function findFirstUserTextFromBranch(ctx: unknown): string {
+  try {
+    const branch = (ctx as { sessionManager?: { getBranch?: () => unknown[] } })?.sessionManager?.getBranch?.() ?? [];
+    for (const entry of branch) {
+      const message = (entry as { message?: AgentMessageLike })?.message;
+      if (message?.role !== "user") {
+        continue;
+      }
+      const text = extractTextContent(message.content);
+      if (text.trim()) {
+        return text;
+      }
+    }
+  } catch {
+  }
+
+  return "";
+}
+
+function getSessionDisplayName(ctx: unknown): string | undefined {
+  try {
+    const explicit = (ctx as { sessionManager?: { getSessionName?: () => string | undefined } })?.sessionManager
+      ?.getSessionName?.();
+    const display = normalizeText(explicit || findFirstUserTextFromBranch(ctx), "", 96);
+    return display || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function collectToolInfo(messages: AgentMessageLike[]): {
   toolNames: string[];
   hasToolError: boolean;
@@ -244,9 +274,9 @@ function normalizeTabTitlePart(value: string, fallback: string): string {
   return cleaned || fallback;
 }
 
-function getNotifyTabTitle(cwdBase: string): string {
-  const safeCwd = normalizeTabTitlePart(cwdBase, "Pi");
-  return `π - ${safeCwd} · ${NOTIFY_SESSION_KEY}`;
+function getNotifyTabTitle(cwdBase: string, sessionName?: string): string {
+  const safeName = normalizeTabTitlePart(sessionName || cwdBase, "Pi");
+  return `π - ${safeName} · ${NOTIFY_SESSION_KEY}`;
 }
 
 function setTerminalTitle(title: string): void {
@@ -263,7 +293,7 @@ function setTerminalTitle(title: string): void {
 async function notify(
   endpoint: string,
   token: string,
-  payload: { title: string; body: string; focusTarget?: string; cwdBase?: string; tabTitle?: string },
+  payload: { title: string; body: string; focusTarget?: string; cwdBase?: string; tabTitle?: string; sessionName?: string },
   timeoutMs: number,
 ): Promise<void> {
   const controller = new AbortController();
@@ -290,9 +320,9 @@ async function notify(
   }
 }
 
-function getCurrentNotifyTabTitle(): { cwdBase: string | undefined; tabTitle: string } {
+function getCurrentNotifyTabTitle(sessionName?: string): { cwdBase: string | undefined; tabTitle: string } {
   const cwdBase = basename(process.cwd()) || undefined;
-  return { cwdBase, tabTitle: getNotifyTabTitle(cwdBase || "") };
+  return { cwdBase, tabTitle: getNotifyTabTitle(cwdBase || "", sessionName) };
 }
 
 export default function remoteWindowsNotify(pi: ExtensionAPI) {
@@ -302,10 +332,21 @@ export default function remoteWindowsNotify(pi: ExtensionAPI) {
 
   globalState.__piRemoteWindowsNotifyRegistered = true;
 
+  let currentSessionName: string | undefined;
   const initialTitle = getCurrentNotifyTabTitle();
   setTerminalTitle(initialTitle.tabTitle);
 
-  pi.on("agent_end", async (event) => {
+  pi.on("session_start", (_event, ctx) => {
+    currentSessionName = getSessionDisplayName(ctx);
+    setTerminalTitle(getCurrentNotifyTabTitle(currentSessionName).tabTitle);
+  });
+
+  pi.on("session_info_changed", (event) => {
+    currentSessionName = normalizeText(event.name, "", 96) || undefined;
+    setTerminalTitle(getCurrentNotifyTabTitle(currentSessionName).tabTitle);
+  });
+
+  pi.on("agent_end", async (event, ctx) => {
     if (shouldSkipNotificationForThisProcess()) {
       return;
     }
@@ -324,7 +365,9 @@ export default function remoteWindowsNotify(pi: ExtensionAPI) {
         ? { title: config.title, body: renderBody(config.bodyTemplate) }
         : buildDynamicNotification(messages, config);
 
-    const { cwdBase, tabTitle } = getCurrentNotifyTabTitle();
+    const sessionName = currentSessionName || getSessionDisplayName(ctx);
+    const { cwdBase, tabTitle } = getCurrentNotifyTabTitle(sessionName);
+    currentSessionName = sessionName;
     setTerminalTitle(tabTitle);
 
     await notify(
@@ -335,6 +378,7 @@ export default function remoteWindowsNotify(pi: ExtensionAPI) {
         focusTarget: config.remoteHostAlias || undefined,
         cwdBase,
         tabTitle,
+        sessionName,
       },
       config.timeoutMs,
     );

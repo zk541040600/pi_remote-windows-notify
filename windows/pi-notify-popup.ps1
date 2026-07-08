@@ -5,6 +5,7 @@ param(
     [string]$FocusTarget,
     [string]$CwdBase,
     [string]$SourceTabTitle,
+    [string]$SessionName,
     [string]$PayloadPath,
     [string]$TargetFingerprint,
     [string]$ConfigPath,
@@ -92,6 +93,7 @@ if ([string]::IsNullOrWhiteSpace($Body) -and -not [string]::IsNullOrWhiteSpace($
 if ([string]::IsNullOrWhiteSpace($FocusTarget) -and -not [string]::IsNullOrWhiteSpace($env:PI_NOTIFY_FOCUS_TARGET)) { $FocusTarget = $env:PI_NOTIFY_FOCUS_TARGET }
 if ([string]::IsNullOrWhiteSpace($CwdBase) -and -not [string]::IsNullOrWhiteSpace($env:PI_NOTIFY_CWD_BASE)) { $CwdBase = $env:PI_NOTIFY_CWD_BASE }
 if ([string]::IsNullOrWhiteSpace($SourceTabTitle) -and -not [string]::IsNullOrWhiteSpace($env:PI_NOTIFY_TAB_TITLE)) { $SourceTabTitle = $env:PI_NOTIFY_TAB_TITLE }
+if ([string]::IsNullOrWhiteSpace($SessionName) -and -not [string]::IsNullOrWhiteSpace($env:PI_NOTIFY_SESSION_NAME)) { $SessionName = $env:PI_NOTIFY_SESSION_NAME }
 $script:NotifyPopupLogPath = Join-Path (Get-NotifyBridgeLogDir) 'popup.log'
 $script:NotifyPopupCachePath = Join-Path (Get-NotifyBridgeLogDir) 'popup-cache.json'
 $popupWallpaperPath = if ($config.PSObject.Properties['PopupWallpaperPath']) { [string]$config.PopupWallpaperPath } else { '' }
@@ -327,6 +329,7 @@ function Test-NotifyPopupDedupeSuperseded {
 $Title = if ([string]::IsNullOrWhiteSpace($Title)) { 'Ready for input' } else { $Title }
 $Body = if ([string]::IsNullOrWhiteSpace($Body)) { '' } else { $Body }
 $FocusTarget = if ([string]::IsNullOrWhiteSpace($FocusTarget)) { $config.RemoteHostAlias } else { $FocusTarget }
+$SessionName = if ([string]::IsNullOrWhiteSpace($SessionName)) { '' } else { $SessionName.Trim() }
 
 if (([string]$CwdBase).Trim() -match '^\{[^}]+\}$') { $CwdBase = '' }
 if (([string]$SourceTabTitle).Trim() -match '^\{[^}]+\}$') { $SourceTabTitle = '' }
@@ -793,7 +796,7 @@ $mutedColor = [System.Drawing.Color]::FromArgb(168, 178, 195)
 
 $form = New-Object PiNotifyNoActivateForm
 $form.Text = 'Pi'
-$form.Size = New-Object System.Drawing.Size(420, 128)
+$form.Size = New-Object System.Drawing.Size(420, 154)
 $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::None
 $form.StartPosition = [System.Windows.Forms.FormStartPosition]::Manual
 $form.ShowInTaskbar = $false
@@ -859,10 +862,36 @@ $closeLabel.Text = 'x'
 $closeLabel.Cursor = [System.Windows.Forms.Cursors]::Hand
 [void]$panel.Controls.Add($closeLabel)
 
+$sessionDisplayName = $SessionName
+if ([string]::IsNullOrWhiteSpace($sessionDisplayName) -and -not [string]::IsNullOrWhiteSpace($SourceTabTitle)) {
+    $tabPrefix = ([string][char]0x03c0) + ' - '
+    $tabSeparator = ' ' + ([string][char]0x00b7) + ' '
+    if ($SourceTabTitle.StartsWith($tabPrefix, [System.StringComparison]::OrdinalIgnoreCase) -and $SourceTabTitle.IndexOf($tabSeparator, [System.StringComparison]::OrdinalIgnoreCase) -gt $tabPrefix.Length) {
+        $start = $tabPrefix.Length
+        $end = $SourceTabTitle.IndexOf($tabSeparator, [System.StringComparison]::OrdinalIgnoreCase)
+        $sessionDisplayName = $SourceTabTitle.Substring($start, $end - $start)
+    }
+    else {
+        $sessionDisplayName = $SourceTabTitle
+    }
+}
+if ([string]::IsNullOrWhiteSpace($sessionDisplayName)) { $sessionDisplayName = $CwdBase }
+if ([string]::IsNullOrWhiteSpace($sessionDisplayName)) { $sessionDisplayName = 'Pi Session' }
+
+$sessionLabel = New-Object System.Windows.Forms.Label
+$sessionLabel.Location = New-Object System.Drawing.Point(22, 34)
+$sessionLabel.Size = New-Object System.Drawing.Size(354, 30)
+$sessionLabel.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 14, [System.Drawing.FontStyle]::Regular)
+$sessionLabel.ForeColor = $accentColor
+$sessionLabel.Text = $sessionDisplayName
+$sessionLabel.AutoEllipsis = $true
+$sessionLabel.Cursor = [System.Windows.Forms.Cursors]::Hand
+[void]$panel.Controls.Add($sessionLabel)
+
 $titleLabel = New-Object System.Windows.Forms.Label
-$titleLabel.Location = New-Object System.Drawing.Point(22, 40)
-$titleLabel.Size = New-Object System.Drawing.Size(354, 28)
-$titleLabel.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 12, [System.Drawing.FontStyle]::Regular)
+$titleLabel.Location = New-Object System.Drawing.Point(22, 68)
+$titleLabel.Size = New-Object System.Drawing.Size(354, 24)
+$titleLabel.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 10, [System.Drawing.FontStyle]::Regular)
 $titleLabel.ForeColor = [System.Drawing.Color]::FromArgb(248, 250, 252)
 $titleLabel.Text = $Title
 $titleLabel.AutoEllipsis = $true
@@ -870,8 +899,8 @@ $titleLabel.Cursor = [System.Windows.Forms.Cursors]::Hand
 [void]$panel.Controls.Add($titleLabel)
 
 $bodyLabel = New-Object System.Windows.Forms.Label
-$bodyLabel.Location = New-Object System.Drawing.Point(22, 72)
-$bodyLabel.Size = New-Object System.Drawing.Size(374, 38)
+$bodyLabel.Location = New-Object System.Drawing.Point(22, 96)
+$bodyLabel.Size = New-Object System.Drawing.Size(374, 42)
 $bodyLabel.Font = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Regular)
 $bodyLabel.ForeColor = [System.Drawing.Color]::FromArgb(214, 221, 233)
 $bodyLabel.Text = $Body
@@ -880,7 +909,7 @@ $bodyLabel.Cursor = [System.Windows.Forms.Cursors]::Hand
 [void]$panel.Controls.Add($bodyLabel)
 
 if ($null -ne $script:NotifyPopupWallpaperImage) {
-    foreach ($label in @($appLabel, $closeLabel, $titleLabel, $bodyLabel)) {
+    foreach ($label in @($appLabel, $closeLabel, $sessionLabel, $titleLabel, $bodyLabel)) {
         $label.BackColor = [System.Drawing.Color]::Transparent
     }
 }
@@ -908,7 +937,7 @@ $closeAction = {
     $form.Close()
 }
 
-foreach ($control in @($form, $panel, $appLabel, $titleLabel, $bodyLabel)) {
+foreach ($control in @($form, $panel, $appLabel, $sessionLabel, $titleLabel, $bodyLabel)) {
     $control.Add_Click($activateAction)
     $control.Add_MouseDown($activateAction)
 }

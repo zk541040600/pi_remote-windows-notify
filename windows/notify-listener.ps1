@@ -438,12 +438,14 @@ function Show-Toast {
         [string]$FocusTarget,
         [string]$CwdBase,
         [string]$TabTitle,
+        [string]$SessionName,
         [string]$LaunchUri
     )
 
     $focusTarget = if ([string]::IsNullOrWhiteSpace($FocusTarget)) { [string]$config.RemoteHostAlias } else { [string]$FocusTarget }
     $cwdBase = if ([string]::IsNullOrWhiteSpace($CwdBase)) { '' } else { [string]$CwdBase }
     $tabTitle = if ([string]::IsNullOrWhiteSpace($TabTitle)) { '' } else { [string]$TabTitle }
+    $sessionName = if ([string]::IsNullOrWhiteSpace($SessionName)) { '' } else { [string]$SessionName }
 
     if ($DisplayMode -eq 'popup-focus' -and (Test-Path -LiteralPath $script:NotifyPopupScript)) {
         $targetKey = Get-NotifyPopupTargetKey -TargetHost $focusTarget -CwdBase $cwdBase -TabTitle $tabTitle
@@ -473,6 +475,7 @@ function Show-Toast {
         $popupStartInfo.EnvironmentVariables['PI_NOTIFY_FOCUS_TARGET'] = [string]$focusTarget
         $popupStartInfo.EnvironmentVariables['PI_NOTIFY_CWD_BASE'] = [string]$cwdBase
         $popupStartInfo.EnvironmentVariables['PI_NOTIFY_TAB_TITLE'] = [string]$tabTitle
+        $popupStartInfo.EnvironmentVariables['PI_NOTIFY_SESSION_NAME'] = [string]$sessionName
         $popupProcess = [System.Diagnostics.Process]::Start($popupStartInfo)
         Write-NotifyListenerLog -Message ('popup-pid {0} slot={1} targetFingerprint="{2}"' -f $popupProcess.Id, $stackIndex, $targetFingerprint)
         return
@@ -564,6 +567,7 @@ try {
             $focusTarget = [string]$config.RemoteHostAlias
             $cwdBase = ''
             $tabTitle = ''
+            $sessionName = ''
             if ($null -ne $payload) {
                 if ($payload.PSObject.Properties['title'] -and -not [string]::IsNullOrWhiteSpace([string]$payload.title)) {
                     $title = [string]$payload.title
@@ -580,9 +584,13 @@ try {
                 if ($payload.PSObject.Properties['tabTitle'] -and -not [string]::IsNullOrWhiteSpace([string]$payload.tabTitle)) {
                     $tabTitle = [string]$payload.tabTitle
                 }
+                if ($payload.PSObject.Properties['sessionName'] -and -not [string]::IsNullOrWhiteSpace([string]$payload.sessionName)) {
+                    $sessionName = [string]$payload.sessionName
+                }
             }
             $title = if ([string]::IsNullOrWhiteSpace($title)) { 'Pi' } else { $title.Trim() }
             $body = if ([string]::IsNullOrWhiteSpace($body)) { 'Ready for input' } else { $body.Trim() }
+            $sessionName = if ([string]::IsNullOrWhiteSpace($sessionName)) { '' } else { $sessionName.Trim() }
             if ([string]::IsNullOrWhiteSpace($cwdBase) -and $body -match '(?i)\bcwd\s*[:=]\s*([^|\u00B7]+)') {
                 $cwdValue = $Matches[1].Trim().Trim('"')
                 $cwdBase = if ([string]::IsNullOrWhiteSpace($cwdValue)) { '' } else { Split-Path -Leaf $cwdValue }
@@ -602,7 +610,7 @@ try {
             $launchUri = Get-NotifyBridgeActivationUri -ActivationId ([Guid]::NewGuid().ToString('N'))
 
             Write-NotifyListenerLog -Message ('notify targetFingerprint="{0}" hasCwd={1} hasTab={2}' -f (Get-NotifyPopupTargetFingerprint -TargetKey $focusTarget), (-not [string]::IsNullOrWhiteSpace($cwdBase)), (-not [string]::IsNullOrWhiteSpace($tabTitle)))
-            Show-Toast -Title $title -Body $body -ToastAppId $AppId -FocusTarget $focusTarget -CwdBase $cwdBase -TabTitle $tabTitle -LaunchUri $launchUri
+            Show-Toast -Title $title -Body $body -ToastAppId $AppId -FocusTarget $focusTarget -CwdBase $cwdBase -TabTitle $tabTitle -SessionName $sessionName -LaunchUri $launchUri
             $notified = $true
             Write-HttpResponse -Stream $stream -StatusCode 200 -Reason 'OK' -Body 'ok'
         }
