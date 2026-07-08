@@ -56,6 +56,39 @@ function Join-NotifyProcessArguments {
     return (@($ArgumentList) | ForEach-Object { ConvertTo-NotifyProcessArgument -Value ([string]$_) }) -join ' '
 }
 
+function Start-NotifyDetachedCommand {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$CommandLine,
+        [string]$Name = 'process'
+    )
+
+    $vbsPath = Join-Path $env:TEMP ('pi-notify-{0}-start-{1}-{2}.vbs' -f $Name, $PID, ([Guid]::NewGuid().ToString('N')))
+    $escapedCommand = $CommandLine.Replace('"', '""')
+    $content = @"
+Set shell = CreateObject("WScript.Shell")
+shell.Run "$escapedCommand", 0, False
+"@
+    [System.IO.File]::WriteAllText($vbsPath, $content.TrimStart(), [System.Text.UTF8Encoding]::new($false))
+
+    $taskName = 'PiNotifyStart_{0}_{1}' -f $Name, ([Guid]::NewGuid().ToString('N').Substring(0, 8))
+    try {
+        $action = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument (Join-NotifyProcessArguments @($vbsPath))
+        $trigger = New-ScheduledTaskTrigger -Once -At ((Get-Date).AddMinutes(1))
+        $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
+        Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Force | Out-Null
+        Start-ScheduledTask -TaskName $taskName
+        Start-Sleep -Seconds 6
+        return
+    }
+    catch {
+        Start-Process -FilePath 'wscript.exe' -ArgumentList (Join-NotifyProcessArguments @($vbsPath)) -WindowStyle Hidden | Out-Null
+    }
+    finally {
+        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+    }
+}
+
 function Stop-NotifyProcessId {
     param(
         [int]$ProcessId,
@@ -199,6 +232,33 @@ function Stop-NotifyWatchdogProcesses {
     }
 }
 
+function Stop-NotifyBrokerProcesses {
+    foreach ($processId in Get-NotifyScriptProcessIds -ScriptName 'pi-notify-broker.ps1') {
+        Stop-NotifyProcessId -ProcessId $processId -Reason 'broker-process-scan'
+    }
+    Remove-Item -LiteralPath (Join-Path $baseDir 'broker.pid') -Force -ErrorAction SilentlyContinue
+}
+
+function Start-NotifyBroker {
+    $brokerScript = Join-Path $binDir 'pi-notify-broker.ps1'
+    if (-not (Test-Path -LiteralPath $brokerScript)) {
+        Write-Host 'skip broker start: script not found'
+        return
+    }
+    $cfg = Get-Content $configPath -Raw | ConvertFrom-Json
+    $brokerEnabled = $true
+    if ($cfg.PSObject.Properties['brokerEnabled']) {
+        try { $brokerEnabled = [bool]$cfg.brokerEnabled } catch { $brokerEnabled = $true }
+    }
+    if (-not $brokerEnabled) {
+        Write-Host 'skip broker start: brokerEnabled=false'
+        return
+    }
+    $brokerCommand = ('"{0}" -NoProfile -STA -WindowStyle Hidden -ExecutionPolicy Bypass -File "{1}" -ConfigPath "{2}"' -f (Get-NotifyBridgePowerShellExe), $brokerScript, $configPath)
+    Start-NotifyDetachedCommand -CommandLine $brokerCommand -Name 'broker'
+    Write-Host 'broker started'
+}
+
 function Reset-NotifyLog {
     param(
         [string]$BaseDir,
@@ -216,7 +276,7 @@ function Reset-NotifyLog {
 function Clear-NotifyPopupRuntimeArtifacts {
     $logDir = Join-Path $baseDir 'logs'
     if (-not (Test-Path -LiteralPath $logDir)) { return }
-    foreach ($pattern in @('popup-cache.json', 'activation-*.json', 'popup-live.*.json', 'popup-payload.json', 'popup-dedupe.json', 'popup-stdout.log', 'popup-stderr.log', 'popup-payload.*.json', 'popup-dedupe.*.json', 'popup-stdout.*.log', 'popup-stderr.*.log', 'popup.log', 'listener.log', 'activate.log', 'hotkey.log')) {
+    foreach ($pattern in @('popup-cache.json', 'activation-*.json', 'popup-live.*.json', 'popup-payload.json', 'popup-dedupe.json', 'popup-stdout.log', 'popup-stderr.log', 'popup-payload.*.json', 'popup-dedupe.*.json', 'popup-stdout.*.log', 'popup-stderr.*.log', 'popup.log', 'listener.log', 'activate.log', 'hotkey.log', 'broker.log')) {
         foreach ($item in @(Get-ChildItem -LiteralPath $logDir -Filter $pattern -File -ErrorAction SilentlyContinue)) {
             Remove-Item -LiteralPath $item.FullName -Force -ErrorAction SilentlyContinue
         }
@@ -293,6 +353,7 @@ $runtimeFiles = @(
     'NotifyBridge.Common.ps1',
     'notify-listener.ps1',
     'pi-notify-popup.ps1',
+    'pi-notify-broker.ps1',
     'pi-notify-activate.ps1',
     'pi-notify-hotkey.ps1',
     'pi-notify-reverse-tunnel.ps1',
@@ -356,35 +417,77 @@ else {
 if ($SkipTunnel) {
     Write-Host "[5/7] keep existing reverse tunnel; restart watchdog around listener refresh (-SkipTunnel)"
     Stop-NotifyWatchdogProcesses
+    Stop-NotifyBrokerProcesses
     Reset-NotifyLog -BaseDir $baseDir -Name 'watchdog.log'
     Reset-NotifyLog -BaseDir $baseDir -Name 'hotkey.log'
+    Reset-NotifyLog -BaseDir $baseDir -Name 'broker.log'
 }
 else {
-    Write-Host "[5/7] stop old tunnel/watchdog..."
+    Write-Host "[5/7] stop old tunnel/watchdog/broker..."
     Stop-NotifyPidFile -Path $tunnelPidPath -Reason 'tunnel-pid-file'
     Stop-NotifyTunnelProcesses -Port ([int]$cfg.port)
     Stop-NotifyWatchdogProcesses
+    Stop-NotifyBrokerProcesses
     Reset-NotifyLog -BaseDir $baseDir -Name 'tunnel.log'
     Reset-NotifyLog -BaseDir $baseDir -Name 'watchdog.log'
     Reset-NotifyLog -BaseDir $baseDir -Name 'hotkey.log'
+    Reset-NotifyLog -BaseDir $baseDir -Name 'broker.log'
 }
 
 Write-Host "[6/7] restart listener..."
-& "$binDir\pi-notify-restart-listener.ps1" -ConfigPath $configPath
-if ($LASTEXITCODE -ne 0) {
-    throw ('Listener restart script failed with exit code {0}.' -f $LASTEXITCODE)
+$listenerLogDir = Join-Path $baseDir 'logs'
+New-Item -ItemType Directory -Force -Path $listenerLogDir | Out-Null
+$listenerStatusPath = Join-Path $listenerLogDir 'restart-listener.status.json'
+$listenerRestartLogPath = Join-Path $listenerLogDir 'restart-listener.log'
+Remove-Item -LiteralPath $listenerStatusPath -Force -ErrorAction SilentlyContinue
+$listenerRestartCommand = ('"{0}" -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{1}" -ConfigPath "{2}" -TimeoutSeconds 60 -StatusPath "{3}" -LogPath "{4}"' -f (Get-NotifyBridgePowerShellExe), (Join-Path $binDir 'pi-notify-restart-listener.ps1'), $configPath, $listenerStatusPath, $listenerRestartLogPath)
+Start-NotifyDetachedCommand -CommandLine $listenerRestartCommand -Name 'listener'
+$listenerStatus = $null
+$health = $null
+for ($attempt = 1; $attempt -le 120; $attempt++) {
+    Start-Sleep -Milliseconds 500
+    if (Test-Path -LiteralPath $listenerStatusPath) {
+        try {
+            $listenerStatus = Get-Content -LiteralPath $listenerStatusPath -Raw | ConvertFrom-Json
+        }
+        catch {
+            continue
+        }
+        if ([string]$listenerStatus.status -eq 'error') {
+            throw ([string]$listenerStatus.message)
+        }
+        if ([string]$listenerStatus.status -eq 'ok') {
+            try {
+                $health = Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:$($cfg.port)/health" -TimeoutSec 2
+                if ($health.StatusCode -eq 200) { break }
+            }
+            catch {
+                $health = $null
+            }
+        }
+    }
 }
-$health = Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:$($cfg.port)/health" -TimeoutSec 2
+if ($null -eq $health) {
+    if ($null -ne $listenerStatus -and -not [string]::IsNullOrWhiteSpace([string]$listenerStatus.message)) {
+        throw ('Listener did not become healthy on port {0}: {1}' -f $cfg.port, $listenerStatus.message)
+    }
+    throw ('Listener did not become healthy on port {0}.' -f $cfg.port)
+}
+Write-Host ('listener healthy port={0}' -f $cfg.port)
 
 if ($SkipTunnel) {
-    Write-Host "[7/7] keep reverse tunnel; start watchdog..."
-    Start-Process powershell.exe -WindowStyle Hidden -ArgumentList (Join-NotifyProcessArguments @('-NoProfile','-WindowStyle','Hidden','-ExecutionPolicy','Bypass','-File', "$binDir\pi-notify-watchdog.ps1", '-ConfigPath', $configPath, '-StartupDelaySeconds', '5')) | Out-Null
+    Write-Host "[7/7] keep reverse tunnel; start broker/watchdog..."
+    Start-NotifyBroker
+    $watchdogCommand = ('"{0}" -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{1}" -ConfigPath "{2}" -StartupDelaySeconds 5' -f (Get-NotifyBridgePowerShellExe), (Join-Path $binDir 'pi-notify-watchdog.ps1'), $configPath)
+    Start-NotifyDetachedCommand -CommandLine $watchdogCommand -Name 'watchdog'
 }
 else {
-    Write-Host "[7/7] start reverse tunnel/watchdog..."
-    $tunnelProcess = Start-Process powershell.exe -WindowStyle Hidden -ArgumentList (Join-NotifyProcessArguments @('-NoProfile','-WindowStyle','Hidden','-ExecutionPolicy','Bypass','-File', "$binDir\pi-notify-reverse-tunnel.ps1", '-ConfigPath', $configPath, '-TunnelStartupDelaySeconds', '5')) -PassThru
-    Set-Content -LiteralPath $tunnelPidPath -Value ([string]$tunnelProcess.Id) -Encoding ASCII
-    Start-Process powershell.exe -WindowStyle Hidden -ArgumentList (Join-NotifyProcessArguments @('-NoProfile','-WindowStyle','Hidden','-ExecutionPolicy','Bypass','-File', "$binDir\pi-notify-watchdog.ps1", '-ConfigPath', $configPath, '-StartupDelaySeconds', '5')) | Out-Null
+    Write-Host "[7/7] start reverse tunnel/broker/watchdog..."
+    $tunnelCommand = ('"{0}" -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{1}" -ConfigPath "{2}" -TunnelStartupDelaySeconds 5' -f (Get-NotifyBridgePowerShellExe), (Join-Path $binDir 'pi-notify-reverse-tunnel.ps1'), $configPath)
+    Start-NotifyDetachedCommand -CommandLine $tunnelCommand -Name 'tunnel'
+    Start-NotifyBroker
+    $watchdogCommand = ('"{0}" -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{1}" -ConfigPath "{2}" -StartupDelaySeconds 5' -f (Get-NotifyBridgePowerShellExe), (Join-Path $binDir 'pi-notify-watchdog.ps1'), $configPath)
+    Start-NotifyDetachedCommand -CommandLine $watchdogCommand -Name 'watchdog'
 }
 
 $remoteTunnelHealth = $null

@@ -38,20 +38,68 @@ function Test-NotifyListenerHealth {
     }
 }
 
-function Test-NotifyRemoteTunnel {
-    $probe = @"
-python3 - <<'PY'
-import urllib.request
-with urllib.request.urlopen('http://127.0.0.1:$($config.Port)/health', timeout=4) as r:
-    print('HTTP', r.status)
-PY
-"@
+function Test-NotifyBrokerHealth {
+    $brokerEnabled = $false
+    if ($config.PSObject.Properties['BrokerEnabled']) {
+        try { $brokerEnabled = [bool]$config.BrokerEnabled } catch { $brokerEnabled = $false }
+    }
+    if (-not $brokerEnabled) { return $null }
+    $brokerUrl = $null
+    if ($config.PSObject.Properties['BrokerHealthUrl']) {
+        $brokerUrl = [string]$config.BrokerHealthUrl
+    }
+    else {
+        $brokerPort = 23119
+        if ($config.PSObject.Properties['BrokerPort']) { try { $brokerPort = [int]$config.BrokerPort } catch {} }
+        $brokerUrl = ('http://127.0.0.1:{0}/health' -f $brokerPort)
+    }
     try {
-        $output = & $config.SshExecutable -T -o BatchMode=yes -o ConnectTimeout=10 $config.RemoteHostAlias $probe 2>$null
-        return ($LASTEXITCODE -eq 0)
+        $response = Invoke-WebRequest -UseBasicParsing -Uri $brokerUrl -TimeoutSec 3
+        return ($response.StatusCode -eq 200)
     }
     catch {
         return $false
+    }
+}
+
+function Get-NotifyBrokerScriptPath {
+    return (Join-Path (Get-NotifyBridgeBinDir) 'pi-notify-broker.ps1')
+}
+
+function Test-NotifyRemoteTunnel {
+    $remoteCommand = ('timeout 8s python3 -c "import urllib.request; r=urllib.request.urlopen(''http://127.0.0.1:{0}/health'', timeout=4); print(''HTTP'', r.status)"' -f $config.Port)
+    $stdoutPath = Join-Path ([System.IO.Path]::GetTempPath()) ('pi-notify-watchdog-ssh-{0}.out' -f ([Guid]::NewGuid().ToString('N')))
+    $stderrPath = Join-Path ([System.IO.Path]::GetTempPath()) ('pi-notify-watchdog-ssh-{0}.err' -f ([Guid]::NewGuid().ToString('N')))
+    $process = $null
+    try {
+        $arguments = Join-NotifyBridgeProcessArguments @(
+            '-T',
+            '-o', 'BatchMode=yes',
+            '-o', 'ConnectTimeout=5',
+            '-o', 'ServerAliveInterval=2',
+            '-o', 'ServerAliveCountMax=2',
+            $config.RemoteHostAlias,
+            $remoteCommand
+        )
+        $process = Start-Process -FilePath $config.SshExecutable -ArgumentList $arguments -WindowStyle Hidden -PassThru -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
+        if (-not $process.WaitForExit(12000)) {
+            try { Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue } catch {}
+            return $false
+        }
+        try { $process.Refresh() } catch {}
+        $probeOutput = ''
+        if (Test-Path -LiteralPath $stdoutPath) {
+            try { $probeOutput = [string](Get-Content -LiteralPath $stdoutPath -Raw -ErrorAction SilentlyContinue) } catch { $probeOutput = '' }
+        }
+        return (($process.ExitCode -eq 0) -or ($probeOutput -match 'HTTP\s+200'))
+    }
+    catch {
+        if ($null -ne $process) { try { Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue } catch {} }
+        return $false
+    }
+    finally {
+        Remove-Item -LiteralPath $stdoutPath -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $stderrPath -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -235,7 +283,8 @@ while ($true) {
     try {
         $listenerOk = Test-NotifyListenerHealth
         $tunnelOk = Test-NotifyRemoteTunnel
-        Write-NotifyWatchdogLog -Message ('health listener={0} tunnel={1}' -f $listenerOk, $tunnelOk)
+        $brokerOk = Test-NotifyBrokerHealth
+        Write-NotifyWatchdogLog -Message ('health listener={0} tunnel={1} broker={2}' -f $listenerOk, $tunnelOk, $brokerOk)
 
         $directListenerPids = Get-NotifyProcessIds -Pattern '*notify-listener.ps1*'
         $listenerRunnerPids = Get-NotifyProcessIds -Pattern '*pi-notify-listener-runner.ps1*'
@@ -248,15 +297,25 @@ while ($true) {
                 $pidFileOk = @($listenerRunnerPids | Where-Object { $_ -eq $listenerPidValue }).Count -eq 1
             }
         }
-        $staleListener = @($directListenerPids).Count -gt 0 -or @($listenerRunnerPids).Count -ne 1 -or -not $pidFileOk
-        if (-not $listenerOk -or $staleListener) {
+        # Stale listener detection: if /health is OK, tolerate pid-file/process-shape
+        # mismatch and only restart on duplicate owned listener processes. Only when
+        # /health is false do we use the stricter shape check. This avoids repeated
+        # false stale-listener restarts when pid discovery is imperfect.
+        $duplicateListener = @($directListenerPids).Count -gt 1 -or @($listenerRunnerPids).Count -gt 1
+        if ($listenerOk) {
+            $staleListener = $duplicateListener
+        }
+        else {
+            $staleListener = $true
+        }
+        if ($staleListener) {
             $script:NotifyWatchdogListenerMisses += 1
         }
         else {
             $script:NotifyWatchdogListenerMisses = 0
         }
         if ($script:NotifyWatchdogListenerMisses -ge 2) {
-            Write-NotifyWatchdogLog -Message ('stale-listener direct={0} runner={1} pidFileOk={2} misses={3}' -f (@($directListenerPids).Count), (@($listenerRunnerPids).Count), $pidFileOk, $script:NotifyWatchdogListenerMisses)
+            Write-NotifyWatchdogLog -Message ('stale-listener direct={0} runner={1} pidFileOk={2} listenerOk={3} misses={4} duplicate={5}' -f (@($directListenerPids).Count), (@($listenerRunnerPids).Count), $pidFileOk, $listenerOk, $script:NotifyWatchdogListenerMisses, $duplicateListener)
             Stop-NotifyProcessGroup -ProcessIds (Merge-NotifyProcessIds -First $directListenerPids -Second $listenerRunnerPids)
             Start-NotifyScript -ScriptName 'pi-notify-restart-listener.ps1'
             $script:NotifyWatchdogListenerMisses = 0
@@ -296,6 +355,37 @@ while ($true) {
             Start-NotifyScript -ScriptName 'pi-notify-reverse-tunnel.ps1'
             $script:NotifyWatchdogTunnelMisses = 0
             Start-Sleep -Seconds 5
+        }
+
+        # Broker supervision: only supervise when brokerEnabled and the script exists.
+        # Returns $null when disabled, so we skip entirely in that case.
+        if ($null -ne $brokerOk) {
+            $brokerPids = Get-NotifyProcessIds -Pattern '*pi-notify-broker.ps1*'
+            $duplicateBroker = @($brokerPids).Count -gt 1
+            if (-not $brokerOk -or $duplicateBroker) {
+                $script:NotifyWatchdogBrokerMisses += 1
+            }
+            else {
+                $script:NotifyWatchdogBrokerMisses = 0
+            }
+            if ($script:NotifyWatchdogBrokerMisses -ge 2) {
+                Write-NotifyWatchdogLog -Message ('stale-broker brokerOk={0} count={1} misses={2}' -f $brokerOk, (@($brokerPids).Count), $script:NotifyWatchdogBrokerMisses)
+                Stop-NotifyProcessGroup -ProcessIds $brokerPids
+                $brokerScriptPath = Get-NotifyBrokerScriptPath
+                if (Test-Path -LiteralPath $brokerScriptPath) {
+                    Start-Process -FilePath (Get-NotifyBridgePowerShellExe) -WindowStyle Hidden -ArgumentList (Join-NotifyBridgeProcessArguments @(
+                        '-NoProfile',
+                        '-STA',
+                        '-WindowStyle', 'Hidden',
+                        '-ExecutionPolicy', 'Bypass',
+                        '-File', $brokerScriptPath,
+                        '-ConfigPath', $config.ConfigPath
+                    )) | Out-Null
+                    Write-NotifyWatchdogLog -Message 'broker-restart-requested'
+                }
+                $script:NotifyWatchdogBrokerMisses = 0
+                Start-Sleep -Seconds 3
+            }
         }
     }
     catch {

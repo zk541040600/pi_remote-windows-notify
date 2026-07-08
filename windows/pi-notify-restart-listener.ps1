@@ -1,6 +1,6 @@
 param(
     [string]$ConfigPath = "$env:USERPROFILE\.pi-notify\config.json",
-    [int]$TimeoutSeconds = 12,
+    [int]$TimeoutSeconds = 60,
     [switch]$Worker,
     [string]$StatusPath,
     [string]$LogPath
@@ -50,6 +50,39 @@ function Join-NotifyProcessArguments {
     return (@($ArgumentList) | ForEach-Object { ConvertTo-NotifyProcessArgument -Value ([string]$_) }) -join ' '
 }
 
+function Start-NotifyDetachedCommand {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$CommandLine,
+        [string]$Name = 'listener'
+    )
+
+    $vbsPath = Join-Path $env:TEMP ('pi-notify-{0}-start-{1}-{2}.vbs' -f $Name, $PID, ([Guid]::NewGuid().ToString('N')))
+    $escapedCommand = $CommandLine.Replace('"', '""')
+    $content = @"
+Set shell = CreateObject("WScript.Shell")
+shell.Run "$escapedCommand", 0, False
+"@
+    [System.IO.File]::WriteAllText($vbsPath, $content.TrimStart(), [System.Text.UTF8Encoding]::new($false))
+
+    $taskName = 'PiNotifyStart_{0}_{1}' -f $Name, ([Guid]::NewGuid().ToString('N').Substring(0, 8))
+    try {
+        $action = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument (Join-NotifyProcessArguments @($vbsPath))
+        $trigger = New-ScheduledTaskTrigger -Once -At ((Get-Date).AddMinutes(1))
+        $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
+        Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Force | Out-Null
+        Start-ScheduledTask -TaskName $taskName
+        Start-Sleep -Seconds 6
+        return
+    }
+    catch {
+        Start-Process -FilePath 'wscript.exe' -ArgumentList (Join-NotifyProcessArguments @($vbsPath)) -WindowStyle Hidden | Out-Null
+    }
+    finally {
+        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+    }
+}
+
 function Sync-LocalRuntimeFiles {
     $runtimeFiles = @(
         'NotifyBridge.Common.ps1',
@@ -57,6 +90,7 @@ function Sync-LocalRuntimeFiles {
         'pi-notify-listener-runner.ps1',
         'pi-notify-restart-listener.ps1',
         'pi-notify-popup.ps1',
+        'pi-notify-broker.ps1',
         'pi-notify-activate.ps1',
     'pi-notify-hotkey.ps1',
         'pi-notify-reverse-tunnel.ps1',
@@ -249,9 +283,13 @@ function Invoke-Worker {
         '-ConfigPath', $ConfigPath
     )) -PassThru
 
-    for ($i = 0; $i -lt 12; $i++) {
+    $maxAttempts = [Math]::Max(6, ([Math]::Max(3, $TimeoutSeconds) * 2))
+    for ($i = 0; $i -lt $maxAttempts; $i++) {
         Start-Sleep -Milliseconds 500
-        if ((Test-NewListenerAlive -Process $listener) -and (Test-HttpHealth -Port $port)) {
+        $alive = Test-NewListenerAlive -Process $listener
+        $healthy = Test-HttpHealth -Port $port
+        Write-RestartLog ('listener poll attempt={0} alive={1} healthy={2}' -f $i, $alive, $healthy)
+        if ($alive -and $healthy) {
             Write-RestartLog "listener restarted pid=$($listener.Id) port=$port"
             Write-Status -Status 'ok' -Message 'listener restarted' -PidValue $listener.Id -PortValue $port
             return

@@ -82,7 +82,7 @@ function Test-NotifyHotkeyPopupProcessOwned {
         $process = Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f $ProcessId) -ErrorAction Stop
         if ($null -eq $process) { return $false }
         $commandLine = [string]$process.CommandLine
-        return ($commandLine -like '*pi-notify-popup.ps1*' -and (Test-NotifyHotkeyCommandLineContainsPath -CommandLine $commandLine -Path $config.ConfigPath))
+        return (($commandLine -like '*pi-notify-popup.ps1*' -or $commandLine -like '*pi-notify-broker.ps1*') -and (Test-NotifyHotkeyCommandLineContainsPath -CommandLine $commandLine -Path $config.ConfigPath))
     }
     catch {
         return $false
@@ -136,6 +136,9 @@ function Get-NotifyHotkeyLivePopupStates {
                 [int]::TryParse([string]$state.stackIndex, [ref]$stackIndex) | Out-Null
             }
             $targetFingerprint = if ($state.PSObject.Properties['targetFingerprint']) { [string]$state.targetFingerprint } else { Get-NotifyHotkeyFingerprint -Value $targetHost }
+            $brokerManaged = $false
+            if ($state.PSObject.Properties['brokerManaged']) { $brokerManaged = [bool]$state.brokerManaged }
+            $popupId = if ($state.PSObject.Properties['popupId']) { [string]$state.popupId } else { '' }
 
             $rows += [pscustomobject]@{
                 ProcessId         = $pidValue
@@ -146,6 +149,8 @@ function Get-NotifyHotkeyLivePopupStates {
                 TargetFingerprint = $targetFingerprint
                 StackIndex        = $stackIndex
                 StartedAtTicks    = $startedAtTicks
+                BrokerManaged     = $brokerManaged
+                PopupId           = $popupId
             }
         }
         catch {
@@ -189,7 +194,40 @@ function Start-NotifyHotkeyActivation {
 
     $hasCwd = -not [string]::IsNullOrWhiteSpace([string]$PopupState.CwdBase)
     $hasTab = -not [string]::IsNullOrWhiteSpace([string]$PopupState.TabTitle)
-    Write-NotifyHotkeyLog -Message ('activate-oldest pid={0} targetFingerprint={1} hasCwd={2} hasTab={3} stackIndex={4}' -f $PopupState.ProcessId, $PopupState.TargetFingerprint, $hasCwd, $hasTab, $PopupState.StackIndex)
+    $brokerManaged = [bool]$PopupState.BrokerManaged
+    Write-NotifyHotkeyLog -Message ('activate-oldest pid={0} targetFingerprint={1} hasCwd={2} hasTab={3} stackIndex={4} brokerManaged={5}' -f $PopupState.ProcessId, $PopupState.TargetFingerprint, $hasCwd, $hasTab, $PopupState.StackIndex, $brokerManaged)
+
+    if ($brokerManaged) {
+        $brokerCloseUrl = $null
+        if ($config.PSObject.Properties['BrokerCloseUrl']) { $brokerCloseUrl = [string]$config.BrokerCloseUrl }
+        elseif ($config.PSObject.Properties['BrokerPort']) {
+            $brokerCloseUrl = ('http://127.0.0.1:{0}/close' -f [int]$config.BrokerPort)
+        }
+        if ([string]::IsNullOrWhiteSpace($brokerCloseUrl) -or [string]::IsNullOrWhiteSpace([string]$PopupState.PopupId)) {
+            Remove-Item -LiteralPath ([string]$PopupState.Path) -Force -ErrorAction SilentlyContinue
+            return $false
+        }
+        try {
+            $closePayload = ('{{"popupId":"{0}","activate":true}}' -f ([string]$PopupState.PopupId))
+            $closeBytes = [System.Text.Encoding]::UTF8.GetBytes($closePayload)
+            $closeReq = [System.Net.HttpWebRequest]::Create($brokerCloseUrl)
+            $closeReq.Method = 'POST'
+            $closeReq.ContentType = 'application/json; charset=utf-8'
+            $closeReq.Timeout = 2000
+            $closeReq.ReadWriteTimeout = 2000
+            $closeStream = $closeReq.GetRequestStream()
+            try { $closeStream.Write($closeBytes, 0, $closeBytes.Length) } finally { $closeStream.Close() }
+            $closeResp = $closeReq.GetResponse()
+            try { } finally { $closeResp.Close() }
+            Write-NotifyHotkeyLog -Message ('broker-popup-activate-request popupId={0}' -f $PopupState.PopupId)
+            return $true
+        }
+        catch {
+            Write-NotifyHotkeyLog -Message ('broker-popup-activate-request-error popupId={0} "{1}"' -f $PopupState.PopupId, $_.Exception.Message)
+            return $false
+        }
+    }
+
     $process = [System.Diagnostics.Process]::Start($startInfo)
     if ($null -eq $process) { return $false }
 
@@ -200,13 +238,47 @@ function Start-NotifyHotkeyActivation {
     }
 
     if ($process.ExitCode -eq 0) {
-        try {
-            Stop-Process -Id ([int]$PopupState.ProcessId) -Force -ErrorAction Stop
-            Remove-Item -LiteralPath ([string]$PopupState.Path) -Force -ErrorAction SilentlyContinue
-            Write-NotifyHotkeyLog -Message ('popup-close-after-activate pid={0}' -f $PopupState.ProcessId)
+        if ($brokerManaged) {
+            # Broker-managed popups: do NOT kill the broker process; ask the broker to close this popup card.
+            $brokerCloseUrl = $null
+            if ($config.PSObject.Properties['BrokerCloseUrl']) { $brokerCloseUrl = [string]$config.BrokerCloseUrl }
+            elseif ($config.PSObject.Properties['BrokerPort']) {
+                $brokerCloseUrl = ('http://127.0.0.1:{0}/close' -f [int]$config.BrokerPort)
+            }
+            if (-not [string]::IsNullOrWhiteSpace($brokerCloseUrl) -and -not [string]::IsNullOrWhiteSpace([string]$PopupState.PopupId)) {
+                try {
+                    $closePayload = ('{{"popupId":"{0}"}}' -f ([string]$PopupState.PopupId))
+                    $closeBytes = [System.Text.Encoding]::UTF8.GetBytes($closePayload)
+                    $closeReq = [System.Net.HttpWebRequest]::Create($brokerCloseUrl)
+                    $closeReq.Method = 'POST'
+                    $closeReq.ContentType = 'application/json; charset=utf-8'
+                    $closeReq.Timeout = 2000
+                    $closeReq.ReadWriteTimeout = 2000
+                    $closeStream = $closeReq.GetRequestStream()
+                    try { $closeStream.Write($closeBytes, 0, $closeBytes.Length) } finally { $closeStream.Close() }
+                    $closeResp = $closeReq.GetResponse()
+                    try { } finally { $closeResp.Close() }
+                    Write-NotifyHotkeyLog -Message ('broker-popup-close-after-activate popupId={0}' -f $PopupState.PopupId)
+                }
+                catch {
+                    Write-NotifyHotkeyLog -Message ('broker-popup-close-after-activate-error popupId={0} "{1}"' -f $PopupState.PopupId, $_.Exception.Message)
+                    # Fallback: remove the live-state file so the stale popup is not re-activated
+                    Remove-Item -LiteralPath ([string]$PopupState.Path) -Force -ErrorAction SilentlyContinue
+                }
+            }
+            else {
+                Remove-Item -LiteralPath ([string]$PopupState.Path) -Force -ErrorAction SilentlyContinue
+            }
         }
-        catch {
-            Write-NotifyHotkeyLog -Message ('popup-close-after-activate-error pid={0} "{1}"' -f $PopupState.ProcessId, $_.Exception.Message)
+        else {
+            try {
+                Stop-Process -Id ([int]$PopupState.ProcessId) -Force -ErrorAction Stop
+                Remove-Item -LiteralPath ([string]$PopupState.Path) -Force -ErrorAction SilentlyContinue
+                Write-NotifyHotkeyLog -Message ('popup-close-after-activate pid={0}' -f $PopupState.ProcessId)
+            }
+            catch {
+                Write-NotifyHotkeyLog -Message ('popup-close-after-activate-error pid={0} "{1}"' -f $PopupState.ProcessId, $_.Exception.Message)
+            }
         }
         return $true
     }

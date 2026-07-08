@@ -31,6 +31,7 @@ $script:NotifyToastEventHandlers = New-Object System.Collections.ArrayList
 $script:NotifyActivationCleanupTimers = New-Object System.Collections.ArrayList
 $script:NotifyActivationScript = Join-Path $PSScriptRoot 'pi-notify-activate.ps1'
 $script:NotifyPopupScript = Join-Path $PSScriptRoot 'pi-notify-popup.ps1'
+$script:NotifyBrokerScript = Join-Path $PSScriptRoot 'pi-notify-broker.ps1'
 $script:NotifyPowerShellExe = Get-NotifyBridgePowerShellExe
 $script:NotifyListenerLogPath = Join-Path (Get-NotifyBridgeLogDir) 'listener.log'
 $script:NotifyRecentNotifications = @()
@@ -67,6 +68,19 @@ function Write-HttpResponse {
         $Stream.Write($bodyBytes, 0, $bodyBytes.Length)
     }
     $Stream.Flush()
+}
+
+function Test-NotifyListenerClientDisconnect {
+    param([System.Exception]$Exception)
+
+    $current = $Exception
+    while ($null -ne $current) {
+        if (($current -is [System.IO.IOException]) -or ($current -is [System.Net.Sockets.SocketException])) {
+            return $true
+        }
+        $current = $current.InnerException
+    }
+    return $false
 }
 
 function Read-HttpRequest {
@@ -427,6 +441,212 @@ function Test-NotifyDuplicateDrop {
     return $false
 }
 
+# Broker delegation helpers: prefer long-lived broker for popup-focus, fall back to per-popup process
+function Test-NotifyBrokerHealth {
+    try {
+        $request = [System.Net.HttpWebRequest]::Create($config.BrokerHealthUrl)
+        $request.Method = 'GET'
+        $request.Timeout = [Math]::Max(100, [int]$config.BrokerRequestTimeoutMs)
+        $request.ReadWriteTimeout = [Math]::Max(100, [int]$config.BrokerRequestTimeoutMs)
+        $response = $request.GetResponse()
+        try { return ([int]$response.StatusCode -eq 200) } finally { $response.Close() }
+    }
+    catch {
+        return $false
+    }
+}
+
+function Get-NotifyBrokerProcessIds {
+    $processIds = @()
+    try {
+        $processes = @(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object { $_.CommandLine -like '*pi-notify-broker.ps1*' })
+        foreach ($process in $processes) {
+            $commandLine = [string]$process.CommandLine
+            $brokerConfigPath = Get-NotifyCommandLineArgument -CommandLine $commandLine -Name 'ConfigPath'
+            if ([string]::IsNullOrWhiteSpace($brokerConfigPath)) { continue }
+            try {
+                if (-not ([System.IO.Path]::GetFullPath($brokerConfigPath).Equals([System.IO.Path]::GetFullPath($ConfigPath), [System.StringComparison]::OrdinalIgnoreCase))) { continue }
+            }
+            catch { continue }
+            $processIds += [int]$process.ProcessId
+        }
+    }
+    catch {
+        Write-NotifyListenerLog -Message ('broker-process-scan-error "{0}"' -f $_.Exception.Message)
+    }
+    return @($processIds | Select-Object -Unique)
+}
+
+function Start-NotifyBroker {
+    if (-not (Test-Path -LiteralPath $script:NotifyBrokerScript)) {
+        Write-NotifyListenerLog -Message 'broker-start-skip missing-broker-script'
+        return $false
+    }
+
+    $existingBrokerPids = @(Get-NotifyBrokerProcessIds)
+    if ($existingBrokerPids.Count -gt 0) {
+        Write-NotifyListenerLog -Message ('broker-start-skip existing count={0}' -f $existingBrokerPids.Count)
+        return $true
+    }
+
+    try {
+        $brokerArgs = Join-NotifyBridgeProcessArguments @(
+            '-NoProfile',
+            '-STA',
+            '-WindowStyle', 'Hidden',
+            '-ExecutionPolicy', 'Bypass',
+            '-File', $script:NotifyBrokerScript,
+            '-ConfigPath', $ConfigPath
+        )
+        $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+        $startInfo.FileName = $script:NotifyPowerShellExe
+        $startInfo.Arguments = $brokerArgs
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $true
+        [void][System.Diagnostics.Process]::Start($startInfo)
+        Write-NotifyListenerLog -Message ('broker-start-request port={0}' -f $config.BrokerPort)
+        return $true
+    }
+    catch {
+        Write-NotifyListenerLog -Message ('broker-start-error "{0}"' -f $_.Exception.Message)
+        return $false
+    }
+}
+
+function Send-NotifyBrokerPopup {
+    param(
+        [Parameter(Mandatory = $true)][string]$Title,
+        [Parameter(Mandatory = $true)][string]$Body,
+        [string]$FocusTarget,
+        [string]$CwdBase,
+        [string]$TabTitle,
+        [string]$SessionName,
+        [Parameter(Mandatory = $true)][string]$TargetFingerprint,
+        [int]$StackIndex,
+        [int]$TimeoutSeconds,
+        [string]$PopupPlacement
+    )
+
+    $payload = @{
+        title = $Title
+        body = $Body
+        focusTarget = $FocusTarget
+        cwdBase = $CwdBase
+        tabTitle = $TabTitle
+        sessionName = $SessionName
+        targetFingerprint = $TargetFingerprint
+        stackIndex = $StackIndex
+        timeoutSeconds = $TimeoutSeconds
+        popupPlacement = $PopupPlacement
+    } | ConvertTo-Json -Depth 4 -Compress
+    $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($payload)
+
+    try {
+        $request = [System.Net.HttpWebRequest]::Create($config.BrokerPopupUrl)
+        $request.Method = 'POST'
+        $request.ContentType = 'application/json; charset=utf-8'
+        $request.Timeout = $config.BrokerRequestTimeoutMs
+        $request.ReadWriteTimeout = $config.BrokerRequestTimeoutMs
+        $requestStream = $request.GetRequestStream()
+        try { $requestStream.Write($bodyBytes, 0, $bodyBytes.Length) } finally { $requestStream.Close() }
+        $response = $request.GetResponse()
+        try { return ([int]$response.StatusCode -eq 200) } finally { $response.Close() }
+    }
+    catch {
+        Write-NotifyListenerLog -Message ('broker-post-error "{0}"' -f $_.Exception.Message)
+        return $false
+    }
+}
+
+function Invoke-NotifyBrokerPopup {
+    param(
+        [Parameter(Mandatory = $true)][string]$Title,
+        [Parameter(Mandatory = $true)][string]$Body,
+        [string]$FocusTarget,
+        [string]$CwdBase,
+        [string]$TabTitle,
+        [string]$SessionName,
+        [Parameter(Mandatory = $true)][string]$TargetFingerprint,
+        [int]$StackIndex,
+        [int]$TimeoutSeconds,
+        [string]$PopupPlacement
+    )
+
+    $brokerEnabled = $false
+    if ($config.PSObject.Properties['BrokerEnabled']) {
+        try { $brokerEnabled = [bool]$config.BrokerEnabled } catch { $brokerEnabled = $false }
+    }
+    if (-not $brokerEnabled) {
+        return $false
+    }
+
+    if (-not (Test-NotifyBrokerHealth)) {
+        Write-NotifyListenerLog -Message 'broker-health-miss attempting-start'
+        $started = Start-NotifyBroker
+        if ($started) {
+            $deadline = [DateTime]::UtcNow.AddMilliseconds([Math]::Max(100, [int]$config.BrokerStartupTimeoutMs))
+            while ([DateTime]::UtcNow -lt $deadline) {
+                Start-Sleep -Milliseconds 50
+                if (Test-NotifyBrokerHealth) { break }
+            }
+        }
+    }
+
+    if (-not (Test-NotifyBrokerHealth)) {
+        Write-NotifyListenerLog -Message 'broker-unavailable fallback=popup-process'
+        return $false
+    }
+
+    $sent = Send-NotifyBrokerPopup -Title $Title -Body $Body -FocusTarget $FocusTarget -CwdBase $CwdBase -TabTitle $TabTitle -SessionName $SessionName -TargetFingerprint $TargetFingerprint -StackIndex $StackIndex -TimeoutSeconds $TimeoutSeconds -PopupPlacement $PopupPlacement
+    if (-not $sent) {
+        Write-NotifyListenerLog -Message 'broker-post-failed fallback=popup-process'
+        return $false
+    }
+
+    Write-NotifyListenerLog -Message ('broker-popup-sent targetFingerprint={0} slot={1} timeout={2}' -f $TargetFingerprint, $StackIndex, $TimeoutSeconds)
+    return $true
+}
+
+function Start-NotifyPopupProcess {
+    param(
+        [Parameter(Mandatory = $true)][string]$Title,
+        [Parameter(Mandatory = $true)][string]$Body,
+        [string]$FocusTarget,
+        [string]$CwdBase,
+        [string]$TabTitle,
+        [string]$SessionName,
+        [Parameter(Mandatory = $true)][string]$TargetFingerprint,
+        [int]$StackIndex,
+        [int]$TimeoutSeconds
+    )
+
+    Clear-NotifyBridgePopupArtifacts -Aggressive
+    $popupArguments = Join-NotifyBridgeProcessArguments @(
+        '-NoProfile',
+        '-STA',
+        '-WindowStyle', 'Hidden',
+        '-ExecutionPolicy', 'Bypass',
+        '-File', $script:NotifyPopupScript,
+        '-ConfigPath', $ConfigPath,
+        '-TargetFingerprint', $TargetFingerprint,
+        '-StackIndex', $StackIndex,
+        '-TimeoutSeconds', $TimeoutSeconds
+    )
+    $popupStartInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $popupStartInfo.FileName = $script:NotifyPowerShellExe
+    $popupStartInfo.Arguments = $popupArguments
+    $popupStartInfo.UseShellExecute = $false
+    $popupStartInfo.CreateNoWindow = $true
+    $popupStartInfo.EnvironmentVariables['PI_NOTIFY_TITLE'] = [string]$Title
+    $popupStartInfo.EnvironmentVariables['PI_NOTIFY_BODY'] = [string]$Body
+    $popupStartInfo.EnvironmentVariables['PI_NOTIFY_FOCUS_TARGET'] = [string]$FocusTarget
+    $popupStartInfo.EnvironmentVariables['PI_NOTIFY_CWD_BASE'] = [string]$CwdBase
+    $popupStartInfo.EnvironmentVariables['PI_NOTIFY_TAB_TITLE'] = [string]$TabTitle
+    $popupStartInfo.EnvironmentVariables['PI_NOTIFY_SESSION_NAME'] = [string]$SessionName
+    $popupProcess = [System.Diagnostics.Process]::Start($popupStartInfo)
+    Write-NotifyListenerLog -Message ('popup-pid {0} slot={1} targetFingerprint="{2}"' -f $popupProcess.Id, $StackIndex, $TargetFingerprint)
+}
+
 function Show-Toast {
     param(
         [Parameter(Mandatory = $true)]
@@ -449,35 +669,18 @@ function Show-Toast {
 
     if ($DisplayMode -eq 'popup-focus' -and (Test-Path -LiteralPath $script:NotifyPopupScript)) {
         $targetKey = Get-NotifyPopupTargetKey -TargetHost $focusTarget -CwdBase $cwdBase -TabTitle $tabTitle
-        $stackIndex = Get-NotifyPopupStackPlan -TargetKey $targetKey
-        Clear-NotifyBridgePopupArtifacts -Aggressive
         $targetFingerprint = Get-NotifyPopupTargetFingerprint -TargetKey $targetKey
 
-        Write-NotifyListenerLog -Message ('popup-launch targetFingerprint="{0}" slot={1} timeout={2}' -f $targetFingerprint, $stackIndex, $PopupTimeoutSeconds)
-        $popupArguments = Join-NotifyBridgeProcessArguments @(
-            '-NoProfile',
-            '-STA',
-            '-WindowStyle', 'Hidden',
-            '-ExecutionPolicy', 'Bypass',
-            '-File', $script:NotifyPopupScript,
-            '-ConfigPath', $ConfigPath,
-            '-TargetFingerprint', $targetFingerprint,
-            '-StackIndex', $stackIndex,
-            '-TimeoutSeconds', $PopupTimeoutSeconds
-        )
-        $popupStartInfo = [System.Diagnostics.ProcessStartInfo]::new()
-        $popupStartInfo.FileName = $script:NotifyPowerShellExe
-        $popupStartInfo.Arguments = $popupArguments
-        $popupStartInfo.UseShellExecute = $false
-        $popupStartInfo.CreateNoWindow = $true
-        $popupStartInfo.EnvironmentVariables['PI_NOTIFY_TITLE'] = [string]$Title
-        $popupStartInfo.EnvironmentVariables['PI_NOTIFY_BODY'] = [string]$Body
-        $popupStartInfo.EnvironmentVariables['PI_NOTIFY_FOCUS_TARGET'] = [string]$focusTarget
-        $popupStartInfo.EnvironmentVariables['PI_NOTIFY_CWD_BASE'] = [string]$cwdBase
-        $popupStartInfo.EnvironmentVariables['PI_NOTIFY_TAB_TITLE'] = [string]$tabTitle
-        $popupStartInfo.EnvironmentVariables['PI_NOTIFY_SESSION_NAME'] = [string]$sessionName
-        $popupProcess = [System.Diagnostics.Process]::Start($popupStartInfo)
-        Write-NotifyListenerLog -Message ('popup-pid {0} slot={1} targetFingerprint="{2}"' -f $popupProcess.Id, $stackIndex, $targetFingerprint)
+        $brokerSent = Invoke-NotifyBrokerPopup -Title $Title -Body $Body -FocusTarget $focusTarget -CwdBase $cwdBase -TabTitle $tabTitle -SessionName $sessionName -TargetFingerprint $targetFingerprint -StackIndex 0 -TimeoutSeconds $PopupTimeoutSeconds -PopupPlacement ([string]$config.PopupPlacement)
+        if ($brokerSent) {
+            return
+        }
+
+        $stackIndex = Get-NotifyPopupStackPlan -TargetKey $targetKey
+        Clear-NotifyBridgePopupArtifacts -Aggressive
+
+        Write-NotifyListenerLog -Message ('popup-launch targetFingerprint={0} slot={1} timeout={2} source=fallback' -f $targetFingerprint, $stackIndex, $PopupTimeoutSeconds)
+        Start-NotifyPopupProcess -Title $Title -Body $Body -FocusTarget $focusTarget -CwdBase $cwdBase -TabTitle $tabTitle -SessionName $sessionName -TargetFingerprint $targetFingerprint -StackIndex $stackIndex -TimeoutSeconds $PopupTimeoutSeconds
         return
     }
 
@@ -615,14 +818,19 @@ try {
             Write-HttpResponse -Stream $stream -StatusCode 200 -Reason 'OK' -Body 'ok'
         }
         catch {
-            try {
-                if ($stream) {
-                    Write-HttpResponse -Stream $stream -StatusCode 500 -Reason 'Internal Server Error' -Body 'error'
+            if (Test-NotifyListenerClientDisconnect -Exception $_.Exception) {
+                Write-NotifyListenerLog -Message 'client-disconnect'
+            }
+            else {
+                try {
+                    if ($stream) {
+                        Write-HttpResponse -Stream $stream -StatusCode 500 -Reason 'Internal Server Error' -Body 'error'
+                    }
                 }
+                catch {
+                }
+                Write-NotifyListenerLog -Message ('error "{0}"' -f $_.Exception.Message)
             }
-            catch {
-            }
-            Write-NotifyListenerLog -Message ('error "{0}"' -f $_.Exception.Message)
         }
         finally {
             try {

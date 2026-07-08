@@ -124,6 +124,7 @@ $filesToCopy = @(
     'pi-notify-activate.ps1',
     'pi-notify-hotkey.ps1',
     'pi-notify-popup.ps1',
+    'pi-notify-broker.ps1',
     'pi-notify-watchdog.ps1',
     'pi-notify-listener-runner.ps1',
     'pi-notify-restart-listener.ps1',
@@ -151,6 +152,7 @@ $listenerScript = Join-Path $binDir 'pi-notify-restart-listener.ps1'
 $tunnelScript = Join-Path $binDir 'pi-notify-reverse-tunnel.ps1'
 $hotkeyScript = Join-Path $binDir 'pi-notify-hotkey.ps1'
 $activationScript = Join-Path $binDir 'pi-notify-activate.ps1'
+$brokerScript = Join-Path $binDir 'pi-notify-broker.ps1'
 $powershellExe = Get-NotifyBridgePowerShellExe
 $toastSupport = Register-NotifyBridgeSystemToastSupport -ConfigPathValue $config.ConfigPath -ToastAppId 'Pi Remote'
 $protocolUri = $toastSupport.ProtocolUri
@@ -161,10 +163,11 @@ $installMode = ''
 $listenerVbs = Join-Path $startupDir 'PiNotifyListener.vbs'
 $tunnelVbs = Join-Path $startupDir 'PiNotifyTunnel.vbs'
 $watchdogVbs = Join-Path $startupDir 'PiNotifyWatchdog.vbs'
+$brokerVbs = Join-Path $startupDir 'PiNotifyBroker.vbs'
 $hotkeyVbs = Join-Path $startupDir 'PiNotifyHotkey.vbs'
 Remove-Item -LiteralPath $hotkeyVbs -Force -ErrorAction SilentlyContinue
 
-foreach ($taskName in @('PiNotifyListener', 'PiNotifyTunnel', 'PiNotifyWatchdog', 'PiNotifyHotkey')) {
+foreach ($taskName in @('PiNotifyListener', 'PiNotifyTunnel', 'PiNotifyWatchdog', 'PiNotifyHotkey', 'PiNotifyBroker')) {
     Remove-LegacyScheduledTask -TaskName $taskName
 }
 
@@ -174,9 +177,31 @@ New-VbsLauncher -FilePath $listenerVbs -PowerShellExe $powershellExe -ScriptPath
 New-VbsLauncher -FilePath $tunnelVbs -PowerShellExe $powershellExe -ScriptPath $tunnelScript -ConfigPathValue $config.ConfigPath
 New-VbsLauncher -FilePath $watchdogVbs -PowerShellExe $powershellExe -ScriptPath $watchdogScript -ConfigPathValue $config.ConfigPath
 
+# Broker needs -STA for the WinForms message loop; write a dedicated VBS launcher
+$brokerCommand = ('"{0}" -NoProfile -STA -WindowStyle Hidden -ExecutionPolicy Bypass -File "{1}" -ConfigPath "{2}"' -f $powershellExe, $brokerScript, $config.ConfigPath)
+$brokerEscaped = $brokerCommand.Replace('"', '""')
+$brokerContent = @"
+Set shell = CreateObject("WScript.Shell")
+shell.Run "$brokerEscaped", 0, False
+"@
+$brokerContent = $brokerContent.TrimStart()
+if (Test-Path -LiteralPath $brokerVbs) {
+    $existingBroker = Get-Content -LiteralPath $brokerVbs -Raw -ErrorAction SilentlyContinue
+    if ($existingBroker -ne $brokerContent -and $existingBroker -ne ($brokerContent + "`r`n") -and $existingBroker -ne ($brokerContent + "`n")) {
+        $brokerTemp = ('{0}.tmp.{1}' -f $brokerVbs, $PID)
+        [System.IO.File]::WriteAllText($brokerTemp, $brokerContent, [System.Text.UTF8Encoding]::new($false))
+        Move-Item -LiteralPath $brokerTemp -Destination $brokerVbs -Force
+    }
+}
+else {
+    [System.IO.File]::WriteAllText($brokerVbs, $brokerContent, [System.Text.UTF8Encoding]::new($false))
+}
+
 if ($StartNow) {
     & wscript.exe $listenerVbs | Out-Null
     Start-Sleep -Seconds 2
+    & wscript.exe $brokerVbs | Out-Null
+    Start-Sleep -Seconds 1
     & wscript.exe $tunnelVbs | Out-Null
     Start-Sleep -Seconds 2
     & wscript.exe $watchdogVbs | Out-Null
@@ -192,6 +217,7 @@ Write-Host ('Click URI    : {0}' -f $protocolUri)
 Write-Host ('Toast link   : {0}' -f $toastShortcutPath)
 Write-Host ('Listener VBS : {0}' -f $listenerVbs)
 Write-Host ('Tunnel VBS   : {0}' -f $tunnelVbs)
+Write-Host ('Broker VBS   : {0}' -f $brokerVbs)
 Write-Host ('Watchdog VBS : {0}' -f $watchdogVbs)
 Write-Host ('Hotkey link  : {0}' -f $popupHotkeyShortcutPath)
 Write-Host ('Popup hotkey : {0}' -f $config.PopupHotkey)

@@ -635,7 +635,11 @@ function Ensure-NotifyBridgeConfig {
         [string]$PopupHotkey,
         [bool]$PopupHotkeyEnabled,
         [string]$PopupWallpaperPath,
-        [int]$PopupWallpaperOffsetYPixels
+        [int]$PopupWallpaperOffsetYPixels,
+        [bool]$BrokerEnabled,
+        [int]$BrokerPort,
+        [int]$BrokerStartupTimeoutMs,
+        [int]$BrokerRequestTimeoutMs
     )
 
     $resolvedPath = Set-NotifyBridgeActiveConfigPath -ConfigPath $ConfigPath
@@ -795,6 +799,46 @@ function Ensure-NotifyBridgeConfig {
         0
     }
 
+    $finalBrokerEnabled = if ($PSBoundParameters.ContainsKey('BrokerEnabled')) {
+        [bool]$BrokerEnabled
+    }
+    elseif ($existing.ContainsKey('brokerEnabled')) {
+        ConvertTo-NotifyBridgeBoolean -Value $existing['brokerEnabled'] -Default $true
+    }
+    else {
+        $true
+    }
+
+    $finalBrokerPort = if ($PSBoundParameters.ContainsKey('BrokerPort') -and $BrokerPort -gt 0) {
+        $BrokerPort
+    }
+    elseif ($existing.ContainsKey('brokerPort') -and [int]$existing['brokerPort'] -gt 0) {
+        [int]$existing['brokerPort']
+    }
+    else {
+        23119
+    }
+
+    $finalBrokerStartupTimeoutMs = if ($PSBoundParameters.ContainsKey('BrokerStartupTimeoutMs') -and $BrokerStartupTimeoutMs -ge 100) {
+        $BrokerStartupTimeoutMs
+    }
+    elseif ($existing.ContainsKey('brokerStartupTimeoutMs') -and [int]$existing['brokerStartupTimeoutMs'] -ge 100) {
+        [int]$existing['brokerStartupTimeoutMs']
+    }
+    else {
+        700
+    }
+
+    $finalBrokerRequestTimeoutMs = if ($PSBoundParameters.ContainsKey('BrokerRequestTimeoutMs') -and $BrokerRequestTimeoutMs -ge 100) {
+        $BrokerRequestTimeoutMs
+    }
+    elseif ($existing.ContainsKey('brokerRequestTimeoutMs') -and [int]$existing['brokerRequestTimeoutMs'] -ge 100) {
+        [int]$existing['brokerRequestTimeoutMs']
+    }
+    else {
+        700
+    }
+
     $config = @{
         listenHost                = $finalHost
         port                      = $finalPort
@@ -812,6 +856,10 @@ function Ensure-NotifyBridgeConfig {
         popupHotkeyEnabled        = $finalPopupHotkeyEnabled
         popupWallpaperPath        = $finalPopupWallpaperPath
         popupWallpaperOffsetYPixels = $finalPopupWallpaperOffsetYPixels
+        brokerEnabled              = $finalBrokerEnabled
+        brokerPort                 = $finalBrokerPort
+        brokerStartupTimeoutMs     = $finalBrokerStartupTimeoutMs
+        brokerRequestTimeoutMs     = $finalBrokerRequestTimeoutMs
         updatedAtUtc              = [DateTime]::UtcNow.ToString('o')
     }
 
@@ -835,5 +883,13 @@ function Ensure-NotifyBridgeConfig {
         PopupHotkeyEnabled        = $config.popupHotkeyEnabled
         PopupWallpaperPath        = $config.popupWallpaperPath
         PopupWallpaperOffsetYPixels = $config.popupWallpaperOffsetYPixels
+        BrokerEnabled              = $config.brokerEnabled
+        BrokerPort                 = $config.brokerPort
+        BrokerStartupTimeoutMs     = $config.brokerStartupTimeoutMs
+        BrokerRequestTimeoutMs     = $config.brokerRequestTimeoutMs
+        BrokerUrl                  = ('http://127.0.0.1:{0}' -f $config.brokerPort)
+        BrokerHealthUrl            = ('http://127.0.0.1:{0}/health' -f $config.brokerPort)
+        BrokerPopupUrl             = ('http://127.0.0.1:{0}/popup' -f $config.brokerPort)
+        BrokerCloseUrl             = ('http://127.0.0.1:{0}/close' -f $config.brokerPort)
     }
 }

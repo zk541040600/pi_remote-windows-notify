@@ -6,12 +6,14 @@ This folder implements a reliable **Windows local notification bridge** for runn
 
 - `NotifyBridge.Common.ps1` — shared config / path / SSH helpers
 - `notify-listener.ps1` — Windows local HTTP listener that shows toast notifications
+- `pi-notify-broker.ps1` — long-lived low-latency WinForms broker for popup-focus mode (loopback HTTP on port 23119)
+- `pi-notify-popup.ps1` — fallback per-notification popup process used when the broker is unavailable or disabled
 - `pi-notify-reverse-tunnel.ps1` — persistent reverse SSH tunnel with auto-reconnect
-- `pi-notify-watchdog.ps1` — self-heal watchdog for listener/tunnel health
+- `pi-notify-watchdog.ps1` — self-heal watchdog for listener/tunnel/broker health
 - `pi-notify-hotkey.ps1` — one-shot target activation used by the Start Menu global shortcut
 - `set-notify-mode.ps1` — switch between `system-toast` and `popup-focus`
 - `install-remote-windows-notify.ps1` — installs the remote Pi extension + config
-- `install-windows-autostart.ps1` — registers Startup-folder launchers for listener/tunnel/watchdog and removes legacy scheduled tasks
+- `install-windows-autostart.ps1` — registers Startup-folder launchers for listener/broker/tunnel/watchdog and removes legacy scheduled tasks
 - `install-linux-autostart.ps1` — installs Linux systemd boot-time remote guard on `my`
 - `install-autostart-all.ps1` — one-shot installer for both Windows + Linux autostart
 - `remote-windows-notify.ts` — Pi extension template installed on the remote host
@@ -20,7 +22,10 @@ This folder implements a reliable **Windows local notification bridge** for runn
 
 ```text
 Windows local machine
-  notify-listener.ps1
+  notify-listener.ps1 :23118 (public /notify endpoint, token auth)
+    -> popup-focus mode: POST to pi-notify-broker.ps1 :23119 (loopback only)
+       -> long-lived WinForms process shows popup cards without per-notification startup
+    -> broker unavailable/post fails: fallback to pi-notify-popup.ps1 process
   pi-notify-reverse-tunnel.ps1
         ^
         | persistent ssh -R reverse tunnel
@@ -28,6 +33,8 @@ Windows local machine
 Remote host my
   Pi extension POST http://127.0.0.1:23118/notify
 ```
+
+The broker binds only `127.0.0.1` and is never exposed through the SSH tunnel. The listener remains the single public entry point and continues to authenticate every request.
 
 ## First-time remote install
 
@@ -80,12 +87,13 @@ powershell.exe -ExecutionPolicy Bypass -File .\scripts\pi-notify\install-windows
 Installer behavior:
 
 - removes legacy scheduled tasks named `PiNotifyListener`, `PiNotifyTunnel`, and `PiNotifyWatchdog`
-- writes Startup-folder launchers for listener/tunnel/watchdog
+- writes Startup-folder launchers for listener/broker/tunnel/watchdog
 - writes a Start Menu shortcut with the configured `popupHotkey`
 
 Startup files:
 
 - `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\PiNotifyListener.vbs`
+- `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\PiNotifyBroker.vbs`
 - `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\PiNotifyTunnel.vbs`
 - `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\PiNotifyWatchdog.vbs`
 
@@ -93,7 +101,7 @@ Hotkey shortcut:
 
 - `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Pi Notify Oldest Popup.lnk`
 
-They start at user logon. `PiNotifyListener.vbs` invokes `pi-notify-restart-listener.ps1`, so startup keeps the runner-owned listener invariant instead of launching `notify-listener.ps1` directly. `PiNotifyTunnel` keeps retrying automatically if SSH drops, and `PiNotifyWatchdog` periodically verifies local listener and remote loopback tunnel health and restarts the broken side when needed. The Start Menu shortcut owns the global popup hotkey, so no always-running hotkey process is required.
+They start at user logon. `PiNotifyListener.vbs` invokes `pi-notify-restart-listener.ps1`, so startup keeps the runner-owned listener invariant instead of launching `notify-listener.ps1` directly. `PiNotifyBroker.vbs` launches the long-lived WinForms broker with `-STA` so popup cards appear without per-notification PowerShell startup. `PiNotifyTunnel` keeps retrying automatically if SSH drops, and `PiNotifyWatchdog` periodically verifies local listener, broker, and remote loopback tunnel health and restarts the broken side when needed. The Start Menu shortcut owns the global popup hotkey, so no always-running hotkey process is required.
 
 ## Refresh after pull
 
@@ -180,11 +188,22 @@ Important keys:
   "popupPlacement": "cursor",
   "popupHotkey": "Ctrl+Alt+P",
   "popupHotkeyEnabled": true,
+  "brokerEnabled": true,
+  "brokerPort": 23119,
+  "brokerStartupTimeoutMs": 700,
+  "brokerRequestTimeoutMs": 700,
   "token": "..."
 }
 ```
 
 `tunnelStartupDelaySeconds` is normalized to at least 5 seconds to avoid startup races between listener, tunnel, and watchdog.
+
+Broker keys (auto-upgraded with safe defaults when missing):
+
+- `brokerEnabled` (default `true`) — when `true`, `popup-focus` mode prefers the long-lived broker; when `false`, the listener uses the old per-notification `pi-notify-popup.ps1` process path.
+- `brokerPort` (default `23119`) — loopback-only HTTP port for the broker. The broker binds only `127.0.0.1` and is never exposed through the SSH tunnel.
+- `brokerStartupTimeoutMs` (default `700`) — bounded wait when the listener starts the broker on first use.
+- `brokerRequestTimeoutMs` (default `700`) — bounded timeout for listener-to-broker `/popup` posts; on failure the listener falls back to the popup process path.
 
 Remote config also supports:
 
@@ -247,6 +266,22 @@ powershell.exe -ExecutionPolicy Bypass -File .\scripts\pi-notify\set-notify-mode
 ```
 
 ## Troubleshooting
+
+### Broker health
+
+Check the broker is alive on loopback:
+
+```powershell
+Invoke-WebRequest -UseBasicParsing http://127.0.0.1:23119/health -TimeoutSec 3
+```
+
+If the broker is unavailable, the listener automatically falls back to the per-notification `pi-notify-popup.ps1` process path, so notifications are not lost. The watchdog restarts the broker when it is missing or unhealthy.
+
+To disable the broker and restore the old per-notification behavior, set `brokerEnabled` to `false` in the config and refresh:
+
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File .\scripts\pi-notify\pi-notify-refresh.ps1 -SkipTunnel -SkipRemoteSync
+```
 
 ### No toast shown
 

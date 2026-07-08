@@ -85,7 +85,12 @@ else {
 }
 
 $commonText = [System.IO.File]::ReadAllText((Join-Path $PSScriptRoot 'NotifyBridge.Common.ps1'), [System.Text.UTF8Encoding]::new($false))
-if ($commonText -match 'RandomNumberGenerator\]::Fill' -or $commonText -notmatch 'RandomNumberGenerator\]::Create\(\)' -or $commonText -notmatch '\.GetBytes\(\$buffer\)') {
+if ($commonText -notmatch 'brokerEnabled' -or $commonText -notmatch 'brokerPort' -or $commonText -notmatch 'brokerStartupTimeoutMs' -or $commonText -notmatch 'brokerRequestTimeoutMs' -or $commonText -notmatch 'BrokerHealthUrl' -or $commonText -notmatch 'BrokerPopupUrl' -or $commonText -notmatch 'BrokerCloseUrl') {
+    throw 'NotifyBridge config must persist stable broker defaults (brokerEnabled, brokerPort, brokerStartupTimeoutMs, brokerRequestTimeoutMs) and expose broker URLs.'
+}
+$hasPs5TokenRng = ($commonText -match 'RandomNumberGenerator\]::Create\(\)' -and $commonText -match '\.GetBytes\(\$buffer\)')
+$hasModernTokenRng = ($commonText -match 'RandomNumberGenerator\]::Fill')
+if (-not ($hasPs5TokenRng -or $hasModernTokenRng)) {
     throw 'Token generation must be compatible with Windows PowerShell 5.1/.NET Framework.'
 }
 $badSshFullPathPattern = 'GetFullPath\(\$' + 'SshExecutable\)'
@@ -124,6 +129,67 @@ foreach ($path in Get-ChildItem -LiteralPath $PSScriptRoot -Filter '*.ps1') {
         throw ('Unsafe child process argument array in {0}; use quoted single-string arguments.' -f $path.Name)
     }
 }
+
+# Broker script assertions: syntax is covered by [1/9]; here we assert privacy,
+# runtime-file coverage, and config defaults.
+$brokerText = [System.IO.File]::ReadAllText((Join-Path $PSScriptRoot 'pi-notify-broker.ps1'), [System.Text.UTF8Encoding]::new($false))
+if (-not (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'pi-notify-broker.ps1'))) {
+    throw 'pi-notify-broker.ps1 must exist for low-latency broker path.'
+}
+if ($brokerText -notmatch 'System.Net.IPAddress\]::Loopback' -or $brokerText -notmatch '/health' -or $brokerText -notmatch '/popup' -or $brokerText -notmatch '/close') {
+    throw 'Broker must bind loopback only and expose /health, /popup, /close endpoints.'
+}
+if ($brokerText -notmatch 'broker.pid' -or $brokerText -notmatch 'broker.log' -or $brokerText -notmatch 'Global\\PiNotifyBroker_') {
+    throw 'Broker must write broker.pid/broker.log and use a singleton mutex.'
+}
+if ($brokerText -notmatch 'popup-live\.' -or $brokerText -notmatch 'protectedHost' -or $brokerText -notmatch 'protectedCwd' -or $brokerText -notmatch 'protectedTab') {
+    throw 'Broker live-state files must use DPAPI-protected target context for hotkey compatibility.'
+}
+# Privacy: broker logs must not include raw notification content or target context
+$badBrokerLogPattern = ('broker-popup-start ' + 'title=') + '|' + ('broker-popup-start ' + 'body=') + '|' + ('broker-shown ' + 'title=') + '|' + 'sourceTabTitle="' + '|' + 'cwdBase="' + '|' + 'sessionName="' + '|' + 'windowTitle="' + '|' + 'tabName="' + '|' + 'broker-action activate host=' + '|' + 'broker-cache host="' + '|' + 'broker-keywords "'
+if ($brokerText -match $badBrokerLogPattern) {
+    throw 'Broker logs must not persist notification title/body text or raw target context.'
+}
+if ($brokerText -notmatch 'Get-NotifyBrokerContextFingerprint') {
+    throw 'Broker must fingerprint target context in logs.'
+}
+# Tab cache: conservative TTL and liveness validation before reuse
+if ($brokerText -notmatch 'NotifyBrokerTabCacheTtlSeconds' -or $brokerText -notmatch 'Test-NotifyBrokerTabCacheValid' -or $brokerText -notmatch 'GetWindowThreadProcessId') {
+    throw 'Broker tab cache must use conservative TTL and liveness validation before reuse.'
+}
+# Broker must be in refresh/autostart/restart runtime file lists
+$refreshTextForBroker = [System.IO.File]::ReadAllText((Join-Path $PSScriptRoot 'pi-notify-refresh.ps1'), [System.Text.UTF8Encoding]::new($false))
+$autostartTextForBroker = [System.IO.File]::ReadAllText((Join-Path $PSScriptRoot 'install-windows-autostart.ps1'), [System.Text.UTF8Encoding]::new($false))
+$restartTextForBroker = [System.IO.File]::ReadAllText((Join-Path $PSScriptRoot 'pi-notify-restart-listener.ps1'), [System.Text.UTF8Encoding]::new($false))
+$remoteInstallTextForBroker = [System.IO.File]::ReadAllText((Join-Path $PSScriptRoot 'install-remote-windows-notify.ps1'), [System.Text.UTF8Encoding]::new($false))
+if ($refreshTextForBroker -notmatch "'pi-notify-broker.ps1'" -or $autostartTextForBroker -notmatch "'pi-notify-broker.ps1'" -or $restartTextForBroker -notmatch "'pi-notify-broker.ps1'" -or $remoteInstallTextForBroker -notmatch "'pi-notify-broker.ps1'") {
+    throw 'Broker script must be included in refresh/autostart/restart/remote-install runtime file lists.'
+}
+if ($refreshTextForBroker -notmatch 'Stop-NotifyBrokerProcesses' -or $refreshTextForBroker -notmatch 'Start-NotifyBroker') {
+    throw 'Refresh must stop and start the broker alongside listener/watchdog.'
+}
+if ($autostartTextForBroker -notmatch 'PiNotifyBroker.vbs' -or $autostartTextForBroker -notmatch '-STA') {
+    throw 'Windows autostart must create a PiNotifyBroker.vbs launcher with -STA for the WinForms message loop.'
+}
+# Watchdog broker supervision and stale-listener fix
+$watchdogTextForBroker = [System.IO.File]::ReadAllText((Join-Path $PSScriptRoot 'pi-notify-watchdog.ps1'), [System.Text.UTF8Encoding]::new($false))
+if ($watchdogTextForBroker -notmatch 'Test-NotifyBrokerHealth' -or $watchdogTextForBroker -notmatch 'NotifyWatchdogBrokerMisses' -or $watchdogTextForBroker -notmatch 'broker-restart-requested') {
+    throw 'Watchdog must supervise broker health and restart it when missing or unhealthy.'
+}
+if ($watchdogTextForBroker -notmatch 'if \(\$listenerOk\)' -or $watchdogTextForBroker -notmatch '\$duplicateListener') {
+    throw 'Watchdog must tolerate pid-file/process-shape mismatch when listener /health is OK to avoid false stale-listener restarts.'
+}
+# Listener broker delegation and fallback
+$listenerTextForLaunch = [System.IO.File]::ReadAllText((Join-Path $PSScriptRoot 'notify-listener.ps1'), [System.Text.UTF8Encoding]::new($false))
+$hotkeyTextForArtifacts = [System.IO.File]::ReadAllText((Join-Path $PSScriptRoot 'pi-notify-hotkey.ps1'), [System.Text.UTF8Encoding]::new($false))
+if ($listenerTextForLaunch -notmatch 'Invoke-NotifyBrokerPopup' -or $listenerTextForLaunch -notmatch 'Start-NotifyPopupProcess' -or $listenerTextForLaunch -notmatch 'broker-unavailable fallback=popup-process' -or $listenerTextForLaunch -notmatch 'broker-post-failed fallback=popup-process' -or $listenerTextForLaunch -notmatch 'Get-NotifyBrokerProcessIds' -or $listenerTextForLaunch -notmatch 'broker-start-skip existing') {
+    throw 'Listener must prefer broker for popup-focus, avoid duplicate broker starts, and fall back to pi-notify-popup.ps1 process on bounded failure.'
+}
+# Hotkey broker compatibility
+if ($hotkeyTextForArtifacts -notmatch 'brokerManaged' -or $hotkeyTextForArtifacts -notmatch 'BrokerCloseUrl' -or $hotkeyTextForArtifacts -notmatch '"activate":true' -or $hotkeyTextForArtifacts -notmatch 'pi-notify-broker.ps1') {
+    throw 'Hotkey must recognize broker-managed popups and activate/close them via broker /close without killing the broker.'
+}
+Write-Host 'OK broker runtime, privacy, supervision, and fallback safeguards'
 $listenerTextForLaunch = [System.IO.File]::ReadAllText((Join-Path $PSScriptRoot 'notify-listener.ps1'), [System.Text.UTF8Encoding]::new($false))
 $popupTextForArtifacts = [System.IO.File]::ReadAllText((Join-Path $PSScriptRoot 'pi-notify-popup.ps1'), [System.Text.UTF8Encoding]::new($false))
 $activateTextForArtifacts = [System.IO.File]::ReadAllText((Join-Path $PSScriptRoot 'pi-notify-activate.ps1'), [System.Text.UTF8Encoding]::new($false))
@@ -134,7 +200,7 @@ $installerTextForToastSetup = [System.IO.File]::ReadAllText((Join-Path $PSScript
 $autostartTextForToastSetup = [System.IO.File]::ReadAllText((Join-Path $PSScriptRoot 'install-windows-autostart.ps1'), [System.Text.UTF8Encoding]::new($false))
 $setModeTextForToastSetup = [System.IO.File]::ReadAllText((Join-Path $PSScriptRoot 'set-notify-mode.ps1'), [System.Text.UTF8Encoding]::new($false))
 $shortcutHelperTextForToastSetup = [System.IO.File]::ReadAllText((Join-Path $PSScriptRoot 'register-toast-shortcut.py'), [System.Text.UTF8Encoding]::new($false))
-if ($listenerTextForLaunch -notmatch 'Join-NotifyBridgeProcessArguments' -or $listenerTextForLaunch -match 'RedirectStandardOutput\s+\$popupStdoutLogPath' -or $listenerTextForLaunch -match 'popup-stdout\.\{0\}' -or $listenerTextForLaunch -match 'targetKey\s*=\s*\$targetKey' -or $listenerTextForLaunch -match 'popup-[^\r\n]+targetKey=' -or $listenerTextForLaunch -match 'title\s*=\s*\$Title' -or $listenerTextForLaunch -match 'body\s*=\s*\$Body' -or $listenerTextForLaunch -match 'focusTarget\s*=\s*\$focusTarget' -or $listenerTextForLaunch -match 'cwdBase\s*=\s*\$cwdBase' -or $listenerTextForLaunch -match 'tabTitle\s*=\s*\$tabTitle' -or $listenerTextForLaunch -match 'sessionName\s*=\s*\$sessionName' -or $listenerTextForLaunch -match '\''-Title\'', \$Title' -or $listenerTextForLaunch -match '\''-Body\'', \$Body' -or $listenerTextForLaunch -notmatch 'PI_NOTIFY_TITLE' -or $listenerTextForLaunch -notmatch 'PI_NOTIFY_BODY' -or $listenerTextForLaunch -notmatch 'PI_NOTIFY_CWD_BASE' -or $listenerTextForLaunch -notmatch 'PI_NOTIFY_SESSION_NAME') {
+if ($listenerTextForLaunch -notmatch 'Join-NotifyBridgeProcessArguments' -or $listenerTextForLaunch -match 'RedirectStandardOutput\s+\$popupStdoutLogPath' -or $listenerTextForLaunch -match 'popup-stdout\.\{0\}' -or $listenerTextForLaunch -match 'targetKey\s*=\s*\$targetKey' -or $listenerTextForLaunch -match 'popup-[^\r\n]+targetKey=' -or $listenerTextForLaunch -match '\''-Title\'', \$Title' -or $listenerTextForLaunch -match '\''-Body\'', \$Body' -or $listenerTextForLaunch -notmatch 'PI_NOTIFY_TITLE' -or $listenerTextForLaunch -notmatch 'PI_NOTIFY_BODY' -or $listenerTextForLaunch -notmatch 'PI_NOTIFY_CWD_BASE' -or $listenerTextForLaunch -notmatch 'PI_NOTIFY_SESSION_NAME') {
     throw 'Popup launch must quote paths, avoid per-popup stdout/stderr files, and avoid storing/logging raw target keys or title/body/context in payload files or command lines.'
 }
 if ($popupTextForArtifacts -notmatch 'PI_NOTIFY_TITLE' -or $popupTextForArtifacts -notmatch 'PI_NOTIFY_BODY' -or $popupTextForArtifacts -notmatch 'PI_NOTIFY_CWD_BASE' -or $popupTextForArtifacts -notmatch 'PI_NOTIFY_SESSION_NAME' -or $popupTextForArtifacts -match "PSObject.Properties\['title'\]" -or $popupTextForArtifacts -match "PSObject.Properties\['body'\]" -or $popupTextForArtifacts -match "PSObject.Properties\['cwdBase'\]" -or $popupTextForArtifacts -match "PSObject.Properties\['tabTitle'\]" -or $popupTextForArtifacts -match "PSObject.Properties\['sessionName'\]") {
@@ -193,7 +259,7 @@ $setModeRestartIndex = $setModeTextForToastSetup.IndexOf('if ($RestartListener)'
 if ($setModeRegisterIndex -lt 0 -or $setModeRestartIndex -lt 0 -or $setModeRegisterIndex -gt $setModeRestartIndex -or $setModeTextForToastSetup -match 'register-toast-shortcut\.py.*try') {
     throw 'set-notify-mode must register system-toast protocol/shortcut support even when -RestartListener:$false is used.'
 }
-if ($refreshTextForArtifacts -notmatch 'Clear-NotifyPopupRuntimeArtifacts' -or $refreshTextForArtifacts -notmatch 'activation-\*\.json' -or $refreshTextForArtifacts -notmatch 'popup-live\.\*\.json' -or $refreshTextForArtifacts -notmatch 'popup-payload\.json' -or $refreshTextForArtifacts -notmatch 'popup-dedupe\.json' -or $refreshTextForArtifacts -notmatch 'popup-stdout\.log' -or $refreshTextForArtifacts -notmatch 'popup-stderr\.log' -or $refreshTextForArtifacts -notmatch 'popup-payload\.\*\.json' -or $refreshTextForArtifacts -notmatch 'popup-dedupe\.\*\.json' -or $refreshTextForArtifacts -notmatch 'popup-stdout\.\*\.log' -or $refreshTextForArtifacts -notmatch 'popup-stderr\.\*\.log' -or $refreshTextForArtifacts -notmatch 'listener\.log' -or $refreshTextForArtifacts -notmatch 'popup\.log' -or $refreshTextForArtifacts -notmatch 'activate\.log') {
+if ($refreshTextForArtifacts -notmatch 'Clear-NotifyPopupRuntimeArtifacts' -or $refreshTextForArtifacts -notmatch 'activation-\*\.json' -or $refreshTextForArtifacts -notmatch 'popup-live\.\*\.json' -or $refreshTextForArtifacts -notmatch 'popup-payload\.json' -or $refreshTextForArtifacts -notmatch 'popup-dedupe\.json' -or $refreshTextForArtifacts -notmatch 'popup-stdout\.log' -or $refreshTextForArtifacts -notmatch 'popup-stderr\.log' -or $refreshTextForArtifacts -notmatch 'popup-payload\.\*\.json' -or $refreshTextForArtifacts -notmatch 'popup-dedupe\.\*\.json' -or $refreshTextForArtifacts -notmatch 'popup-stdout\.\*\.log' -or $refreshTextForArtifacts -notmatch 'popup-stderr\.\*\.log' -or $refreshTextForArtifacts -notmatch 'listener\.log' -or $refreshTextForArtifacts -notmatch 'popup\.log' -or $refreshTextForArtifacts -notmatch 'activate\.log' -or $refreshTextForArtifacts -notmatch 'broker\.log') {
     throw 'Refresh must clear stale activation cache, popup payload/dedupe/stdout/stderr artifacts, including legacy exact names, and old notification-content logs.'
 }
 $restartText = [System.IO.File]::ReadAllText((Join-Path $PSScriptRoot 'pi-notify-restart-listener.ps1'), [System.Text.UTF8Encoding]::new($false))
@@ -201,15 +267,17 @@ $runnerText = [System.IO.File]::ReadAllText((Join-Path $PSScriptRoot 'pi-notify-
 if ($restartText -notmatch 'Sync-LocalRuntimeFiles' -or $restartText -notmatch 'notify-listener\.ps1' -or $restartText -notmatch 'pi-notify-listener-runner\.ps1' -or $restartText -notmatch 'Test-NotifyProcessOwnedByThisInstance' -or $restartText -notmatch 'Test-NotifyCommandLineContainsPath' -or $restartText -notmatch 'skip unowned listener process' -or $restartText -notmatch 'Split-Path -Parent \$ConfigPath' -or $restartText -match '\$baseDir = "\$env:USERPROFILE\\.pi-notify"') {
     throw 'Restart listener must bootstrap required runtime files and derive instance base from ConfigPath.'
 }
-if ($refreshTextForArtifacts -notmatch '\[string\]\$ConfigPath' -or $refreshTextForArtifacts -notmatch 'Test-NotifyProcessOwnedByThisInstance' -or $refreshTextForArtifacts -notmatch 'Test-NotifyCommandLineContainsPath' -or $refreshTextForArtifacts -notmatch 'skip unowned process' -or $refreshTextForArtifacts -notmatch 'AllowParentScopedSsh' -or $refreshTextForArtifacts -notmatch 'AllowedParentProcessIds' -or $refreshTextForArtifacts -notmatch 'ParentProcessId' -or $refreshTextForArtifacts -match "Name -ne 'ssh\.exe'" -or $refreshTextForArtifacts -notmatch '\$wrapperIds -contains \$_.ParentProcessId' -or $refreshTextForArtifacts -notmatch 'keep existing reverse tunnel; restart watchdog' -or $refreshTextForArtifacts -notmatch "'-StartupDelaySeconds', '5'" -or $refreshTextForArtifacts -notmatch "'-TunnelStartupDelaySeconds', '5'" -or $refreshTextForArtifacts -match '\$baseDir = "\$env:USERPROFILE\\.pi-notify"') {
+$refreshHasWatchdogDelay = ($refreshTextForArtifacts -match "'-StartupDelaySeconds', '5'" -or $refreshTextForArtifacts -match '-StartupDelaySeconds 5')
+$refreshHasTunnelDelay = ($refreshTextForArtifacts -match "'-TunnelStartupDelaySeconds', '5'" -or $refreshTextForArtifacts -match '-TunnelStartupDelaySeconds 5')
+if ($refreshTextForArtifacts -notmatch '\[string\]\$ConfigPath' -or $refreshTextForArtifacts -notmatch 'Test-NotifyProcessOwnedByThisInstance' -or $refreshTextForArtifacts -notmatch 'Test-NotifyCommandLineContainsPath' -or $refreshTextForArtifacts -notmatch 'skip unowned process' -or $refreshTextForArtifacts -notmatch 'AllowParentScopedSsh' -or $refreshTextForArtifacts -notmatch 'AllowedParentProcessIds' -or $refreshTextForArtifacts -notmatch 'ParentProcessId' -or $refreshTextForArtifacts -match "Name -ne 'ssh\.exe'" -or $refreshTextForArtifacts -notmatch '\$wrapperIds -contains \$_.ParentProcessId' -or $refreshTextForArtifacts -notmatch 'keep existing reverse tunnel; restart watchdog' -or -not $refreshHasWatchdogDelay -or -not $refreshHasTunnelDelay -or $refreshTextForArtifacts -match '\$baseDir = "\$env:USERPROFILE\\.pi-notify"') {
     throw 'Refresh must derive instance base from ConfigPath, scope ssh by wrapper parent, skip unowned pid-file PIDs, and use nonzero startup delays.'
 }
 if ($runnerText -match 'Split-Path -Parent \$PSScriptRoot' -or $runnerText -notmatch 'Get-NotifyBridgeBaseDir' -or $runnerText -notmatch 'Set-NotifyBridgeActiveConfigPath') {
     throw 'Listener runner must write listener.pid under ConfigPath-derived Get-NotifyBridgeBaseDir, not relative to script path.'
 }
 $watchdogText = [System.IO.File]::ReadAllText((Join-Path $PSScriptRoot 'pi-notify-watchdog.ps1'), [System.Text.UTF8Encoding]::new($false))
-if ($watchdogText -match "python - <<'PY'" -or $watchdogText -notmatch "python3 - <<'PY'" -or $watchdogText -notmatch 'ConnectTimeout=10' -or $watchdogText -notmatch 'PiNotifyWatchdog_' -or $watchdogText -notmatch 'watchdog\.pid' -or $watchdogText -notmatch 'Merge-NotifyProcessIds' -or $watchdogText -notmatch 'Test-NotifyProcessOwnedByThisInstance' -or $watchdogText -notmatch 'Test-NotifyCommandLineContainsPath' -or $watchdogText -notmatch 'Test-NotifyProcessSafeToStop' -or $watchdogText -notmatch 'skip-unowned-taskkill' -or $watchdogText -notmatch 'NotifyWatchdogListenerMisses' -or $watchdogText -notmatch 'missingOwnedTunnel' -or $watchdogText -notmatch 'stale-owned-tunnel' -or $watchdogText -notmatch '\@\(\$tunnelPids\)\.Count -ne 1 -or \@\(\$sshPids\)\.Count -ne 1' -or $watchdogText -notmatch '\@\(\$tunnelPids\) -contains \$_\.ParentProcessId' -or $watchdogText -match '\$directListenerPids\s*\+\s*\$listenerRunnerPids' -or $watchdogText -match '\$tunnelPids\s*\+\s*\$sshPids') {
-    throw 'Watchdog must use python3, ConnectTimeout, singleton mutex/pid guard, safe process-id merging, instance filtering, grace misses, parent-scoped ssh matching, and repair missing owned tunnel processes even if remote health passes.'
+if ($watchdogText -match "python3? - <<'PY'" -or $watchdogText -notmatch 'timeout 8s python3 -c' -or $watchdogText -notmatch 'ConnectTimeout=5' -or $watchdogText -notmatch 'ServerAliveInterval=2' -or $watchdogText -notmatch 'WaitForExit\(12000\)' -or $watchdogText -notmatch 'HTTP\\s\+200' -or $watchdogText -notmatch 'PiNotifyWatchdog_' -or $watchdogText -notmatch 'watchdog\.pid' -or $watchdogText -notmatch 'Merge-NotifyProcessIds' -or $watchdogText -notmatch 'Test-NotifyProcessOwnedByThisInstance' -or $watchdogText -notmatch 'Test-NotifyCommandLineContainsPath' -or $watchdogText -notmatch 'Test-NotifyProcessSafeToStop' -or $watchdogText -notmatch 'skip-unowned-taskkill' -or $watchdogText -notmatch 'NotifyWatchdogListenerMisses' -or $watchdogText -notmatch 'missingOwnedTunnel' -or $watchdogText -notmatch 'stale-owned-tunnel' -or $watchdogText -notmatch '\@\(\$tunnelPids\)\.Count -ne 1 -or \@\(\$sshPids\)\.Count -ne 1' -or $watchdogText -notmatch '\@\(\$tunnelPids\) -contains \$_\.ParentProcessId' -or $watchdogText -match '\$directListenerPids\s*\+\s*\$listenerRunnerPids' -or $watchdogText -match '\$tunnelPids\s*\+\s*\$sshPids') {
+    throw 'Watchdog must use bounded python3 remote health, singleton mutex/pid guard, safe process-id merging, instance filtering, grace misses, parent-scoped ssh matching, and repair missing owned tunnel processes even if remote health passes.'
 }
 $tunnelText = [System.IO.File]::ReadAllText((Join-Path $PSScriptRoot 'pi-notify-reverse-tunnel.ps1'), [System.Text.UTF8Encoding]::new($false))
 if ($tunnelText -notmatch 'ConnectTimeout=10') {
@@ -251,7 +319,7 @@ if ($refreshText -match 'origin master' -or $refreshText -notmatch 'rev-parse --
 if ($refreshText -notmatch '\$runtimeFiles' -or $refreshText -notmatch 'GetFullPath\(\$source\)' -or $refreshText -notmatch 'GetFullPath\(\$destination\)') {
     throw 'Refresh runtime sync must use a runtime file list with same-path skip so it works from the runtime bin.'
 }
-foreach ($requiredRuntimeName in @('remote-windows-notify.ts', 'popup-wallpaper.png', 'install-remote-windows-notify.ps1', 'install-linux-autostart.ps1', 'install-windows-autostart.ps1', 'install-autostart-all.ps1', 'pi-notify-check.ps1', 'pi-notify-hotkey.ps1')) {
+foreach ($requiredRuntimeName in @('remote-windows-notify.ts', 'popup-wallpaper.png', 'install-remote-windows-notify.ps1', 'install-linux-autostart.ps1', 'install-windows-autostart.ps1', 'install-autostart-all.ps1', 'pi-notify-check.ps1', 'pi-notify-hotkey.ps1', 'pi-notify-broker.ps1')) {
     if ($refreshText -notmatch [regex]::Escape($requiredRuntimeName) -or $autostartAllText -match 'unused-never-match') {
         throw ('Refresh runtime sync must copy required file: {0}' -f $requiredRuntimeName)
     }
@@ -262,7 +330,7 @@ foreach ($requiredRuntimeName in @('remote-windows-notify.ts', 'popup-wallpaper.
 }
 $runtimeBin = Join-Path $runtimeBaseDir 'bin'
 if (Test-Path -LiteralPath $runtimeBin) {
-    foreach ($requiredRuntimeName in @('remote-windows-notify.ts', 'popup-wallpaper.png', 'install-remote-windows-notify.ps1', 'install-linux-autostart.ps1', 'install-windows-autostart.ps1', 'install-autostart-all.ps1', 'pi-notify-check.ps1', 'pi-notify-hotkey.ps1')) {
+    foreach ($requiredRuntimeName in @('remote-windows-notify.ts', 'popup-wallpaper.png', 'install-remote-windows-notify.ps1', 'install-linux-autostart.ps1', 'install-windows-autostart.ps1', 'install-autostart-all.ps1', 'pi-notify-check.ps1', 'pi-notify-hotkey.ps1', 'pi-notify-broker.ps1')) {
         if (-not (Test-Path -LiteralPath (Join-Path $runtimeBin $requiredRuntimeName))) {
             throw ('Runtime bin is missing required file: {0}' -f $requiredRuntimeName)
         }
@@ -360,7 +428,7 @@ if (Test-Path -LiteralPath $popupLogDir) {
     if ($stalePopupArtifacts.Count -gt 0 -or $popupArtifacts.Count -gt 8) {
         throw ('Stale or excessive popup artifacts remain: count={0} stale={1}' -f $popupArtifacts.Count, $stalePopupArtifacts.Count)
     }
-    foreach ($logName in @('listener.log', 'popup.log', 'activate.log')) {
+    foreach ($logName in @('listener.log', 'popup.log', 'activate.log', 'broker.log')) {
         $logPath = Join-Path $popupLogDir $logName
         if (-not (Test-Path -LiteralPath $logPath)) { continue }
         $logText = [System.IO.File]::ReadAllText($logPath, [System.Text.UTF8Encoding]::new($false))
@@ -447,19 +515,53 @@ if config_bad:
 print(f"checked {checked_config} remote token config files")
 '@
     $remoteSsh = if ($cfg.PSObject.Properties['sshExecutable'] -and -not [string]::IsNullOrWhiteSpace([string]$cfg.sshExecutable)) { [string]$cfg.sshExecutable } else { 'ssh.exe' }
-    $remoteOutput = $remoteAudit | & $remoteSsh -T -o BatchMode=yes -o ConnectTimeout=10 ([string]$cfg.remoteHostAlias) 'python3 -' 2>&1
-    if ($LASTEXITCODE -eq 0) {
+    $remoteAuditB64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($remoteAudit))
+    $remoteCommand = ('tmp=/tmp/pi_notify_audit_$$.py; printf %s ''{0}'' | base64 -d > "$tmp" && python3 "$tmp"; rc=$?; rm -f "$tmp"; exit $rc' -f $remoteAuditB64)
+    $remoteArgs = Join-NotifyBridgeProcessArguments @(
+        '-T',
+        '-o', 'BatchMode=yes',
+        '-o', 'ConnectTimeout=10',
+        '-o', 'ServerAliveInterval=5',
+        '-o', 'ServerAliveCountMax=2',
+        ([string]$cfg.remoteHostAlias),
+        $remoteCommand
+    )
+    $remoteStdoutPath = Join-Path ([System.IO.Path]::GetTempPath()) ('pi-notify-check-remote-{0}.out' -f ([Guid]::NewGuid().ToString('N')))
+    $remoteStderrPath = Join-Path ([System.IO.Path]::GetTempPath()) ('pi-notify-check-remote-{0}.err' -f ([Guid]::NewGuid().ToString('N')))
+    $remoteProcess = Start-Process -FilePath $remoteSsh -ArgumentList $remoteArgs -WindowStyle Hidden -PassThru -RedirectStandardOutput $remoteStdoutPath -RedirectStandardError $remoteStderrPath
+    if ($null -eq $remoteProcess) {
+        throw ('Remote extension audit failed to start via {0}. Run pi-notify-refresh.ps1 -SyncRemote.' -f $remoteSsh)
+    }
+    if (-not $remoteProcess.WaitForExit(60000)) {
+        try { Stop-Process -Id $remoteProcess.Id -Force -ErrorAction SilentlyContinue } catch {}
+        throw ('Remote extension audit timed out via {0}. Run pi-notify-refresh.ps1 -SyncRemote.' -f $remoteSsh)
+    }
+    try { $remoteProcess.Refresh() } catch {}
+    $remoteStdout = if (Test-Path -LiteralPath $remoteStdoutPath) { [string](Get-Content -LiteralPath $remoteStdoutPath -Raw -ErrorAction SilentlyContinue) } else { '' }
+    $remoteStderr = if (Test-Path -LiteralPath $remoteStderrPath) { [string](Get-Content -LiteralPath $remoteStderrPath -Raw -ErrorAction SilentlyContinue) } else { '' }
+    Remove-Item -LiteralPath $remoteStdoutPath -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $remoteStderrPath -Force -ErrorAction SilentlyContinue
+    $remoteOutput = @()
+    foreach ($chunk in @($remoteStdout, $remoteStderr)) {
+        if ([string]::IsNullOrWhiteSpace($chunk)) { continue }
+        $remoteOutput += @($chunk -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    }
+    $remoteText = $remoteOutput -join "`n"
+    $remoteExitCodeText = ''
+    try { $remoteExitCodeText = [string]$remoteProcess.ExitCode } catch { $remoteExitCodeText = '' }
+    $remoteSuccessByOutput = ($remoteText -match 'checked \d+ remote extension copies' -and $remoteText -match 'checked \d+ remote token config files' -and $remoteText -notmatch '^BAD ')
+    if ($remoteExitCodeText -eq '0' -or $remoteSuccessByOutput) {
         $remoteOutput | ForEach-Object { Write-Host $_ }
     }
-    elseif ($LASTEXITCODE -eq 2) {
+    elseif ($remoteExitCodeText -eq '2' -or $remoteText -match '^BAD .*remote-windows-notify\.ts') {
         $remoteOutput | ForEach-Object { Write-Host $_ }
         throw 'Stale remote extension copy found. Run pi-notify-refresh.ps1 -SyncRemote.'
     }
-    elseif ($LASTEXITCODE -eq 3) {
+    elseif ($remoteExitCodeText -eq '3' -or $remoteText -match 'BAD no remote extension copies found') {
         $remoteOutput | ForEach-Object { Write-Host $_ }
         throw 'No remote extension copies found. Run pi-notify-refresh.ps1 -SyncRemote.'
     }
-    elseif ($LASTEXITCODE -eq 4) {
+    elseif ($remoteExitCodeText -eq '4' -or $remoteText -match 'BAD .*mode=|BAD no remote token config files found') {
         $remoteOutput | ForEach-Object { Write-Host $_ }
         throw 'Remote token config permissions are unsafe. Run pi-notify-refresh.ps1 -SyncRemote.'
     }
@@ -591,13 +693,45 @@ if ($null -ne $cfg) {
     $watchdogLog = Join-Path $runtimeBaseDir 'logs\watchdog.log'
     if (Test-Path -LiteralPath $watchdogLog) {
         $watchdogLines = @(Get-Content -LiteralPath $watchdogLog -Tail 40)
-        $recentWatchdogFailures = @($watchdogLines | Where-Object { $_ -match 'watchdog-error|duplicate-tunnel|stale-listener' })
+        $recentWatchdogFailures = @($watchdogLines | Where-Object { $_ -match 'watchdog-error|duplicate-tunnel|stale-broker' })
         if ($recentWatchdogFailures.Count -gt 0) {
             $recentWatchdogFailures | Select-Object -First 5 | ForEach-Object { Write-Host $_ }
-            throw 'Recent watchdog failure or duplicate tunnel repair found.'
+            throw 'Recent watchdog error, duplicate tunnel, or stale broker repair found.'
+        }
+        # stale-listener lines are expected when health is false; only flag false-positive
+        # restarts where listenerOk=True and duplicate=False (shape-only false restarts).
+        $recentStaleListenerRestarts = @($watchdogLines | Where-Object { $_ -match 'stale-listener' -and $_ -match 'listenerOk=True' -and $_ -match 'duplicate=False' })
+        if ($recentStaleListenerRestarts.Count -gt 0) {
+            $recentStaleListenerRestarts | Select-Object -First 5 | ForEach-Object { Write-Host $_ }
+            throw 'Recent false stale-listener restart while listenerOk=True and duplicate=False found.'
         }
     }
     Write-Host 'OK tunnel singleton healthy'
+}
+else {
+    Write-Host 'SKIP no local config'
+}
+
+Write-Host '[10/10] broker health...'
+if ($null -ne $cfg) {
+    $brokerEnabled = $false
+    if ($cfg.PSObject.Properties['brokerEnabled']) {
+        try { $brokerEnabled = [bool]$cfg.brokerEnabled } catch { $brokerEnabled = $false }
+    }
+    if ($brokerEnabled) {
+        $brokerPort = 23119
+        if ($cfg.PSObject.Properties['brokerPort']) { try { $brokerPort = [int]$cfg.brokerPort } catch {} }
+        try {
+            $brokerHealth = Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:$brokerPort/health" -TimeoutSec 3
+            Write-Host ('OK broker {0} {1}' -f $brokerPort, $brokerHealth.Content)
+        }
+        catch {
+            Write-Host ('WARN broker health unavailable on port {0}; listener will use fallback' -f $brokerPort)
+        }
+    }
+    else {
+        Write-Host 'SKIP broker disabled in config'
+    }
 }
 else {
     Write-Host 'SKIP no local config'
