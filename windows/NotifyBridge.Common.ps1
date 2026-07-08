@@ -350,6 +350,46 @@ function Register-NotifyBridgeToastShortcut {
     return $shortcutPath
 }
 
+function Register-NotifyBridgePopupHotkeyShortcut {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$PowerShellExe,
+        [Parameter(Mandatory = $true)]
+        [string]$HotkeyScript,
+        [Parameter(Mandatory = $true)]
+        [string]$ConfigPathValue,
+        [string]$HotkeyValue = 'Ctrl+Alt+P',
+        [bool]$Enabled = $true
+    )
+
+    $programsDir = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'
+    New-Item -ItemType Directory -Force -Path $programsDir | Out-Null
+    $shortcutPath = Join-Path $programsDir 'Pi Notify Oldest Popup.lnk'
+    if (-not $Enabled) {
+        Remove-Item -LiteralPath $shortcutPath -Force -ErrorAction SilentlyContinue
+        return ''
+    }
+
+    $shell = New-Object -ComObject WScript.Shell
+    $shortcut = $shell.CreateShortcut($shortcutPath)
+    $shortcut.TargetPath = $PowerShellExe
+    $shortcut.Arguments = Join-NotifyBridgeProcessArguments @(
+        '-NoProfile',
+        '-WindowStyle', 'Hidden',
+        '-ExecutionPolicy', 'Bypass',
+        '-File', $HotkeyScript,
+        '-ConfigPath', $ConfigPathValue,
+        '-Once'
+    )
+    $shortcut.WorkingDirectory = Split-Path -Parent $HotkeyScript
+    $shortcut.WindowStyle = 7
+    $shortcut.Description = 'Activate the oldest live Pi popup notification target.'
+    $shortcut.Hotkey = (Normalize-NotifyBridgePopupHotkey -Value $HotkeyValue).ToUpperInvariant()
+    $shortcut.Save()
+    return $shortcutPath
+}
+
 function Register-NotifyBridgeSystemToastSupport {
     [CmdletBinding()]
     param(
@@ -493,6 +533,35 @@ function Normalize-NotifyBridgePopupPlacement {
     return 'cursor'
 }
 
+function Normalize-NotifyBridgePopupHotkey {
+    [CmdletBinding()]
+    param(
+        [string]$Value
+    )
+
+    $normalized = if ([string]::IsNullOrWhiteSpace($Value)) { '' } else { [string]$Value.Trim() }
+    if ([string]::IsNullOrWhiteSpace($normalized)) {
+        return 'Ctrl+Alt+P'
+    }
+    return $normalized
+}
+
+function ConvertTo-NotifyBridgeBoolean {
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        $Value,
+        [bool]$Default = $false
+    )
+
+    if ($null -eq $Value) { return $Default }
+    if ($Value -is [bool]) { return [bool]$Value }
+    $text = ([string]$Value).Trim().ToLowerInvariant()
+    if ($text -in @('1', 'true', 'yes', 'on')) { return $true }
+    if ($text -in @('0', 'false', 'no', 'off')) { return $false }
+    return $Default
+}
+
 function New-NotifyBridgeToken {
     [CmdletBinding()]
     param(
@@ -563,6 +632,8 @@ function Ensure-NotifyBridgeConfig {
         [string]$DisplayMode,
         [int]$PopupTimeoutSeconds,
         [string]$PopupPlacement,
+        [string]$PopupHotkey,
+        [bool]$PopupHotkeyEnabled,
         [string]$PopupWallpaperPath,
         [int]$PopupWallpaperOffsetYPixels
     )
@@ -682,6 +753,26 @@ function Ensure-NotifyBridgeConfig {
         'cursor'
     }
 
+    $finalPopupHotkey = if ($PSBoundParameters.ContainsKey('PopupHotkey')) {
+        Normalize-NotifyBridgePopupHotkey -Value $PopupHotkey
+    }
+    elseif ($existing.ContainsKey('popupHotkey')) {
+        Normalize-NotifyBridgePopupHotkey -Value ([string]$existing['popupHotkey'])
+    }
+    else {
+        'Ctrl+Alt+P'
+    }
+
+    $finalPopupHotkeyEnabled = if ($PSBoundParameters.ContainsKey('PopupHotkeyEnabled')) {
+        [bool]$PopupHotkeyEnabled
+    }
+    elseif ($existing.ContainsKey('popupHotkeyEnabled')) {
+        ConvertTo-NotifyBridgeBoolean -Value $existing['popupHotkeyEnabled'] -Default $true
+    }
+    else {
+        $true
+    }
+
     $finalPopupWallpaperPath = if ($PSBoundParameters.ContainsKey('PopupWallpaperPath')) {
         if ([string]::IsNullOrWhiteSpace($PopupWallpaperPath)) { '' } else { [System.IO.Path]::GetFullPath($PopupWallpaperPath.Trim()) }
     }
@@ -717,6 +808,8 @@ function Ensure-NotifyBridgeConfig {
         displayMode               = $finalDisplayMode
         popupTimeoutSeconds       = $finalPopupTimeoutSeconds
         popupPlacement            = $finalPopupPlacement
+        popupHotkey               = $finalPopupHotkey
+        popupHotkeyEnabled        = $finalPopupHotkeyEnabled
         popupWallpaperPath        = $finalPopupWallpaperPath
         popupWallpaperOffsetYPixels = $finalPopupWallpaperOffsetYPixels
         updatedAtUtc              = [DateTime]::UtcNow.ToString('o')
@@ -738,6 +831,8 @@ function Ensure-NotifyBridgeConfig {
         DisplayMode               = $config.displayMode
         PopupTimeoutSeconds       = $config.popupTimeoutSeconds
         PopupPlacement            = $config.popupPlacement
+        PopupHotkey               = $config.popupHotkey
+        PopupHotkeyEnabled        = $config.popupHotkeyEnabled
         PopupWallpaperPath        = $config.popupWallpaperPath
         PopupWallpaperOffsetYPixels = $config.popupWallpaperOffsetYPixels
     }

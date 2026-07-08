@@ -127,6 +127,7 @@ foreach ($path in Get-ChildItem -LiteralPath $PSScriptRoot -Filter '*.ps1') {
 $listenerTextForLaunch = [System.IO.File]::ReadAllText((Join-Path $PSScriptRoot 'notify-listener.ps1'), [System.Text.UTF8Encoding]::new($false))
 $popupTextForArtifacts = [System.IO.File]::ReadAllText((Join-Path $PSScriptRoot 'pi-notify-popup.ps1'), [System.Text.UTF8Encoding]::new($false))
 $activateTextForArtifacts = [System.IO.File]::ReadAllText((Join-Path $PSScriptRoot 'pi-notify-activate.ps1'), [System.Text.UTF8Encoding]::new($false))
+$hotkeyTextForArtifacts = [System.IO.File]::ReadAllText((Join-Path $PSScriptRoot 'pi-notify-hotkey.ps1'), [System.Text.UTF8Encoding]::new($false))
 $refreshTextForArtifacts = [System.IO.File]::ReadAllText((Join-Path $PSScriptRoot 'pi-notify-refresh.ps1'), [System.Text.UTF8Encoding]::new($false))
 $commonTextForToastSetup = [System.IO.File]::ReadAllText((Join-Path $PSScriptRoot 'NotifyBridge.Common.ps1'), [System.Text.UTF8Encoding]::new($false))
 $installerTextForToastSetup = [System.IO.File]::ReadAllText((Join-Path $PSScriptRoot 'install-remote-windows-notify.ps1'), [System.Text.UTF8Encoding]::new($false))
@@ -150,6 +151,9 @@ if ($popupTextForArtifacts -match 'host\s*=\s*\$TargetHostValue' -or $popupTextF
 }
 if ($popupTextForArtifacts -match 'WriteAllText\(\$PayloadPath' -or $popupTextForArtifacts -match 'popup-dedupe\.\{0\}\.json' -or $popupTextForArtifacts -match 'popup-payload-read-error') {
     throw 'Live popup processes must not leave payload/dedupe JSON artifacts; use listener-owned memory and non-sensitive command-line metadata.'
+}
+if ($popupTextForArtifacts -notmatch 'popup-live\.\{0\}\.json' -or $popupTextForArtifacts -notmatch 'protectedHost' -or $popupTextForArtifacts -notmatch 'protectedCwd' -or $popupTextForArtifacts -notmatch 'protectedTab' -or $hotkeyTextForArtifacts -notmatch 'Unprotect-NotifyHotkeyValue' -or $hotkeyTextForArtifacts -match 'Write-NotifyHotkeyLog[^\r\n]*TargetHost' -or $hotkeyTextForArtifacts -match 'Write-NotifyHotkeyLog[^\r\n]*CwdBase' -or $hotkeyTextForArtifacts -match 'Write-NotifyHotkeyLog[^\r\n]*TabTitle') {
+    throw 'Popup hotkey live state must store DPAPI-protected target context and hotkey logs must not persist raw target context.'
 }
 $badListenerNotificationLogPattern = ('notify ' + 'title=') + '|' + ('system-toast ' + 'title=') + '|' + ('notify-drop missing-target-metadata ' + 'title=') + '|' + ('popup-launch ' + 'title=') + '|' + ('popup-pid .*target' + 'Key') + '|' + ('popup-launch ' + 'focusTarget=') + '|' + ('notify-dedup .*focusTarget=') + '|' + ('notify focusTarget=')
 $badPopupNotificationLogPattern = ('popup-start ' + 'title=') + '|' + ('popup-' + 'action .*' + 'tit' + 'le=') + '|' + ('popup-drop missing-target-metadata ' + 'title=') + '|' + ('popup-dedup drop-imprecise ' + 'title=') + '|' + 'sourceTabTitle="' + '|' + 'cwdBase="' + '|' + 'windowTitle="' + '|' + 'tabTitle="' + '|' + 'keywords="' + '|' + 'name="'
@@ -189,7 +193,7 @@ $setModeRestartIndex = $setModeTextForToastSetup.IndexOf('if ($RestartListener)'
 if ($setModeRegisterIndex -lt 0 -or $setModeRestartIndex -lt 0 -or $setModeRegisterIndex -gt $setModeRestartIndex -or $setModeTextForToastSetup -match 'register-toast-shortcut\.py.*try') {
     throw 'set-notify-mode must register system-toast protocol/shortcut support even when -RestartListener:$false is used.'
 }
-if ($refreshTextForArtifacts -notmatch 'Clear-NotifyPopupRuntimeArtifacts' -or $refreshTextForArtifacts -notmatch 'activation-\*\.json' -or $refreshTextForArtifacts -notmatch 'popup-payload\.json' -or $refreshTextForArtifacts -notmatch 'popup-dedupe\.json' -or $refreshTextForArtifacts -notmatch 'popup-stdout\.log' -or $refreshTextForArtifacts -notmatch 'popup-stderr\.log' -or $refreshTextForArtifacts -notmatch 'popup-payload\.\*\.json' -or $refreshTextForArtifacts -notmatch 'popup-dedupe\.\*\.json' -or $refreshTextForArtifacts -notmatch 'popup-stdout\.\*\.log' -or $refreshTextForArtifacts -notmatch 'popup-stderr\.\*\.log' -or $refreshTextForArtifacts -notmatch 'listener\.log' -or $refreshTextForArtifacts -notmatch 'popup\.log' -or $refreshTextForArtifacts -notmatch 'activate\.log') {
+if ($refreshTextForArtifacts -notmatch 'Clear-NotifyPopupRuntimeArtifacts' -or $refreshTextForArtifacts -notmatch 'activation-\*\.json' -or $refreshTextForArtifacts -notmatch 'popup-live\.\*\.json' -or $refreshTextForArtifacts -notmatch 'popup-payload\.json' -or $refreshTextForArtifacts -notmatch 'popup-dedupe\.json' -or $refreshTextForArtifacts -notmatch 'popup-stdout\.log' -or $refreshTextForArtifacts -notmatch 'popup-stderr\.log' -or $refreshTextForArtifacts -notmatch 'popup-payload\.\*\.json' -or $refreshTextForArtifacts -notmatch 'popup-dedupe\.\*\.json' -or $refreshTextForArtifacts -notmatch 'popup-stdout\.\*\.log' -or $refreshTextForArtifacts -notmatch 'popup-stderr\.\*\.log' -or $refreshTextForArtifacts -notmatch 'listener\.log' -or $refreshTextForArtifacts -notmatch 'popup\.log' -or $refreshTextForArtifacts -notmatch 'activate\.log') {
     throw 'Refresh must clear stale activation cache, popup payload/dedupe/stdout/stderr artifacts, including legacy exact names, and old notification-content logs.'
 }
 $restartText = [System.IO.File]::ReadAllText((Join-Path $PSScriptRoot 'pi-notify-restart-listener.ps1'), [System.Text.UTF8Encoding]::new($false))
@@ -247,7 +251,7 @@ if ($refreshText -match 'origin master' -or $refreshText -notmatch 'rev-parse --
 if ($refreshText -notmatch '\$runtimeFiles' -or $refreshText -notmatch 'GetFullPath\(\$source\)' -or $refreshText -notmatch 'GetFullPath\(\$destination\)') {
     throw 'Refresh runtime sync must use a runtime file list with same-path skip so it works from the runtime bin.'
 }
-foreach ($requiredRuntimeName in @('remote-windows-notify.ts', 'popup-wallpaper.png', 'install-remote-windows-notify.ps1', 'install-linux-autostart.ps1', 'install-windows-autostart.ps1', 'install-autostart-all.ps1', 'pi-notify-check.ps1')) {
+foreach ($requiredRuntimeName in @('remote-windows-notify.ts', 'popup-wallpaper.png', 'install-remote-windows-notify.ps1', 'install-linux-autostart.ps1', 'install-windows-autostart.ps1', 'install-autostart-all.ps1', 'pi-notify-check.ps1', 'pi-notify-hotkey.ps1')) {
     if ($refreshText -notmatch [regex]::Escape($requiredRuntimeName) -or $autostartAllText -match 'unused-never-match') {
         throw ('Refresh runtime sync must copy required file: {0}' -f $requiredRuntimeName)
     }
@@ -258,7 +262,7 @@ foreach ($requiredRuntimeName in @('remote-windows-notify.ts', 'popup-wallpaper.
 }
 $runtimeBin = Join-Path $runtimeBaseDir 'bin'
 if (Test-Path -LiteralPath $runtimeBin) {
-    foreach ($requiredRuntimeName in @('remote-windows-notify.ts', 'popup-wallpaper.png', 'install-remote-windows-notify.ps1', 'install-linux-autostart.ps1', 'install-windows-autostart.ps1', 'install-autostart-all.ps1', 'pi-notify-check.ps1')) {
+    foreach ($requiredRuntimeName in @('remote-windows-notify.ts', 'popup-wallpaper.png', 'install-remote-windows-notify.ps1', 'install-linux-autostart.ps1', 'install-windows-autostart.ps1', 'install-autostart-all.ps1', 'pi-notify-check.ps1', 'pi-notify-hotkey.ps1')) {
         if (-not (Test-Path -LiteralPath (Join-Path $runtimeBin $requiredRuntimeName))) {
             throw ('Runtime bin is missing required file: {0}' -f $requiredRuntimeName)
         }

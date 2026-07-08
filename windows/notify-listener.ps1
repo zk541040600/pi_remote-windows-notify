@@ -604,7 +604,6 @@ try {
             Write-NotifyListenerLog -Message ('notify targetFingerprint="{0}" hasCwd={1} hasTab={2}' -f (Get-NotifyPopupTargetFingerprint -TargetKey $focusTarget), (-not [string]::IsNullOrWhiteSpace($cwdBase)), (-not [string]::IsNullOrWhiteSpace($tabTitle)))
             Show-Toast -Title $title -Body $body -ToastAppId $AppId -FocusTarget $focusTarget -CwdBase $cwdBase -TabTitle $tabTitle -LaunchUri $launchUri
             $notified = $true
-            Write-Host ("[{0}] notify ok" -f (Get-Date -Format 'HH:mm:ss'))
             Write-HttpResponse -Stream $stream -StatusCode 200 -Reason 'OK' -Body 'ok'
         }
         catch {
@@ -616,7 +615,6 @@ try {
             catch {
             }
             Write-NotifyListenerLog -Message ('error "{0}"' -f $_.Exception.Message)
-            Write-Warning $_.Exception.Message
         }
         finally {
             try {

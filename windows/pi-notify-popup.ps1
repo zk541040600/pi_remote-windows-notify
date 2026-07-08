@@ -19,6 +19,7 @@ $ErrorActionPreference = 'Stop'
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
+Add-Type -AssemblyName System.Security
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
 Add-Type -ReferencedAssemblies System.Windows.Forms,System.Drawing @"
@@ -195,6 +196,60 @@ function Get-NotifyPopupContextFingerprint {
     }
 }
 
+function Protect-NotifyPopupLiveValue {
+    param([string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return '' }
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes([string]$Value)
+    $protected = [System.Security.Cryptography.ProtectedData]::Protect($bytes, $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser)
+    return [Convert]::ToBase64String($protected)
+}
+
+function Get-NotifyPopupLiveStatePath {
+    return (Join-Path (Get-NotifyBridgeLogDir) ('popup-live.{0}.json' -f $PID))
+}
+
+function Save-NotifyPopupLiveState {
+    param(
+        [string]$TargetHostValue,
+        [string]$CwdBaseValue,
+        [string]$SourceTabTitleValue,
+        [string]$TargetFingerprintValue,
+        [int]$StackIndexValue,
+        [int]$TimeoutSecondsValue
+    )
+
+    $path = Get-NotifyPopupLiveStatePath
+    try {
+        $ttlSeconds = [Math]::Max(300, ([Math]::Max(3, $TimeoutSecondsValue) + 60))
+        $payload = @{
+            processId         = $PID
+            configFingerprint = Get-NotifyPopupContextFingerprint -Value $config.ConfigPath
+            targetFingerprint = $TargetFingerprintValue
+            stackIndex        = $StackIndexValue
+            startedAtTicks    = [DateTime]::UtcNow.Ticks
+            createdAtUtc      = [DateTime]::UtcNow.ToString('o')
+            expiresAtTicks    = [DateTime]::UtcNow.AddSeconds($ttlSeconds).Ticks
+            protectedHost     = Protect-NotifyPopupLiveValue -Value $TargetHostValue
+            protectedCwd      = Protect-NotifyPopupLiveValue -Value $CwdBaseValue
+            protectedTab      = Protect-NotifyPopupLiveValue -Value $SourceTabTitleValue
+        }
+        [System.IO.File]::WriteAllText($path, ($payload | ConvertTo-Json -Depth 4), [System.Text.UTF8Encoding]::new($false))
+        Write-NotifyPopupLog -Message ('popup-live-state pid={0} targetFingerprint={1} stackIndex={2} pathFingerprint={3}' -f $PID, $TargetFingerprintValue, $StackIndexValue, (Get-NotifyPopupContextFingerprint -Value $path))
+    }
+    catch {
+        Write-NotifyPopupLog -Message ('popup-live-state-write-error "{0}"' -f $_.Exception.Message)
+    }
+}
+
+function Remove-NotifyPopupLiveState {
+    try {
+        Remove-Item -LiteralPath (Get-NotifyPopupLiveStatePath) -Force -ErrorAction SilentlyContinue
+    }
+    catch {
+    }
+}
+
 $script:NotifyPopupWallpaperImage = Get-NotifyPopupWallpaperImage -Path $popupWallpaperPath
 
 function Get-NotifyPopupDedupeSignature {
@@ -295,6 +350,8 @@ catch {
 }
 
 Write-NotifyPopupLog -Message ('popup-start targetFingerprint={0} hasCwd={1} hasTab={2} timeout={3} stackIndex={4}' -f (Get-NotifyPopupContextFingerprint -Value $FocusTarget), (-not [string]::IsNullOrWhiteSpace($CwdBase)), (-not [string]::IsNullOrWhiteSpace($SourceTabTitle)), $TimeoutSeconds, $StackIndex)
+$liveTargetFingerprint = if ([string]::IsNullOrWhiteSpace($TargetFingerprint)) { Get-NotifyPopupContextFingerprint -Value $FocusTarget } else { $TargetFingerprint }
+Save-NotifyPopupLiveState -TargetHostValue $FocusTarget -CwdBaseValue $CwdBase -SourceTabTitleValue $SourceTabTitle -TargetFingerprintValue $liveTargetFingerprint -StackIndexValue $StackIndex -TimeoutSecondsValue $TimeoutSeconds
 
 function Get-NotifyPopupWindows {
     param(
@@ -927,6 +984,7 @@ $form.Add_Shown({
 
 $form.Add_FormClosed({
     Write-NotifyPopupLog -Message ('popup-closed shouldActivate={0}' -f $shouldActivate)
+    Remove-NotifyPopupLiveState
     try {
         $timer.Stop()
         $timer.Dispose()

@@ -8,6 +8,7 @@ This folder implements a reliable **Windows local notification bridge** for runn
 - `notify-listener.ps1` — Windows local HTTP listener that shows toast notifications
 - `pi-notify-reverse-tunnel.ps1` — persistent reverse SSH tunnel with auto-reconnect
 - `pi-notify-watchdog.ps1` — self-heal watchdog for listener/tunnel health
+- `pi-notify-hotkey.ps1` — one-shot target activation used by the Start Menu global shortcut
 - `set-notify-mode.ps1` — switch between `system-toast` and `popup-focus`
 - `install-remote-windows-notify.ps1` — installs the remote Pi extension + config
 - `install-windows-autostart.ps1` — registers Startup-folder launchers for listener/tunnel/watchdog and removes legacy scheduled tasks
@@ -80,6 +81,7 @@ Installer behavior:
 
 - removes legacy scheduled tasks named `PiNotifyListener`, `PiNotifyTunnel`, and `PiNotifyWatchdog`
 - writes Startup-folder launchers for listener/tunnel/watchdog
+- writes a Start Menu shortcut with the configured `popupHotkey`
 
 Startup files:
 
@@ -87,7 +89,11 @@ Startup files:
 - `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\PiNotifyTunnel.vbs`
 - `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\PiNotifyWatchdog.vbs`
 
-They start at user logon. `PiNotifyListener.vbs` invokes `pi-notify-restart-listener.ps1`, so startup keeps the runner-owned listener invariant instead of launching `notify-listener.ps1` directly. `PiNotifyTunnel` keeps retrying automatically if SSH drops, and `PiNotifyWatchdog` periodically verifies both local listener health and remote loopback tunnel health and restarts the broken side when needed.
+Hotkey shortcut:
+
+- `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Pi Notify Oldest Popup.lnk`
+
+They start at user logon. `PiNotifyListener.vbs` invokes `pi-notify-restart-listener.ps1`, so startup keeps the runner-owned listener invariant instead of launching `notify-listener.ps1` directly. `PiNotifyTunnel` keeps retrying automatically if SSH drops, and `PiNotifyWatchdog` periodically verifies local listener and remote loopback tunnel health and restarts the broken side when needed. The Start Menu shortcut owns the global popup hotkey, so no always-running hotkey process is required.
 
 ## Refresh after pull
 
@@ -172,6 +178,8 @@ Important keys:
   "popupTimeoutSeconds": 18,
   "popupWallpaperPath": "C:/Users/Administrator/.pi-notify/bin/popup-wallpaper.png",
   "popupPlacement": "cursor",
+  "popupHotkey": "Ctrl+Alt+P",
+  "popupHotkeyEnabled": true,
   "token": "..."
 }
 ```
@@ -206,6 +214,8 @@ Notification payloads may include:
 - `cursor` -> the screen currently containing the mouse pointer
 - `right` -> the right-most screen
 - `primary` -> the Windows primary screen
+
+`popupHotkey` defaults to `Ctrl+Alt+P`. When multiple custom popup cards are visible, pressing it activates the oldest live popup's target tab and only dismisses that selected popup. Press it again to move through the remaining popups in age order. Set `popupHotkeyEnabled` to `false` to disable the global hotkey.
 
 Template fields:
 

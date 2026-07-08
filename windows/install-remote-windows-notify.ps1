@@ -40,6 +40,7 @@ $runtimeFiles = @(
     'pi-notify-restart-listener.ps1',
     'pi-notify-popup.ps1',
     'pi-notify-activate.ps1',
+    'pi-notify-hotkey.ps1',
     'pi-notify-reverse-tunnel.ps1',
     'pi-notify-watchdog.ps1',
     'pi-notify-refresh.ps1',

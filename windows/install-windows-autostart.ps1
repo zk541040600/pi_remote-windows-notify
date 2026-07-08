@@ -122,6 +122,7 @@ $filesToCopy = @(
     'notify-listener.ps1',
     'pi-notify-reverse-tunnel.ps1',
     'pi-notify-activate.ps1',
+    'pi-notify-hotkey.ps1',
     'pi-notify-popup.ps1',
     'pi-notify-watchdog.ps1',
     'pi-notify-listener-runner.ps1',
@@ -148,18 +149,22 @@ foreach ($name in $filesToCopy) {
 
 $listenerScript = Join-Path $binDir 'pi-notify-restart-listener.ps1'
 $tunnelScript = Join-Path $binDir 'pi-notify-reverse-tunnel.ps1'
+$hotkeyScript = Join-Path $binDir 'pi-notify-hotkey.ps1'
 $activationScript = Join-Path $binDir 'pi-notify-activate.ps1'
 $powershellExe = Get-NotifyBridgePowerShellExe
 $toastSupport = Register-NotifyBridgeSystemToastSupport -ConfigPathValue $config.ConfigPath -ToastAppId 'Pi Remote'
 $protocolUri = $toastSupport.ProtocolUri
 $toastShortcutPath = $toastSupport.ShortcutPath
+$popupHotkeyShortcutPath = Register-NotifyBridgePopupHotkeyShortcut -PowerShellExe $powershellExe -HotkeyScript $hotkeyScript -ConfigPathValue $config.ConfigPath -HotkeyValue $config.PopupHotkey -Enabled ([bool]$config.PopupHotkeyEnabled)
 $installMode = ''
 
 $listenerVbs = Join-Path $startupDir 'PiNotifyListener.vbs'
 $tunnelVbs = Join-Path $startupDir 'PiNotifyTunnel.vbs'
 $watchdogVbs = Join-Path $startupDir 'PiNotifyWatchdog.vbs'
+$hotkeyVbs = Join-Path $startupDir 'PiNotifyHotkey.vbs'
+Remove-Item -LiteralPath $hotkeyVbs -Force -ErrorAction SilentlyContinue
 
-foreach ($taskName in @('PiNotifyListener', 'PiNotifyTunnel', 'PiNotifyWatchdog')) {
+foreach ($taskName in @('PiNotifyListener', 'PiNotifyTunnel', 'PiNotifyWatchdog', 'PiNotifyHotkey')) {
     Remove-LegacyScheduledTask -TaskName $taskName
 }
 
@@ -188,3 +193,5 @@ Write-Host ('Toast link   : {0}' -f $toastShortcutPath)
 Write-Host ('Listener VBS : {0}' -f $listenerVbs)
 Write-Host ('Tunnel VBS   : {0}' -f $tunnelVbs)
 Write-Host ('Watchdog VBS : {0}' -f $watchdogVbs)
+Write-Host ('Hotkey link  : {0}' -f $popupHotkeyShortcutPath)
+Write-Host ('Popup hotkey : {0}' -f $config.PopupHotkey)

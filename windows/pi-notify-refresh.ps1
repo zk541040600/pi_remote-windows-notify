@@ -216,7 +216,7 @@ function Reset-NotifyLog {
 function Clear-NotifyPopupRuntimeArtifacts {
     $logDir = Join-Path $baseDir 'logs'
     if (-not (Test-Path -LiteralPath $logDir)) { return }
-    foreach ($pattern in @('popup-cache.json', 'activation-*.json', 'popup-payload.json', 'popup-dedupe.json', 'popup-stdout.log', 'popup-stderr.log', 'popup-payload.*.json', 'popup-dedupe.*.json', 'popup-stdout.*.log', 'popup-stderr.*.log', 'popup.log', 'listener.log', 'activate.log')) {
+    foreach ($pattern in @('popup-cache.json', 'activation-*.json', 'popup-live.*.json', 'popup-payload.json', 'popup-dedupe.json', 'popup-stdout.log', 'popup-stderr.log', 'popup-payload.*.json', 'popup-dedupe.*.json', 'popup-stdout.*.log', 'popup-stderr.*.log', 'popup.log', 'listener.log', 'activate.log', 'hotkey.log')) {
         foreach ($item in @(Get-ChildItem -LiteralPath $logDir -Filter $pattern -File -ErrorAction SilentlyContinue)) {
             Remove-Item -LiteralPath $item.FullName -Force -ErrorAction SilentlyContinue
         }
@@ -294,6 +294,7 @@ $runtimeFiles = @(
     'notify-listener.ps1',
     'pi-notify-popup.ps1',
     'pi-notify-activate.ps1',
+    'pi-notify-hotkey.ps1',
     'pi-notify-reverse-tunnel.ps1',
     'pi-notify-watchdog.ps1',
     'pi-notify-listener-runner.ps1',
@@ -323,6 +324,10 @@ if ((Test-Path -LiteralPath $bundledWallpaperPath) -and ((-not $cfg.PSObject.Pro
     if ($cfg.PSObject.Properties['popupWallpaperPath']) { $cfg.popupWallpaperPath = $bundledWallpaperPath } else { $cfg | Add-Member -NotePropertyName 'popupWallpaperPath' -NotePropertyValue $bundledWallpaperPath }
     $cfg | ConvertTo-Json -Depth 10 | Set-Content $configPath -Encoding UTF8
 }
+$hotkeyScript = Join-Path $binDir 'pi-notify-hotkey.ps1'
+$popupHotkeyShortcutPath = Register-NotifyBridgePopupHotkeyShortcut -PowerShellExe (Get-NotifyBridgePowerShellExe) -HotkeyScript $hotkeyScript -ConfigPathValue $configPath -HotkeyValue ([string]$cfg.popupHotkey) -Enabled ([bool]$cfg.popupHotkeyEnabled)
+Remove-Item -LiteralPath (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Startup\PiNotifyHotkey.vbs') -Force -ErrorAction SilentlyContinue
+Write-Host ('Popup hotkey: {0} -> {1}' -f $cfg.popupHotkey, $popupHotkeyShortcutPath)
 Clear-NotifyPopupRuntimeArtifacts
 
 if ($SyncRemote -and -not $SkipRemoteSync) {
@@ -352,6 +357,7 @@ if ($SkipTunnel) {
     Write-Host "[5/7] keep existing reverse tunnel; restart watchdog around listener refresh (-SkipTunnel)"
     Stop-NotifyWatchdogProcesses
     Reset-NotifyLog -BaseDir $baseDir -Name 'watchdog.log'
+    Reset-NotifyLog -BaseDir $baseDir -Name 'hotkey.log'
 }
 else {
     Write-Host "[5/7] stop old tunnel/watchdog..."
@@ -360,6 +366,7 @@ else {
     Stop-NotifyWatchdogProcesses
     Reset-NotifyLog -BaseDir $baseDir -Name 'tunnel.log'
     Reset-NotifyLog -BaseDir $baseDir -Name 'watchdog.log'
+    Reset-NotifyLog -BaseDir $baseDir -Name 'hotkey.log'
 }
 
 Write-Host "[6/7] restart listener..."
