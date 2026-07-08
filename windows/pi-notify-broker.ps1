@@ -33,6 +33,16 @@ public class PiNotifyNoActivateForm : System.Windows.Forms.Form {
             return cp;
         }
     }
+
+    protected override void WndProc(ref System.Windows.Forms.Message m) {
+        const int WM_MOUSEACTIVATE = 0x0021;
+        const int MA_NOACTIVATE = 3;
+        if (m.Msg == WM_MOUSEACTIVATE) {
+            m.Result = (IntPtr)MA_NOACTIVATE;
+            return;
+        }
+        base.WndProc(ref m);
+    }
 }
 
 public static class PiNotifyConsoleWindow {
@@ -874,6 +884,7 @@ function Show-NotifyBrokerPopup {
     $targetHost = $FocusTarget
     $targetCwdBase = $CwdBase
     $targetSourceTabTitle = $SourceTabTitle
+    $previousForegroundWindow = [PiNotifyBrokerUser32]::GetForegroundWindow()
     $didActivate = $false
     $shouldActivate = $false
 
@@ -891,6 +902,7 @@ function Show-NotifyBrokerPopup {
         StackIndex        = $StackIndex
         PopupPlacement    = $PopupPlacementValue
         CreatedAtUtc      = $popupCreatedAtUtc
+        PreviousForegroundWindow = $previousForegroundWindow
         DidActivate       = [ref]$didActivate
         ShouldActivate    = [ref]$shouldActivate
         Timer             = $timer
@@ -960,6 +972,14 @@ function Show-NotifyBrokerPopup {
         $this.Region = New-Object System.Drawing.Region($roundedPath)
         $roundedPath.Dispose()
         [void][PiNotifyBrokerUser32]::ShowWindowAsync($this.Handle, 4)
+        try {
+            if ($tag.PreviousForegroundWindow -ne [IntPtr]::Zero -and [PiNotifyBrokerUser32]::GetForegroundWindow() -eq $this.Handle) {
+                [void][PiNotifyBrokerUser32]::SetForegroundWindow($tag.PreviousForegroundWindow)
+                Write-NotifyBrokerLog -Message ('broker-restore-foreground-after-show popupId={0}' -f $tag.PopupId)
+            }
+        }
+        catch {
+        }
         Write-NotifyBrokerLog -Message ('broker-shown popupId={0} stackIndex={1} placement={2} targetFingerprint={3} elapsedMs={4}' -f $tag.PopupId, $tag.StackIndex, $tag.PopupPlacement, $tag.TargetFingerprint, [int]([DateTime]::UtcNow - $tag.CreatedAtUtc).TotalMilliseconds)
         $tag.Timer.Start()
         $tag.FocusWatchTimer.Start()

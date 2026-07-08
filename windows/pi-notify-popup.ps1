@@ -42,6 +42,16 @@ public class PiNotifyNoActivateForm : System.Windows.Forms.Form {
             return cp;
         }
     }
+
+    protected override void WndProc(ref System.Windows.Forms.Message m) {
+        const int WM_MOUSEACTIVATE = 0x0021;
+        const int MA_NOACTIVATE = 3;
+        if (m.Msg == WM_MOUSEACTIVATE) {
+            m.Result = (IntPtr)MA_NOACTIVATE;
+            return;
+        }
+        base.WndProc(ref m);
+    }
 }
 
 public static class PiNotifyConsoleWindow {
@@ -997,6 +1007,8 @@ function Get-NotifyPopupWorkingArea {
     return [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
 }
 
+$previousForegroundWindow = [PiNotifyPopupUser32]::GetForegroundWindow()
+
 $form.Add_Shown({
     $workingArea = Get-NotifyPopupWorkingArea -Placement $PopupPlacement
     $margin = 16
@@ -1012,6 +1024,14 @@ $form.Add_Shown({
     $form.Region = New-Object System.Drawing.Region($roundedPath)
     $roundedPath.Dispose()
     [void][PiNotifyPopupUser32]::ShowWindowAsync($form.Handle, 4)
+    try {
+        if ($previousForegroundWindow -ne [IntPtr]::Zero -and [PiNotifyPopupUser32]::GetForegroundWindow() -eq $form.Handle) {
+            [void][PiNotifyPopupUser32]::SetForegroundWindow($previousForegroundWindow)
+            Write-NotifyPopupLog -Message 'popup-restore-foreground-after-show'
+        }
+    }
+    catch {
+    }
     Write-NotifyPopupLog -Message ('popup-shown-noactivate x={0} y={1} w={2} h={3} stackIndex={4} placement={5}' -f $x, $y, $form.Width, $form.Height, $slot, $PopupPlacement)
     $timer.Start()
     $focusWatchTimer.Start()

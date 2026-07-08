@@ -153,6 +153,10 @@ if ($brokerText -match $badBrokerLogPattern) {
 if ($brokerText -notmatch 'Get-NotifyBrokerContextFingerprint') {
     throw 'Broker must fingerprint target context in logs.'
 }
+$popupNoActivateText = [System.IO.File]::ReadAllText((Join-Path $PSScriptRoot 'pi-notify-popup.ps1'), [System.Text.UTF8Encoding]::new($false))
+if ($brokerText -notmatch 'WM_MOUSEACTIVATE' -or $brokerText -notmatch 'MA_NOACTIVATE' -or $brokerText -notmatch 'PreviousForegroundWindow' -or $popupNoActivateText -notmatch 'WM_MOUSEACTIVATE' -or $popupNoActivateText -notmatch 'MA_NOACTIVATE' -or $popupNoActivateText -notmatch 'previousForegroundWindow') {
+    throw 'Popup windows must avoid stealing keyboard or mouse activation from the current foreground app.'
+}
 # Tab cache: conservative TTL and liveness validation before reuse
 if ($brokerText -notmatch 'NotifyBrokerTabCacheTtlSeconds' -or $brokerText -notmatch 'Test-NotifyBrokerTabCacheValid' -or $brokerText -notmatch 'GetWindowThreadProcessId') {
     throw 'Broker tab cache must use conservative TTL and liveness validation before reuse.'
