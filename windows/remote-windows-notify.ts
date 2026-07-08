@@ -272,7 +272,7 @@ async function getRuntimeConfig(): Promise<RuntimeConfig> {
 }
 
 function shouldSkipNotificationForThisProcess(): boolean {
-  return process.env.PI_SUBAGENT_CHILD === "1";
+  return process.env.PI_SUBAGENT_CHILD === "1" || process.env.TRELLIS_SUBAGENT_CHILD === "1";
 }
 
 function normalizeTabTitlePart(value: string, fallback: string): string {
