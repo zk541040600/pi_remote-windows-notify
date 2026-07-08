@@ -102,18 +102,27 @@ function findLastTextForRole(messages: AgentMessageLike[], role: string): string
   return "";
 }
 
-function collectToolInfo(messages: AgentMessageLike[]): { toolNames: string[]; hasError: boolean } {
+function collectToolInfo(messages: AgentMessageLike[]): {
+  toolNames: string[];
+  hasToolError: boolean;
+  hasTrailingToolError: boolean;
+} {
   const seen = new Set<string>();
   const toolNames: string[] = [];
-  let hasError = false;
+  let hasToolError = false;
+  let hasTrailingToolError = false;
 
   for (const message of messages) {
     if (message?.role !== "toolResult") {
+      if (message?.role === "assistant" && extractTextContent(message.content).trim()) {
+        hasTrailingToolError = false;
+      }
       continue;
     }
 
     if (message.isError) {
-      hasError = true;
+      hasToolError = true;
+      hasTrailingToolError = true;
     }
 
     const toolName = normalizeText(typeof message.toolName === "string" ? message.toolName : "", "", 32);
@@ -125,16 +134,31 @@ function collectToolInfo(messages: AgentMessageLike[]): { toolNames: string[]; h
     toolNames.push(toolName);
   }
 
-  return { toolNames, hasError };
+  return { toolNames, hasToolError, hasTrailingToolError };
+}
+
+function assistantTextSignalsProblem(text: string): boolean {
+  const value = text.trim();
+  if (!value) {
+    return false;
+  }
+
+  return (
+    /(^|\n)\s*(❌|⚠️)/.test(value) ||
+    /(?:测试|验证|构建|命令|执行|运行|提交|上传|push|commit|build|test|verify)\S{0,12}(?:失败|报错|未通过)/i.test(value) ||
+    /(?:无法完成|未完成|不能继续|阻塞|需要你确认|需要确认)/.test(value) ||
+    /\b(blocked|failed|failure|cannot continue|unable to complete)\b/i.test(value)
+  );
 }
 
 function buildDynamicNotification(messages: AgentMessageLike[], config: RuntimeConfig): { title: string; body: string } {
   const userPrompt = normalizeText(findLastTextForRole(messages, "user"), "", 72);
   const assistantText = normalizeText(findLastTextForRole(messages, "assistant"), "", 120);
-  const { toolNames, hasError } = collectToolInfo(messages);
+  const { toolNames, hasToolError, hasTrailingToolError } = collectToolInfo(messages);
 
   const title = normalizeText(userPrompt || assistantText || config.title, "Pi", 72);
-  const status = hasError ? "有报错，等你看" : toolNames.length > 0 ? "已完成，等你确认" : "已回复，等你输入";
+  const hasUnresolvedError = hasTrailingToolError || (hasToolError && assistantTextSignalsProblem(assistantText));
+  const status = hasUnresolvedError ? "有报错，等你看" : toolNames.length > 0 ? "已完成，等你确认" : "已回复，等你输入";
   const bodyParts: string[] = [status];
 
   if (toolNames.length > 0) {
