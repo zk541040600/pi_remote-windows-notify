@@ -515,10 +515,15 @@ function Test-NotifyPopupForegroundTarget {
         if (-not [string]::IsNullOrWhiteSpace($SourceTabTitleValue)) {
             foreach ($value in $haystack) {
                 if ($value.IndexOf($SourceTabTitleValue, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
-                                Write-NotifyPopupLog -Message ('popup-foreground-target-match sourceTabFingerprint={0} selectedTabFingerprint={1} windowFingerprint={2}' -f (Get-NotifyPopupContextFingerprint -Value $SourceTabTitleValue), (Get-NotifyPopupContextFingerprint -Value $selectedTitle), (Get-NotifyPopupContextFingerprint -Value $windowTitle))
+                    Write-NotifyPopupLog -Message ('popup-foreground-target-match sourceTabFingerprint={0} selectedTabFingerprint={1} windowFingerprint={2}' -f (Get-NotifyPopupContextFingerprint -Value $SourceTabTitleValue), (Get-NotifyPopupContextFingerprint -Value $selectedTitle), (Get-NotifyPopupContextFingerprint -Value $windowTitle))
                     return $true
                 }
             }
+
+            # A precise tab title identifies the popup's own Pi tab. Do not fall back to
+            # cwd matching here: multiple Pi tabs commonly share the same cwd, and a
+            # click on one popup would otherwise make sibling popups dismiss themselves.
+            return $false
         }
 
         if (-not [string]::IsNullOrWhiteSpace($CurrentDirBase)) {
