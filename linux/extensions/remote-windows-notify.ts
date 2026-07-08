@@ -36,8 +36,11 @@ type AgentMessageLike = {
 const DEFAULT_ENDPOINT = "http://127.0.0.1:23118/notify";
 const DEFAULT_TIMEOUT_MS = 4000;
 const DEFAULT_CONFIG_PATH = join(homedir(), ".pi", "agent", "remote-windows-notify.json");
-const NOTIFY_SESSION_KEY = `${process.pid.toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
-const globalState = globalThis as { __piRemoteWindowsNotifyRegistered?: boolean };
+const PI_TERMINAL_TITLE = "π";
+const globalState = globalThis as {
+  __piRemoteWindowsNotifyRegistered?: boolean;
+  __piRemoteWindowsNotifyActiveToken?: symbol;
+};
 
 function isTruthy(value: string | undefined): boolean {
   return /^(1|true|yes|on)$/i.test((value ?? "").trim());
@@ -121,14 +124,17 @@ function findFirstUserTextFromBranch(ctx: unknown): string {
   return "";
 }
 
-function getSessionDisplayName(ctx: unknown): string | undefined {
+function getSessionNames(ctx: unknown): { explicitName?: string; displayName?: string } {
   try {
-    const explicit = (ctx as { sessionManager?: { getSessionName?: () => string | undefined } })?.sessionManager
-      ?.getSessionName?.();
-    const display = normalizeText(explicit || findFirstUserTextFromBranch(ctx), "", 96);
-    return display || undefined;
+    const explicitName = normalizeText(
+      (ctx as { sessionManager?: { getSessionName?: () => string | undefined } })?.sessionManager?.getSessionName?.(),
+      "",
+      96,
+    ) || undefined;
+    const displayName = explicitName || normalizeText(findFirstUserTextFromBranch(ctx), "", 96) || undefined;
+    return { explicitName, displayName };
   } catch {
-    return undefined;
+    return {};
   }
 }
 
@@ -274,9 +280,10 @@ function normalizeTabTitlePart(value: string, fallback: string): string {
   return cleaned || fallback;
 }
 
-function getNotifyTabTitle(cwdBase: string, sessionName?: string): string {
-  const safeName = normalizeTabTitlePart(sessionName || cwdBase, "Pi");
-  return `π - ${safeName} · ${NOTIFY_SESSION_KEY}`;
+function getNotifyTabTitle(cwdBase: string, explicitSessionName?: string): string {
+  const safeCwd = normalizeTabTitlePart(cwdBase, "Pi");
+  const safeName = explicitSessionName ? normalizeTabTitlePart(explicitSessionName, "") : "";
+  return safeName ? `${PI_TERMINAL_TITLE} - ${safeName} - ${safeCwd}` : `${PI_TERMINAL_TITLE} - ${safeCwd}`;
 }
 
 function setTerminalTitle(title: string): void {
@@ -320,34 +327,56 @@ async function notify(
   }
 }
 
-function getCurrentNotifyTabTitle(sessionName?: string): { cwdBase: string | undefined; tabTitle: string } {
+function getCurrentNotifyTabTitle(explicitSessionName?: string): { cwdBase: string | undefined; tabTitle: string } {
   const cwdBase = basename(process.cwd()) || undefined;
-  return { cwdBase, tabTitle: getNotifyTabTitle(cwdBase || "", sessionName) };
+  return { cwdBase, tabTitle: getNotifyTabTitle(cwdBase || "", explicitSessionName) };
 }
 
 export default function remoteWindowsNotify(pi: ExtensionAPI) {
-  if (shouldSkipNotificationForThisProcess() || globalState.__piRemoteWindowsNotifyRegistered) {
+  if (shouldSkipNotificationForThisProcess()) {
     return;
   }
 
+  const activeToken = Symbol("pi-remote-windows-notify");
   globalState.__piRemoteWindowsNotifyRegistered = true;
+  globalState.__piRemoteWindowsNotifyActiveToken = activeToken;
 
-  let currentSessionName: string | undefined;
+  const isActiveExtension = () => globalState.__piRemoteWindowsNotifyActiveToken === activeToken;
+
+  let currentExplicitSessionName: string | undefined;
+  let currentDisplaySessionName: string | undefined;
   const initialTitle = getCurrentNotifyTabTitle();
   setTerminalTitle(initialTitle.tabTitle);
 
   pi.on("session_start", (_event, ctx) => {
-    currentSessionName = getSessionDisplayName(ctx);
-    setTerminalTitle(getCurrentNotifyTabTitle(currentSessionName).tabTitle);
+    if (!isActiveExtension()) {
+      return;
+    }
+
+    const sessionNames = getSessionNames(ctx);
+    currentExplicitSessionName = sessionNames.explicitName;
+    currentDisplaySessionName = sessionNames.displayName;
+    setTerminalTitle(getCurrentNotifyTabTitle(currentExplicitSessionName).tabTitle);
   });
 
   pi.on("session_info_changed", (event) => {
-    currentSessionName = normalizeText(event.name, "", 96) || undefined;
-    setTerminalTitle(getCurrentNotifyTabTitle(currentSessionName).tabTitle);
+    if (!isActiveExtension()) {
+      return;
+    }
+
+    currentExplicitSessionName = normalizeText(event.name, "", 96) || undefined;
+    currentDisplaySessionName = currentExplicitSessionName;
+    setTerminalTitle(getCurrentNotifyTabTitle(currentExplicitSessionName).tabTitle);
+  });
+
+  pi.on("session_shutdown", () => {
+    if (isActiveExtension()) {
+      globalState.__piRemoteWindowsNotifyActiveToken = undefined;
+    }
   });
 
   pi.on("agent_end", async (event, ctx) => {
-    if (shouldSkipNotificationForThisProcess()) {
+    if (shouldSkipNotificationForThisProcess() || !isActiveExtension()) {
       return;
     }
 
@@ -365,9 +394,12 @@ export default function remoteWindowsNotify(pi: ExtensionAPI) {
         ? { title: config.title, body: renderBody(config.bodyTemplate) }
         : buildDynamicNotification(messages, config);
 
-    const sessionName = currentSessionName || getSessionDisplayName(ctx);
-    const { cwdBase, tabTitle } = getCurrentNotifyTabTitle(sessionName);
-    currentSessionName = sessionName;
+    const sessionNames = getSessionNames(ctx);
+    const explicitSessionName = sessionNames.explicitName ?? currentExplicitSessionName;
+    const sessionName = sessionNames.displayName ?? currentDisplaySessionName;
+    const { cwdBase, tabTitle } = getCurrentNotifyTabTitle(explicitSessionName);
+    currentExplicitSessionName = explicitSessionName;
+    currentDisplaySessionName = sessionName;
     setTerminalTitle(tabTitle);
 
     await notify(

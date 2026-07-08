@@ -865,14 +865,20 @@ $closeLabel.Cursor = [System.Windows.Forms.Cursors]::Hand
 $sessionDisplayName = $SessionName
 if ([string]::IsNullOrWhiteSpace($sessionDisplayName) -and -not [string]::IsNullOrWhiteSpace($SourceTabTitle)) {
     $tabPrefix = ([string][char]0x03c0) + ' - '
-    $tabSeparator = ' ' + ([string][char]0x00b7) + ' '
-    if ($SourceTabTitle.StartsWith($tabPrefix, [System.StringComparison]::OrdinalIgnoreCase) -and $SourceTabTitle.IndexOf($tabSeparator, [System.StringComparison]::OrdinalIgnoreCase) -gt $tabPrefix.Length) {
+    $middleDotSeparator = ' ' + ([string][char]0x00b7) + ' '
+    if ($SourceTabTitle.StartsWith($tabPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
         $start = $tabPrefix.Length
-        $end = $SourceTabTitle.IndexOf($tabSeparator, [System.StringComparison]::OrdinalIgnoreCase)
-        $sessionDisplayName = $SourceTabTitle.Substring($start, $end - $start)
+        $middleDotIndex = $SourceTabTitle.IndexOf($middleDotSeparator, [System.StringComparison]::OrdinalIgnoreCase)
+        $dashIndex = $SourceTabTitle.LastIndexOf(' - ', [System.StringComparison]::OrdinalIgnoreCase)
+        if ($dashIndex -gt $start) {
+            $sessionDisplayName = $SourceTabTitle.Substring($start, $dashIndex - $start).Trim()
+        }
+        elseif ($middleDotIndex -gt $start) {
+            $sessionDisplayName = $SourceTabTitle.Substring($start, $middleDotIndex - $start).Trim()
+        }
     }
-    else {
-        $sessionDisplayName = $SourceTabTitle
+    if ([string]::IsNullOrWhiteSpace($sessionDisplayName)) {
+        $sessionDisplayName = $SourceTabTitle.Trim()
     }
 }
 if ([string]::IsNullOrWhiteSpace($sessionDisplayName)) { $sessionDisplayName = $CwdBase }

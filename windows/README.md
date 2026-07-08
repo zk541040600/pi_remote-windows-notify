@@ -203,7 +203,7 @@ Notification payloads may include:
 {
   "focusTarget": "my",
   "cwdBase": "project-name",
-  "tabTitle": "π - session-name-or-project · sessionKey",
+  "tabTitle": "π - session-name - project-name",
   "sessionName": "human-readable session name"
 }
 ```
@@ -235,7 +235,7 @@ Display modes:
 
 `popup-focus` matching rules:
 
-1. Prefer exact-ish `tabTitle` from the sender (`π - <cwdBase> · <sessionKey>`).
+1. Prefer exact-ish `tabTitle` from the sender (`π - <sessionName> - <cwdBase>` when the Pi session is named, otherwise `π - <cwdBase>`).
 2. Fall back to `cwdBase` when older senders do not provide `tabTitle`.
 3. If no matching tab is found, log `popup-focus-miss` and do nothing. It does **not** open a new tab/window and does **not** jump to `Windows PowerShell`.
 
