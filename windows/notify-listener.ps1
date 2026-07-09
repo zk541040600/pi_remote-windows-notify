@@ -560,9 +560,23 @@ function Send-NotifyBrokerPopup {
         $stream.Write($requestBytes, 0, $requestBytes.Length)
         $stream.Write($bodyBytes, 0, $bodyBytes.Length)
         $stream.Flush()
+
+        $responseWaitMs = [Math]::Min(150, $timeoutMs)
+        $deadline = [DateTime]::UtcNow.AddMilliseconds($responseWaitMs)
+        while (-not $stream.DataAvailable -and [DateTime]::UtcNow -lt $deadline) {
+            Start-Sleep -Milliseconds 10
+        }
+        if (-not $stream.DataAvailable) {
+            Write-NotifyListenerLog -Message 'broker-post-accepted-no-response'
+            return $true
+        }
+
         $buffer = [byte[]]::new(256)
         $read = $stream.Read($buffer, 0, $buffer.Length)
-        if ($read -le 0) { throw 'broker returned an empty response.' }
+        if ($read -le 0) {
+            Write-NotifyListenerLog -Message 'broker-post-accepted-empty-response'
+            return $true
+        }
         $responseText = [System.Text.Encoding]::ASCII.GetString($buffer, 0, $read)
         if ($responseText -notmatch '^HTTP/1\.1 200\b') {
             $firstLine = (($responseText -split "`r?`n") | Select-Object -First 1)

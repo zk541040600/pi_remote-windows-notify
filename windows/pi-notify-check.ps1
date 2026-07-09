@@ -142,8 +142,8 @@ if ($brokerText -notmatch 'System.Net.IPAddress\]::Loopback' -or $brokerText -no
 if ($brokerText -notmatch 'broker.pid' -or $brokerText -notmatch 'broker.log' -or $brokerText -notmatch 'Global\\PiNotifyBroker_') {
     throw 'Broker must write broker.pid/broker.log and use a singleton mutex.'
 }
-if ($brokerText -notmatch 'popup-live\.' -or $brokerText -notmatch 'protectedHost' -or $brokerText -notmatch 'protectedCwd' -or $brokerText -notmatch 'protectedTab') {
-    throw 'Broker live-state files must use DPAPI-protected target context for hotkey compatibility.'
+if ($brokerText -notmatch 'popup-live\.' -or $brokerText -notmatch 'brokerManaged\s*=\s*\$true' -or $brokerText -match 'protectedHost\s*=\s*Protect-NotifyBrokerLiveValue' -or $brokerText -match 'protectedCwd\s*=\s*Protect-NotifyBrokerLiveValue' -or $brokerText -match 'protectedTab\s*=\s*Protect-NotifyBrokerLiveValue') {
+    throw 'Broker-managed live-state files must avoid target-context DPAPI work; broker /activate-oldest and /close use in-memory popup state and popupId.'
 }
 # Privacy: broker logs must not include raw notification content or target context
 $badBrokerLogPattern = ('broker-popup-start ' + 'title=') + '|' + ('broker-popup-start ' + 'body=') + '|' + ('broker-shown ' + 'title=') + '|' + 'sourceTabTitle="' + '|' + 'cwdBase="' + '|' + 'sessionName="' + '|' + 'windowTitle="' + '|' + 'tabName="' + '|' + 'broker-action activate host=' + '|' + 'broker-cache host="' + '|' + 'broker-keywords "'
@@ -206,15 +206,15 @@ if ($listenerTextForLaunch -notmatch 'Invoke-NotifyBrokerPopup' -or $listenerTex
 if ($listenerTextForLaunch -notmatch 'Dictionary\[string,string\][\s\S]{0,120}OrdinalIgnoreCase' -or ([regex]::Matches($brokerText, 'Dictionary\[string,string\][\s\S]{0,120}OrdinalIgnoreCase')).Count -lt 2) {
     throw 'Listener and broker HTTP parsers must treat headers as case-insensitive so Node fetch lowercase content-length is honored.'
 }
-if ($listenerTextForLaunch -notmatch 'TcpClient' -or $listenerTextForLaunch -notmatch 'BeginConnect' -or $listenerTextForLaunch -notmatch 'Content-Length: \$\(\$bodyBytes\.Length\)' -or ([regex]::Matches($hotkeyTextForArtifacts, 'ContentLength\s*=\s*\$closeBytes\.Length')).Count -lt 2) {
-    throw 'Broker popup/close POST requests must use bounded loopback POSTs with Content-Length for the raw TCP HTTP broker parser.'
+if ($listenerTextForLaunch -notmatch 'TcpClient' -or $listenerTextForLaunch -notmatch 'BeginConnect' -or $listenerTextForLaunch -notmatch 'Content-Length: \$\(\$bodyBytes\.Length\)' -or $listenerTextForLaunch -notmatch 'broker-post-accepted-no-response' -or ([regex]::Matches($hotkeyTextForArtifacts, 'ContentLength\s*=\s*\$closeBytes\.Length')).Count -lt 2) {
+    throw 'Broker popup/close POST requests must use bounded loopback POSTs with Content-Length and avoid false fallback when the broker accepts but responds slowly.'
 }
 if ($listenerTextForLaunch -notmatch 'Invoke-NotifyBrokerPopup[^\r\n]+-StackIndex -1') {
     throw 'Listener must let the broker allocate popup stack slots; otherwise broker-managed popups overlap at slot 0.'
 }
 # Hotkey broker compatibility and resident registration
-if ($hotkeyTextForArtifacts -notmatch 'brokerManaged' -or $hotkeyTextForArtifacts -notmatch 'BrokerCloseUrl' -or $hotkeyTextForArtifacts -notmatch '"activate":true' -or $hotkeyTextForArtifacts -notmatch 'pi-notify-broker.ps1') {
-    throw 'Hotkey must recognize broker-managed popups and activate/close them via broker /close without killing the broker.'
+if ($hotkeyTextForArtifacts -notmatch 'brokerManaged' -or $hotkeyTextForArtifacts -notmatch 'BrokerCloseUrl' -or $hotkeyTextForArtifacts -notmatch '"activate":true' -or $hotkeyTextForArtifacts -notmatch 'pi-notify-broker.ps1' -or $hotkeyTextForArtifacts -notmatch '-not \$brokerManaged') {
+    throw 'Hotkey must recognize broker-managed popups, including popupId-only broker live-state, and activate/close them via broker /close without killing the broker.'
 }
 if ($brokerText -notmatch 'Set-NotifyBrokerPopupActivating' -or $brokerText -notmatch '0x8df3' -or $brokerText -notmatch 'broker-activation-feedback' -or $brokerText -notmatch 'FormToClose') {
     throw 'Broker activation must give immediate popup feedback and close the feedback card after focus activation finishes.'
@@ -222,8 +222,11 @@ if ($brokerText -notmatch 'Set-NotifyBrokerPopupActivating' -or $brokerText -not
 if ($brokerText -notmatch '/activate-oldest' -or $brokerText -notmatch 'Invoke-NotifyBrokerOldestPopupActivation' -or $hotkeyTextForArtifacts -notmatch 'Invoke-NotifyHotkeyBrokerActivateOldest' -or $hotkeyTextForArtifacts -notmatch 'TcpClient' -or $hotkeyTextForArtifacts -notmatch 'BeginConnect') {
     throw 'Hotkey must prefer bounded TcpClient broker /activate-oldest so Alt+L avoids popup-live file scan on the fast path.'
 }
-if ($brokerText -notmatch 'Queue-NotifyBrokerPrewarm' -or $brokerText -notmatch 'Update-NotifyBrokerTabCacheForTarget' -or $brokerText -notmatch 'broker-prewarm-cache-updated' -or $brokerText -notmatch 'broker-prewarm-skip recent-scan' -or $brokerText -notmatch 'broker-prewarm-dedupe' -or $brokerText -notmatch 'broker-prewarm-skip closed-popup' -or $brokerText -notmatch 'NotifyBrokerPrewarmDelayMs\s*=\s*1500') {
+if ($brokerText -notmatch 'Queue-NotifyBrokerPrewarm' -or $brokerText -notmatch 'Update-NotifyBrokerTabCacheForTarget' -or $brokerText -notmatch 'broker-prewarm-cache-updated' -or $brokerText -notmatch 'broker-prewarm-skip recent-scan' -or $brokerText -notmatch 'broker-prewarm-dedupe' -or $brokerText -notmatch 'broker-prewarm-skip closed-popup' -or $brokerText -notmatch 'NotifyBrokerPrewarmDelayMs\s*=\s*10000') {
     throw 'Broker must prewarm target tab cache after popup display while delaying/throttling repeated expensive scans and skipping closed popups.'
+}
+if ($brokerText -notmatch 'Get-NotifyBrokerWallpaperCardImage' -or $brokerText -notmatch 'broker-wallpaper-card-rendered' -or $brokerText -notmatch 'DrawImageUnscaled' -or $brokerText -notmatch 'Get-NotifyBrokerWallpaperCardImage -Width 420 -Height 154') {
+    throw 'Broker popup paint must use startup-warmed cached card-size wallpaper rendering instead of per-paint high-quality scaling.'
 }
 if ($brokerText -notmatch 'broker-client-disconnect stage=response') {
     throw 'Broker HTTP listener must treat client-disconnect response writes as benign instead of noisy bg errors.'

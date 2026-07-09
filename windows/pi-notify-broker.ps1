@@ -125,7 +125,7 @@ $script:NotifyBrokerPrewarmQueue = $null
 $script:NotifyBrokerPrewarmTimer = $null
 $script:NotifyBrokerPrewarmLastScanByTarget = @{}
 $script:NotifyBrokerPrewarmMinIntervalSeconds = 15
-$script:NotifyBrokerPrewarmDelayMs = 1500
+$script:NotifyBrokerPrewarmDelayMs = 10000
 $script:NotifyBrokerPrewarmMaxQueue = 4
 if ($config.PSObject.Properties['PopupMaxVisible']) {
     try { $script:NotifyBrokerPopupMaxVisible = [Math]::Max(1, [Math]::Min(8, [int]$config.PopupMaxVisible)) } catch { $script:NotifyBrokerPopupMaxVisible = 4 }
@@ -203,6 +203,7 @@ function Get-NotifyBrokerWallpaperImage {
 }
 
 $script:NotifyBrokerWallpaperImage = Get-NotifyBrokerWallpaperImage -Path $popupWallpaperPath
+$script:NotifyBrokerWallpaperCardCache = @{}
 
 function Get-NotifyBrokerCoverSourceRectangle {
     param(
@@ -235,6 +236,51 @@ function Get-NotifyBrokerCoverSourceRectangle {
     $sourceY = [Math]::Min($maxSourceY, [Math]::Max(0, $sourceY))
     return [System.Drawing.Rectangle]::new(0, $sourceY, $Image.Width, $sourceHeight)
 }
+
+function Get-NotifyBrokerWallpaperCardImage {
+    param(
+        [int]$Width,
+        [int]$Height
+    )
+
+    if ($null -eq $script:NotifyBrokerWallpaperImage -or $Width -le 0 -or $Height -le 0) { return $null }
+    $cacheKey = ('{0}x{1}:{2}' -f $Width, $Height, $script:NotifyBrokerWallpaperOffsetYPixels)
+    if ($script:NotifyBrokerWallpaperCardCache.ContainsKey($cacheKey)) {
+        return $script:NotifyBrokerWallpaperCardCache[$cacheKey]
+    }
+
+    $bitmap = $null
+    $graphics = $null
+    $overlay = $null
+    try {
+        $bitmap = [System.Drawing.Bitmap]::new($Width, $Height, [System.Drawing.Imaging.PixelFormat]::Format32bppPArgb)
+        $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+        $dest = New-Object System.Drawing.Rectangle(0, 0, $Width, $Height)
+        $source = Get-NotifyBrokerCoverSourceRectangle -Image $script:NotifyBrokerWallpaperImage -TargetWidth $Width -TargetHeight $Height -VerticalOffsetPixels $script:NotifyBrokerWallpaperOffsetYPixels
+        $graphics.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+        $graphics.DrawImage($script:NotifyBrokerWallpaperImage, $dest, $source, [System.Drawing.GraphicsUnit]::Pixel)
+        $overlay = [System.Drawing.Drawing2D.LinearGradientBrush]::new(
+            $dest,
+            [System.Drawing.Color]::FromArgb(170, 0, 0, 0),
+            [System.Drawing.Color]::FromArgb(70, 0, 0, 0),
+            [System.Drawing.Drawing2D.LinearGradientMode]::Horizontal)
+        $graphics.FillRectangle($overlay, $dest)
+        $script:NotifyBrokerWallpaperCardCache[$cacheKey] = $bitmap
+        Write-NotifyBrokerLog -Message ('broker-wallpaper-card-rendered {0}x{1}' -f $Width, $Height)
+        return $bitmap
+    }
+    catch {
+        Write-NotifyBrokerLog -Message ('broker-wallpaper-card-error "{0}"' -f $_.Exception.Message)
+        if ($null -ne $bitmap) { $bitmap.Dispose() }
+        return $null
+    }
+    finally {
+        if ($null -ne $overlay) { $overlay.Dispose() }
+        if ($null -ne $graphics) { $graphics.Dispose() }
+    }
+}
+
+[void](Get-NotifyBrokerWallpaperCardImage -Width 420 -Height 154)
 
 function New-NotifyBrokerRoundedPath {
     param(
@@ -284,9 +330,6 @@ function Save-NotifyBrokerLiveState {
             startedAtTicks    = [DateTime]::UtcNow.Ticks
             createdAtUtc      = [DateTime]::UtcNow.ToString('o')
             expiresAtTicks    = [DateTime]::UtcNow.AddSeconds($ttlSeconds).Ticks
-            protectedHost     = Protect-NotifyBrokerLiveValue -Value $TargetHostValue
-            protectedCwd      = Protect-NotifyBrokerLiveValue -Value $CwdBaseValue
-            protectedTab      = Protect-NotifyBrokerLiveValue -Value $SourceTabTitleValue
         }
         [System.IO.File]::WriteAllText($path, ($payload | ConvertTo-Json -Depth 4), [System.Text.UTF8Encoding]::new($false))
     }
@@ -1181,16 +1224,10 @@ function Show-NotifyBrokerPopup {
             $paintAccentColor = [System.Drawing.Color]::FromArgb(94, 234, 212)
 
             if ($null -ne $script:NotifyBrokerWallpaperImage) {
-                $dest = New-Object System.Drawing.Rectangle(0, 0, $paintPanel.Width, $paintPanel.Height)
-                $source = Get-NotifyBrokerCoverSourceRectangle -Image $script:NotifyBrokerWallpaperImage -TargetWidth $paintPanel.Width -TargetHeight $paintPanel.Height -VerticalOffsetPixels $script:NotifyBrokerWallpaperOffsetYPixels
-                $graphics.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
-                $graphics.DrawImage($script:NotifyBrokerWallpaperImage, $dest, $source, [System.Drawing.GraphicsUnit]::Pixel)
-                $overlay = [System.Drawing.Drawing2D.LinearGradientBrush]::new(
-                    $dest,
-                    [System.Drawing.Color]::FromArgb(170, 0, 0, 0),
-                    [System.Drawing.Color]::FromArgb(70, 0, 0, 0),
-                    [System.Drawing.Drawing2D.LinearGradientMode]::Horizontal)
-                try { $graphics.FillRectangle($overlay, $dest) } finally { $overlay.Dispose() }
+                $cardImage = Get-NotifyBrokerWallpaperCardImage -Width $paintPanel.Width -Height $paintPanel.Height
+                if ($null -ne $cardImage) {
+                    $graphics.DrawImageUnscaled($cardImage, 0, 0)
+                }
             }
 
             $path = New-NotifyBrokerRoundedPath -Rectangle $rect -Radius 14
@@ -1881,6 +1918,14 @@ finally {
             $script:NotifyBrokerListenerRunspace.Stop()
             $script:NotifyBrokerListenerRunspace.Close()
         }
+    }
+    catch {
+    }
+    try {
+        foreach ($cachedImage in @($script:NotifyBrokerWallpaperCardCache.Values)) {
+            if ($null -ne $cachedImage) { $cachedImage.Dispose() }
+        }
+        if ($null -ne $script:NotifyBrokerWallpaperImage) { $script:NotifyBrokerWallpaperImage.Dispose() }
     }
     catch {
     }

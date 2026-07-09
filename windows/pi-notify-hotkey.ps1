@@ -160,7 +160,9 @@ function Get-NotifyHotkeyLivePopupStates {
             $targetHost = if ($state.PSObject.Properties['protectedHost']) { Unprotect-NotifyHotkeyValue -Value ([string]$state.protectedHost) } else { '' }
             $cwdBase = if ($state.PSObject.Properties['protectedCwd']) { Unprotect-NotifyHotkeyValue -Value ([string]$state.protectedCwd) } else { '' }
             $tabTitle = if ($state.PSObject.Properties['protectedTab']) { Unprotect-NotifyHotkeyValue -Value ([string]$state.protectedTab) } else { '' }
-            if ([string]::IsNullOrWhiteSpace($cwdBase) -and [string]::IsNullOrWhiteSpace($tabTitle)) {
+            $brokerManaged = $false
+            if ($state.PSObject.Properties['brokerManaged']) { $brokerManaged = [bool]$state.brokerManaged }
+            if (-not $brokerManaged -and [string]::IsNullOrWhiteSpace($cwdBase) -and [string]::IsNullOrWhiteSpace($tabTitle)) {
                 continue
             }
 
@@ -173,8 +175,6 @@ function Get-NotifyHotkeyLivePopupStates {
                 [int]::TryParse([string]$state.stackIndex, [ref]$stackIndex) | Out-Null
             }
             $targetFingerprint = if ($state.PSObject.Properties['targetFingerprint']) { [string]$state.targetFingerprint } else { Get-NotifyHotkeyFingerprint -Value $targetHost }
-            $brokerManaged = $false
-            if ($state.PSObject.Properties['brokerManaged']) { $brokerManaged = [bool]$state.brokerManaged }
             $popupId = if ($state.PSObject.Properties['popupId']) { [string]$state.popupId } else { '' }
 
             $rows += [pscustomobject]@{
