@@ -157,18 +157,24 @@ function Test-HttpHealth {
     catch { return $false }
 }
 
-function Test-NewListenerAlive {
-    param([System.Diagnostics.Process]$Process)
-    try {
-        $Process.Refresh()
-        if ($Process.HasExited) { return $false }
-    }
-    catch { return $false }
-
-    if (-not (Test-Path -LiteralPath $pidPath)) { return $false }
+function Get-NewListenerPid {
+    if (-not (Test-Path -LiteralPath $pidPath)) { return 0 }
     $raw = [string](Get-Content -LiteralPath $pidPath -Raw -ErrorAction SilentlyContinue)
     $pidValue = 0
-    return ([int]::TryParse($raw.Trim(), [ref]$pidValue) -and $pidValue -eq $Process.Id)
+    if ([int]::TryParse($raw.Trim(), [ref]$pidValue)) { return $pidValue }
+    return 0
+}
+
+function Test-NewListenerAlive {
+    $pidValue = Get-NewListenerPid
+    if ($pidValue -le 0) { return $false }
+    try {
+        $process = Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f $pidValue) -ErrorAction Stop
+        if ($null -eq $process) { return $false }
+        $commandLine = [string]$process.CommandLine
+        return (($commandLine -like '*pi-notify-listener-runner.ps1*') -and (Test-NotifyProcessOwnedByThisInstance -CommandLine $commandLine))
+    }
+    catch { return $false }
 }
 
 function Test-NotifyCommandLineContainsPath {
@@ -277,27 +283,25 @@ function Invoke-Worker {
     Stop-ExistingListenerProcesses
 
     Start-Sleep -Milliseconds 300
-    $listener = Start-Process -FilePath powershell.exe -WindowStyle Hidden -ArgumentList (Join-NotifyProcessArguments @(
-        '-NoProfile',
-        '-ExecutionPolicy', 'Bypass',
-        '-File', $runnerPath,
-        '-ConfigPath', $ConfigPath
-    )) -PassThru
+    $runnerCommand = ('"{0}" -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{1}" -ConfigPath "{2}"' -f (Get-Command powershell.exe).Source, $runnerPath, $ConfigPath)
+    Start-NotifyDetachedCommand -CommandLine $runnerCommand -Name 'listener'
 
     $maxAttempts = [Math]::Max(6, ([Math]::Max(3, $TimeoutSeconds) * 2))
     for ($i = 0; $i -lt $maxAttempts; $i++) {
         Start-Sleep -Milliseconds 500
-        $alive = Test-NewListenerAlive -Process $listener
+        $alive = Test-NewListenerAlive
         $healthy = Test-HttpHealth -Port $port
+        $listenerPid = Get-NewListenerPid
         Write-RestartLog ('listener poll attempt={0} alive={1} healthy={2}' -f $i, $alive, $healthy)
         if ($alive -and $healthy) {
-            Write-RestartLog "listener restarted pid=$($listener.Id) port=$port"
-            Write-Status -Status 'ok' -Message 'listener restarted' -PidValue $listener.Id -PortValue $port
+            Write-RestartLog "listener restarted pid=$listenerPid port=$port"
+            Write-Status -Status 'ok' -Message 'listener restarted' -PidValue $listenerPid -PortValue $port
             return
         }
     }
 
-    try { Stop-Process -Id $listener.Id -Force -ErrorAction SilentlyContinue } catch {}
+    $stalePid = Get-NewListenerPid
+    if ($stalePid -gt 0) { try { Stop-Process -Id $stalePid -Force -ErrorAction SilentlyContinue } catch {} }
     throw "listener did not become healthy on port $port"
 }
 

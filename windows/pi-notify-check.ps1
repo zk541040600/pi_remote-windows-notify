@@ -196,6 +196,7 @@ if ($watchdogTextForBroker -notmatch 'if \(\$listenerOk\)' -or $watchdogTextForB
 # Listener broker delegation and fallback
 $listenerTextForLaunch = [System.IO.File]::ReadAllText((Join-Path $PSScriptRoot 'notify-listener.ps1'), [System.Text.UTF8Encoding]::new($false))
 $hotkeyTextForArtifacts = [System.IO.File]::ReadAllText((Join-Path $PSScriptRoot 'pi-notify-hotkey.ps1'), [System.Text.UTF8Encoding]::new($false))
+$refreshTextForArtifacts = [System.IO.File]::ReadAllText((Join-Path $PSScriptRoot 'pi-notify-refresh.ps1'), [System.Text.UTF8Encoding]::new($false))
 if ($listenerTextForLaunch -notmatch 'Invoke-NotifyBrokerPopup' -or $listenerTextForLaunch -notmatch 'Start-NotifyPopupProcess' -or $listenerTextForLaunch -notmatch 'broker-unavailable fallback=popup-process' -or $listenerTextForLaunch -notmatch 'broker-post-failed fallback=popup-process' -or $listenerTextForLaunch -notmatch 'Get-NotifyBrokerProcessIds' -or $listenerTextForLaunch -notmatch 'broker-start-skip existing') {
     throw 'Listener must prefer broker for popup-focus, avoid duplicate broker starts, and fall back to pi-notify-popup.ps1 process on bounded failure.'
 }
@@ -208,9 +209,15 @@ if ($listenerTextForLaunch -notmatch 'ContentLength\s*=\s*\$bodyBytes\.Length' -
 if ($listenerTextForLaunch -notmatch 'Invoke-NotifyBrokerPopup[^\r\n]+-StackIndex -1') {
     throw 'Listener must let the broker allocate popup stack slots; otherwise broker-managed popups overlap at slot 0.'
 }
-# Hotkey broker compatibility
+# Hotkey broker compatibility and resident registration
 if ($hotkeyTextForArtifacts -notmatch 'brokerManaged' -or $hotkeyTextForArtifacts -notmatch 'BrokerCloseUrl' -or $hotkeyTextForArtifacts -notmatch '"activate":true' -or $hotkeyTextForArtifacts -notmatch 'pi-notify-broker.ps1') {
     throw 'Hotkey must recognize broker-managed popups and activate/close them via broker /close without killing the broker.'
+}
+if ($hotkeyTextForArtifacts -notmatch 'RegisterHotKey' -or $hotkeyTextForArtifacts -notmatch 'Start-NotifyHotkeyResident' -or $hotkeyTextForArtifacts -notmatch 'MOD_NOREPEAT' -or $hotkeyTextForArtifacts -notmatch 'ConvertTo-NotifyHotkeyRegistration') {
+    throw 'Hotkey must run as a resident RegisterHotKey worker so single-modifier shortcuts like Alt+P work reliably.'
+}
+if ($refreshTextForArtifacts -notmatch 'PiNotifyHotkey\.vbs' -or $refreshTextForArtifacts -notmatch 'Start-NotifyHotkey' -or $refreshTextForArtifacts -notmatch 'Stop-NotifyHotkeyProcesses' -or $refreshTextForArtifacts -match 'Register-NotifyBridgePopupHotkeyShortcut') {
+    throw 'Refresh must install/start the resident hotkey worker and must not rely on Start Menu shortcut hotkeys.'
 }
 Write-Host 'OK broker runtime, privacy, supervision, and fallback safeguards'
 $listenerTextForLaunch = [System.IO.File]::ReadAllText((Join-Path $PSScriptRoot 'notify-listener.ps1'), [System.Text.UTF8Encoding]::new($false))
@@ -616,6 +623,17 @@ foreach ($taskName in @('PiNotifyListener', 'PiNotifyTunnel', 'PiNotifyWatchdog'
     }
 }
 Write-Host 'OK no legacy PiNotify scheduled tasks'
+$hotkeyVbs = Join-Path $startupDir 'PiNotifyHotkey.vbs'
+if ($cfg.PSObject.Properties['popupHotkeyEnabled'] -and [bool]$cfg.popupHotkeyEnabled) {
+    if (-not (Test-Path -LiteralPath $hotkeyVbs)) {
+        throw ('Startup hotkey launcher missing: {0}' -f $hotkeyVbs)
+    }
+    $hotkeyVbsText = [System.IO.File]::ReadAllText($hotkeyVbs)
+    if ($hotkeyVbsText -notmatch 'pi-notify-hotkey\.ps1' -or $hotkeyVbsText -match '-Once') {
+        throw ('Startup hotkey launcher must run resident pi-notify-hotkey.ps1 without -Once: {0}' -f $hotkeyVbs)
+    }
+    Write-Host ('OK hotkey VBS: {0}' -f $hotkeyVbs)
+}
 if (-not $autostartChecked) {
     Write-Host 'SKIP no listener autostart registered'
 }

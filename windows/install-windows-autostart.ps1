@@ -157,7 +157,8 @@ $powershellExe = Get-NotifyBridgePowerShellExe
 $toastSupport = Register-NotifyBridgeSystemToastSupport -ConfigPathValue $config.ConfigPath -ToastAppId 'Pi Remote'
 $protocolUri = $toastSupport.ProtocolUri
 $toastShortcutPath = $toastSupport.ShortcutPath
-$popupHotkeyShortcutPath = Register-NotifyBridgePopupHotkeyShortcut -PowerShellExe $powershellExe -HotkeyScript $hotkeyScript -ConfigPathValue $config.ConfigPath -HotkeyValue $config.PopupHotkey -Enabled ([bool]$config.PopupHotkeyEnabled)
+$programsHotkeyShortcutPath = Join-Path (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs') 'Pi Notify Oldest Popup.lnk'
+Remove-Item -LiteralPath $programsHotkeyShortcutPath -Force -ErrorAction SilentlyContinue
 $installMode = ''
 
 $listenerVbs = Join-Path $startupDir 'PiNotifyListener.vbs'
@@ -165,7 +166,6 @@ $tunnelVbs = Join-Path $startupDir 'PiNotifyTunnel.vbs'
 $watchdogVbs = Join-Path $startupDir 'PiNotifyWatchdog.vbs'
 $brokerVbs = Join-Path $startupDir 'PiNotifyBroker.vbs'
 $hotkeyVbs = Join-Path $startupDir 'PiNotifyHotkey.vbs'
-Remove-Item -LiteralPath $hotkeyVbs -Force -ErrorAction SilentlyContinue
 
 foreach ($taskName in @('PiNotifyListener', 'PiNotifyTunnel', 'PiNotifyWatchdog', 'PiNotifyHotkey', 'PiNotifyBroker')) {
     Remove-LegacyScheduledTask -TaskName $taskName
@@ -176,6 +176,12 @@ $watchdogScript = Join-Path $binDir 'pi-notify-watchdog.ps1'
 New-VbsLauncher -FilePath $listenerVbs -PowerShellExe $powershellExe -ScriptPath $listenerScript -ConfigPathValue $config.ConfigPath
 New-VbsLauncher -FilePath $tunnelVbs -PowerShellExe $powershellExe -ScriptPath $tunnelScript -ConfigPathValue $config.ConfigPath
 New-VbsLauncher -FilePath $watchdogVbs -PowerShellExe $powershellExe -ScriptPath $watchdogScript -ConfigPathValue $config.ConfigPath
+if ([bool]$config.PopupHotkeyEnabled) {
+    New-VbsLauncher -FilePath $hotkeyVbs -PowerShellExe $powershellExe -ScriptPath $hotkeyScript -ConfigPathValue $config.ConfigPath
+}
+else {
+    Remove-Item -LiteralPath $hotkeyVbs -Force -ErrorAction SilentlyContinue
+}
 
 # Broker needs -STA for the WinForms message loop; write a dedicated VBS launcher
 $brokerCommand = ('"{0}" -NoProfile -STA -WindowStyle Hidden -ExecutionPolicy Bypass -File "{1}" -ConfigPath "{2}"' -f $powershellExe, $brokerScript, $config.ConfigPath)
@@ -205,6 +211,7 @@ if ($StartNow) {
     & wscript.exe $tunnelVbs | Out-Null
     Start-Sleep -Seconds 2
     & wscript.exe $watchdogVbs | Out-Null
+    if ([bool]$config.PopupHotkeyEnabled -and (Test-Path -LiteralPath $hotkeyVbs)) { & wscript.exe $hotkeyVbs | Out-Null }
 }
 
 Write-Host 'Windows Pi notify auto-start installed.'
@@ -219,5 +226,5 @@ Write-Host ('Listener VBS : {0}' -f $listenerVbs)
 Write-Host ('Tunnel VBS   : {0}' -f $tunnelVbs)
 Write-Host ('Broker VBS   : {0}' -f $brokerVbs)
 Write-Host ('Watchdog VBS : {0}' -f $watchdogVbs)
-Write-Host ('Hotkey link  : {0}' -f $popupHotkeyShortcutPath)
+Write-Host ('Hotkey VBS   : {0}' -f $hotkeyVbs)
 Write-Host ('Popup hotkey : {0}' -f $config.PopupHotkey)

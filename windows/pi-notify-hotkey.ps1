@@ -11,6 +11,43 @@ $ErrorActionPreference = 'Stop'
 
 Add-Type -AssemblyName System.Security
 
+if (-not ([System.Management.Automation.PSTypeName]'PiNotifyHotkeyNative').Type) {
+    Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+
+public static class PiNotifyHotkeyNative {
+    [StructLayout(LayoutKind.Sequential)]
+    public struct POINT { public int x; public int y; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct MSG {
+        public IntPtr hwnd;
+        public UInt32 message;
+        public IntPtr wParam;
+        public IntPtr lParam;
+        public UInt32 time;
+        public POINT pt;
+    }
+
+    [DllImport("user32.dll", SetLastError=true)]
+    public static extern bool RegisterHotKey(IntPtr hWnd, int id, UInt32 fsModifiers, UInt32 vk);
+
+    [DllImport("user32.dll", SetLastError=true)]
+    public static extern bool UnregisterHotKey(IntPtr hWnd, int id);
+
+    [DllImport("user32.dll", SetLastError=true)]
+    public static extern sbyte GetMessage(out MSG lpMsg, IntPtr hWnd, UInt32 wMsgFilterMin, UInt32 wMsgFilterMax);
+
+    [DllImport("user32.dll")]
+    public static extern bool TranslateMessage(ref MSG lpMsg);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr DispatchMessage(ref MSG lpMsg);
+}
+"@
+}
+
 $configArgs = @{}
 if ($PSBoundParameters.ContainsKey('ConfigPath')) { $configArgs.ConfigPath = $ConfigPath }
 $config = Ensure-NotifyBridgeConfig @configArgs
@@ -299,5 +336,117 @@ function Invoke-NotifyHotkeyOldestPopup {
     return (Start-NotifyHotkeyActivation -PopupState $states[0])
 }
 
-if (Invoke-NotifyHotkeyOldestPopup) { exit 0 }
-exit 1
+function ConvertTo-NotifyHotkeyRegistration {
+    param([string]$HotkeyValue)
+
+    $value = if ([string]::IsNullOrWhiteSpace($HotkeyValue)) { 'Alt+P' } else { [string]$HotkeyValue }
+    $parts = @($value -split '\+' | ForEach-Object { $_.Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($parts.Count -lt 2) {
+        throw ('Invalid popupHotkey "{0}". Use Alt+P, Ctrl+P, Ctrl+Alt+P, Shift+F8, or Win+P style syntax.' -f $value)
+    }
+
+    $modifiers = [uint32]0x4000 # MOD_NOREPEAT
+    for ($i = 0; $i -lt ($parts.Count - 1); $i++) {
+        switch -Regex ($parts[$i].ToLowerInvariant()) {
+            '^(ctrl|control)$' { $modifiers = $modifiers -bor [uint32]0x0002; continue }
+            '^alt$' { $modifiers = $modifiers -bor [uint32]0x0001; continue }
+            '^shift$' { $modifiers = $modifiers -bor [uint32]0x0004; continue }
+            '^(win|windows|meta)$' { $modifiers = $modifiers -bor [uint32]0x0008; continue }
+            default { throw ('Unsupported popupHotkey modifier "{0}" in "{1}".' -f $parts[$i], $value) }
+        }
+    }
+
+    $key = $parts[$parts.Count - 1].ToUpperInvariant()
+    $virtualKey = [uint32]0
+    if ($key.Length -eq 1) {
+        $ch = [char]$key[0]
+        if ((($ch -ge [char]'A') -and ($ch -le [char]'Z')) -or (($ch -ge [char]'0') -and ($ch -le [char]'9'))) {
+            $virtualKey = [uint32][byte][char]$ch
+        }
+    }
+    elseif ($key -match '^F([1-9]|1[0-9]|2[0-4])$') {
+        $virtualKey = [uint32](0x70 + [int]$Matches[1] - 1)
+    }
+    if ($virtualKey -eq 0) {
+        throw ('Unsupported popupHotkey key "{0}" in "{1}".' -f $key, $value)
+    }
+    if (($modifiers -band 0x000F) -eq 0) {
+        throw ('popupHotkey must include at least one modifier: {0}' -f $value)
+    }
+
+    [pscustomobject]@{
+        Label      = ($parts -join '+')
+        Modifiers  = $modifiers
+        VirtualKey = $virtualKey
+    }
+}
+
+function Start-NotifyHotkeyResident {
+    if ($config.PSObject.Properties['PopupHotkeyEnabled'] -and -not [bool]$config.PopupHotkeyEnabled) {
+        Write-NotifyHotkeyLog -Message 'resident-disabled'
+        return 0
+    }
+
+    $registration = ConvertTo-NotifyHotkeyRegistration -HotkeyValue ([string]$config.PopupHotkey)
+    $mutexName = 'Local\PiNotifyHotkey-{0}' -f (Get-NotifyHotkeyFingerprint -Value $config.ConfigPath)
+    $createdNew = $false
+    $mutex = [System.Threading.Mutex]::new($true, $mutexName, [ref]$createdNew)
+    if (-not $createdNew) {
+        Write-NotifyHotkeyLog -Message ('resident-existing hotkey={0}' -f $registration.Label)
+        return 0
+    }
+
+    $id = 0x5050
+    $registered = $false
+    try {
+        $registered = [PiNotifyHotkeyNative]::RegisterHotKey([IntPtr]::Zero, $id, [uint32]$registration.Modifiers, [uint32]$registration.VirtualKey)
+        if (-not $registered) {
+            $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+            Write-NotifyHotkeyLog -Message ('resident-register-failed hotkey={0} error={1}' -f $registration.Label, $errorCode)
+            return 1
+        }
+        Write-NotifyHotkeyLog -Message ('resident-start hotkey={0} modifiers=0x{1:x} vk=0x{2:x}' -f $registration.Label, [uint32]$registration.Modifiers, [uint32]$registration.VirtualKey)
+        $lastHotkeyAtTicks = [int64]0
+        $debounceTicks = [TimeSpan]::FromMilliseconds(1000).Ticks
+        $msg = [PiNotifyHotkeyNative+MSG]::new()
+        while ($true) {
+            $result = [PiNotifyHotkeyNative]::GetMessage([ref]$msg, [IntPtr]::Zero, 0, 0)
+            if ($result -eq 0) { break }
+            if ($result -lt 0) {
+                $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                Write-NotifyHotkeyLog -Message ('resident-getmessage-error error={0}' -f $errorCode)
+                return 1
+            }
+            if ($msg.message -eq 0x0312 -and $msg.wParam.ToInt32() -eq $id) {
+                $nowTicks = [DateTime]::UtcNow.Ticks
+                if ($lastHotkeyAtTicks -gt 0 -and ($nowTicks - $lastHotkeyAtTicks) -lt $debounceTicks) {
+                    Write-NotifyHotkeyLog -Message 'resident-debounce'
+                }
+                else {
+                    $lastHotkeyAtTicks = $nowTicks
+                    try {
+                        [void](Invoke-NotifyHotkeyOldestPopup)
+                    }
+                    catch {
+                        Write-NotifyHotkeyLog -Message ('resident-activate-error "{0}"' -f $_.Exception.Message)
+                    }
+                }
+            }
+            [void][PiNotifyHotkeyNative]::TranslateMessage([ref]$msg)
+            [void][PiNotifyHotkeyNative]::DispatchMessage([ref]$msg)
+        }
+        return 0
+    }
+    finally {
+        if ($registered) { [void][PiNotifyHotkeyNative]::UnregisterHotKey([IntPtr]::Zero, $id) }
+        if ($null -ne $mutex) { $mutex.ReleaseMutex(); $mutex.Dispose() }
+        Write-NotifyHotkeyLog -Message ('resident-stop hotkey={0}' -f $registration.Label)
+    }
+}
+
+if ($Once) {
+    if (Invoke-NotifyHotkeyOldestPopup) { exit 0 }
+    exit 1
+}
+
+exit (Start-NotifyHotkeyResident)

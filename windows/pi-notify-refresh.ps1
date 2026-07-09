@@ -239,6 +239,58 @@ function Stop-NotifyBrokerProcesses {
     Remove-Item -LiteralPath (Join-Path $baseDir 'broker.pid') -Force -ErrorAction SilentlyContinue
 }
 
+function Stop-NotifyHotkeyProcesses {
+    foreach ($processId in Get-NotifyScriptProcessIds -ScriptName 'pi-notify-hotkey.ps1') {
+        Stop-NotifyProcessId -ProcessId $processId -Reason 'hotkey-process-scan'
+    }
+}
+
+function Write-NotifyHotkeyStartupLauncher {
+    param(
+        [bool]$Enabled,
+        [string]$HotkeyScript
+    )
+
+    $startupDir = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Startup'
+    New-Item -ItemType Directory -Force -Path $startupDir | Out-Null
+    $hotkeyVbs = Join-Path $startupDir 'PiNotifyHotkey.vbs'
+    $legacyShortcut = Join-Path (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs') 'Pi Notify Oldest Popup.lnk'
+    Remove-Item -LiteralPath $legacyShortcut -Force -ErrorAction SilentlyContinue
+    if (-not $Enabled) {
+        Remove-Item -LiteralPath $hotkeyVbs -Force -ErrorAction SilentlyContinue
+        return $hotkeyVbs
+    }
+
+    $hotkeyCommand = ('"{0}" -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{1}" -ConfigPath "{2}"' -f (Get-NotifyBridgePowerShellExe), $HotkeyScript, $configPath)
+    $hotkeyEscaped = $hotkeyCommand.Replace('"', '""')
+    $hotkeyContent = @"
+Set shell = CreateObject("WScript.Shell")
+shell.Run "$hotkeyEscaped", 0, False
+"@
+    [System.IO.File]::WriteAllText($hotkeyVbs, $hotkeyContent.TrimStart(), [System.Text.UTF8Encoding]::new($false))
+    return $hotkeyVbs
+}
+
+function Start-NotifyHotkey {
+    param(
+        [bool]$Enabled,
+        [string]$HotkeyScript
+    )
+
+    if (-not $Enabled) {
+        Write-Host 'skip hotkey start: popupHotkeyEnabled=false'
+        return
+    }
+    if (-not (Test-Path -LiteralPath $HotkeyScript)) {
+        Write-Host 'skip hotkey start: script not found'
+        return
+    }
+    Stop-NotifyHotkeyProcesses
+    $hotkeyCommand = ('"{0}" -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{1}" -ConfigPath "{2}"' -f (Get-NotifyBridgePowerShellExe), $HotkeyScript, $configPath)
+    Start-NotifyDetachedCommand -CommandLine $hotkeyCommand -Name 'hotkey'
+    Write-Host 'hotkey started'
+}
+
 function Start-NotifyBroker {
     $brokerScript = Join-Path $binDir 'pi-notify-broker.ps1'
     if (-not (Test-Path -LiteralPath $brokerScript)) {
@@ -386,9 +438,8 @@ if ((Test-Path -LiteralPath $bundledWallpaperPath) -and ((-not $cfg.PSObject.Pro
     $cfg | ConvertTo-Json -Depth 10 | Set-Content $configPath -Encoding UTF8
 }
 $hotkeyScript = Join-Path $binDir 'pi-notify-hotkey.ps1'
-$popupHotkeyShortcutPath = Register-NotifyBridgePopupHotkeyShortcut -PowerShellExe (Get-NotifyBridgePowerShellExe) -HotkeyScript $hotkeyScript -ConfigPathValue $configPath -HotkeyValue ([string]$cfg.popupHotkey) -Enabled ([bool]$cfg.popupHotkeyEnabled)
-Remove-Item -LiteralPath (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Startup\PiNotifyHotkey.vbs') -Force -ErrorAction SilentlyContinue
-Write-Host ('Popup hotkey: {0} -> {1}' -f $cfg.popupHotkey, $popupHotkeyShortcutPath)
+$popupHotkeyStartupPath = Write-NotifyHotkeyStartupLauncher -Enabled ([bool]$cfg.popupHotkeyEnabled) -HotkeyScript $hotkeyScript
+Write-Host ('Popup hotkey: {0} -> {1}' -f $cfg.popupHotkey, $popupHotkeyStartupPath)
 Clear-NotifyPopupRuntimeArtifacts
 
 if ($SyncRemote -and -not $SkipRemoteSync) {
@@ -418,6 +469,7 @@ if ($SkipTunnel) {
     Write-Host "[5/7] keep existing reverse tunnel; restart watchdog around listener refresh (-SkipTunnel)"
     Stop-NotifyWatchdogProcesses
     Stop-NotifyBrokerProcesses
+    Stop-NotifyHotkeyProcesses
     Reset-NotifyLog -BaseDir $baseDir -Name 'watchdog.log'
     Reset-NotifyLog -BaseDir $baseDir -Name 'hotkey.log'
     Reset-NotifyLog -BaseDir $baseDir -Name 'broker.log'
@@ -428,6 +480,7 @@ else {
     Stop-NotifyTunnelProcesses -Port ([int]$cfg.port)
     Stop-NotifyWatchdogProcesses
     Stop-NotifyBrokerProcesses
+    Stop-NotifyHotkeyProcesses
     Reset-NotifyLog -BaseDir $baseDir -Name 'tunnel.log'
     Reset-NotifyLog -BaseDir $baseDir -Name 'watchdog.log'
     Reset-NotifyLog -BaseDir $baseDir -Name 'hotkey.log'
@@ -480,6 +533,7 @@ if ($SkipTunnel) {
     Start-NotifyBroker
     $watchdogCommand = ('"{0}" -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{1}" -ConfigPath "{2}" -StartupDelaySeconds 5' -f (Get-NotifyBridgePowerShellExe), (Join-Path $binDir 'pi-notify-watchdog.ps1'), $configPath)
     Start-NotifyDetachedCommand -CommandLine $watchdogCommand -Name 'watchdog'
+    Start-NotifyHotkey -Enabled ([bool]$cfg.popupHotkeyEnabled) -HotkeyScript (Join-Path $binDir 'pi-notify-hotkey.ps1')
 }
 else {
     Write-Host "[7/7] start reverse tunnel/broker/watchdog..."
@@ -488,6 +542,7 @@ else {
     Start-NotifyBroker
     $watchdogCommand = ('"{0}" -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{1}" -ConfigPath "{2}" -StartupDelaySeconds 5' -f (Get-NotifyBridgePowerShellExe), (Join-Path $binDir 'pi-notify-watchdog.ps1'), $configPath)
     Start-NotifyDetachedCommand -CommandLine $watchdogCommand -Name 'watchdog'
+    Start-NotifyHotkey -Enabled ([bool]$cfg.popupHotkeyEnabled) -HotkeyScript (Join-Path $binDir 'pi-notify-hotkey.ps1')
 }
 
 $remoteTunnelHealth = $null

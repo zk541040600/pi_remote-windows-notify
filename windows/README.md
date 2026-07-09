@@ -88,7 +88,7 @@ Installer behavior:
 
 - removes legacy scheduled tasks named `PiNotifyListener`, `PiNotifyTunnel`, and `PiNotifyWatchdog`
 - writes Startup-folder launchers for listener/broker/tunnel/watchdog
-- writes a Start Menu shortcut with the configured `popupHotkey`
+- writes a Startup-folder `PiNotifyHotkey.vbs` launcher for the resident configured `popupHotkey`
 
 Startup files:
 
@@ -97,11 +97,11 @@ Startup files:
 - `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\PiNotifyTunnel.vbs`
 - `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\PiNotifyWatchdog.vbs`
 
-Hotkey shortcut:
+Hotkey launcher:
 
-- `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Pi Notify Oldest Popup.lnk`
+- `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\PiNotifyHotkey.vbs`
 
-They start at user logon. `PiNotifyListener.vbs` invokes `pi-notify-restart-listener.ps1`, so startup keeps the runner-owned listener invariant instead of launching `notify-listener.ps1` directly. `PiNotifyBroker.vbs` launches the long-lived WinForms broker with `-STA` so popup cards appear without per-notification PowerShell startup. `PiNotifyTunnel` keeps retrying automatically if SSH drops, and `PiNotifyWatchdog` periodically verifies local listener, broker, and remote loopback tunnel health and restarts the broken side when needed. The Start Menu shortcut owns the global popup hotkey, so no always-running hotkey process is required.
+They start at user logon. `PiNotifyListener.vbs` invokes `pi-notify-restart-listener.ps1`, so startup keeps the runner-owned listener invariant instead of launching `notify-listener.ps1` directly. `PiNotifyBroker.vbs` launches the long-lived WinForms broker with `-STA` so popup cards appear without per-notification PowerShell startup. `PiNotifyTunnel` keeps retrying automatically if SSH drops, and `PiNotifyWatchdog` periodically verifies local listener, broker, and remote loopback tunnel health and restarts the broken side when needed. The resident `PiNotifyHotkey.vbs` worker owns the global popup hotkey, so single-modifier shortcuts such as `Alt+P` work reliably without depending on Explorer shortcut-hotkey registration.
 
 ## Refresh after pull
 
@@ -186,7 +186,7 @@ Important keys:
   "popupTimeoutSeconds": 18,
   "popupWallpaperPath": "C:/Users/Administrator/.pi-notify/bin/popup-wallpaper.png",
   "popupPlacement": "cursor",
-  "popupHotkey": "Ctrl+Alt+P",
+  "popupHotkey": "Alt+P",
   "popupHotkeyEnabled": true,
   "brokerEnabled": true,
   "brokerPort": 23119,
@@ -235,7 +235,7 @@ Notification payloads may include:
 - `right` -> the right-most screen
 - `primary` -> the Windows primary screen
 
-`popupHotkey` defaults to `Ctrl+Alt+P`. When multiple custom popup cards are visible, pressing it activates the oldest live popup's target tab and only dismisses that selected popup. Press it again to move through the remaining popups in age order. Set `popupHotkeyEnabled` to `false` to disable the global hotkey.
+`popupHotkey` defaults to `Alt+P` and is registered by the resident `PiNotifyHotkey.vbs` startup worker, not a Start Menu shortcut. When multiple custom popup cards are visible, pressing it activates the oldest live popup's target tab and only dismisses that selected popup. Press it again to move through the remaining popups in age order. Set `popupHotkeyEnabled` to `false` to disable the global hotkey. `Ctrl+P` also works as a config value, but `Alt+P` avoids common print shortcuts.
 
 Template fields:
 
