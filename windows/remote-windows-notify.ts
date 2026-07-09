@@ -272,7 +272,11 @@ async function getRuntimeConfig(): Promise<RuntimeConfig> {
 }
 
 function shouldSkipNotificationForThisProcess(): boolean {
-  return process.env.PI_SUBAGENT_CHILD === "1" || process.env.TRELLIS_SUBAGENT_CHILD === "1";
+  if (process.env.PI_SUBAGENT_CHILD === "1" || process.env.TRELLIS_SUBAGENT_CHILD === "1") return true;
+  // Trellis channel workers (meeting Pi workers) should not send notifications
+  // unless explicitly allowed via PI_NOTIFY_ALLOW_TRELLIS_CHANNEL=1.
+  if (process.env.TRELLIS_CHANNEL && process.env.TRELLIS_CHANNEL_AS && process.env.PI_NOTIFY_ALLOW_TRELLIS_CHANNEL !== "1") return true;
+  return false;
 }
 
 function normalizeTabTitlePart(value: string, fallback: string): string {
