@@ -21,6 +21,7 @@ $script:NotifyWatchdogHasLock = $false
 $script:NotifyWatchdogListenerMisses = 0
 $script:NotifyWatchdogTunnelMisses = 0
 $script:NotifyWatchdogBrokerMisses = 0
+$script:NotifyWatchdogHotkeyMisses = 0
 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $script:NotifyWatchdogLogPath) | Out-Null
 
 function Write-NotifyWatchdogLog {
@@ -386,6 +387,27 @@ while ($true) {
                 }
                 $script:NotifyWatchdogBrokerMisses = 0
                 Start-Sleep -Seconds 3
+            }
+        }
+
+        $hotkeyEnabled = $true
+        if ($config.PSObject.Properties['PopupHotkeyEnabled']) {
+            try { $hotkeyEnabled = [bool]$config.PopupHotkeyEnabled } catch { $hotkeyEnabled = $true }
+        }
+        if ($hotkeyEnabled) {
+            $hotkeyPids = Get-NotifyProcessIds -Pattern '*pi-notify-hotkey.ps1*'
+            if (@($hotkeyPids).Count -ne 1) {
+                $script:NotifyWatchdogHotkeyMisses += 1
+            }
+            else {
+                $script:NotifyWatchdogHotkeyMisses = 0
+            }
+            if ($script:NotifyWatchdogHotkeyMisses -ge 1) {
+                Write-NotifyWatchdogLog -Message ('stale-hotkey count={0} misses={1}' -f (@($hotkeyPids).Count), $script:NotifyWatchdogHotkeyMisses)
+                Stop-NotifyProcessGroup -ProcessIds $hotkeyPids
+                Start-NotifyScript -ScriptName 'pi-notify-hotkey.ps1'
+                $script:NotifyWatchdogHotkeyMisses = 0
+                Start-Sleep -Seconds 1
             }
         }
     }

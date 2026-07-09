@@ -326,24 +326,53 @@ function Start-NotifyHotkeyActivation {
     return $false
 }
 
-function Invoke-NotifyHotkeyBrokerActivateOldest {
-    $brokerActivateOldestUrl = $null
-    if ($config.PSObject.Properties['BrokerPort']) {
-        $brokerActivateOldestUrl = ('http://127.0.0.1:{0}/activate-oldest' -f [int]$config.BrokerPort)
-    }
-    if ([string]::IsNullOrWhiteSpace($brokerActivateOldestUrl)) { return $false }
+function Send-NotifyHotkeyBrokerPost {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+        [int]$TimeoutMs = 700
+    )
+
+    if (-not $config.PSObject.Properties['BrokerPort']) { throw 'BrokerPort is not configured.' }
+    $port = [int]$config.BrokerPort
+    $client = [System.Net.Sockets.TcpClient]::new()
+    $connectHandle = $null
     try {
-        $payloadBytes = [System.Text.Encoding]::UTF8.GetBytes('{}')
-        $req = [System.Net.HttpWebRequest]::Create($brokerActivateOldestUrl)
-        $req.Method = 'POST'
-        $req.ContentType = 'application/json; charset=utf-8'
-        $req.ContentLength = $payloadBytes.Length
-        $req.Timeout = 700
-        $req.ReadWriteTimeout = 700
-        $stream = $req.GetRequestStream()
-        try { $stream.Write($payloadBytes, 0, $payloadBytes.Length) } finally { $stream.Close() }
-        $resp = $req.GetResponse()
-        try { } finally { $resp.Close() }
+        $connectResult = $client.BeginConnect('127.0.0.1', $port, $null, $null)
+        $connectHandle = $connectResult.AsyncWaitHandle
+        if (-not $connectHandle.WaitOne($TimeoutMs)) {
+            throw ('broker connect timeout after {0}ms' -f $TimeoutMs)
+        }
+        $client.EndConnect($connectResult)
+        $client.ReceiveTimeout = $TimeoutMs
+        $client.SendTimeout = $TimeoutMs
+        $body = '{}'
+        $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($body)
+        $requestHead = "POST $Path HTTP/1.1`r`nHost: 127.0.0.1:$port`r`nContent-Type: application/json; charset=utf-8`r`nContent-Length: $($bodyBytes.Length)`r`nConnection: close`r`n`r`n"
+        $requestBytes = [System.Text.Encoding]::ASCII.GetBytes($requestHead)
+        $stream = $client.GetStream()
+        $stream.Write($requestBytes, 0, $requestBytes.Length)
+        $stream.Write($bodyBytes, 0, $bodyBytes.Length)
+        $stream.Flush()
+        $buffer = [byte[]]::new(256)
+        $read = $stream.Read($buffer, 0, $buffer.Length)
+        if ($read -le 0) { throw 'broker returned an empty response.' }
+        $responseText = [System.Text.Encoding]::ASCII.GetString($buffer, 0, $read)
+        if ($responseText -notmatch '^HTTP/1\.1 200\b') {
+            $firstLine = (($responseText -split "`r?`n") | Select-Object -First 1)
+            throw ('broker returned {0}' -f $firstLine)
+        }
+        return $true
+    }
+    finally {
+        if ($null -ne $connectHandle) { try { $connectHandle.Close() } catch {} }
+        try { $client.Close() } catch {}
+    }
+}
+
+function Invoke-NotifyHotkeyBrokerActivateOldest {
+    try {
+        [void](Send-NotifyHotkeyBrokerPost -Path '/activate-oldest' -TimeoutMs 700)
         Write-NotifyHotkeyLog -Message 'broker-activate-oldest-request'
         return $true
     }

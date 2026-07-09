@@ -190,6 +190,9 @@ $watchdogTextForBroker = [System.IO.File]::ReadAllText((Join-Path $PSScriptRoot 
 if ($watchdogTextForBroker -notmatch 'Test-NotifyBrokerHealth' -or $watchdogTextForBroker -notmatch 'NotifyWatchdogBrokerMisses\s*=\s*0' -or $watchdogTextForBroker -notmatch 'broker-restart-requested') {
     throw 'Watchdog must supervise broker health and restart it when missing or unhealthy.'
 }
+if ($watchdogTextForBroker -notmatch 'NotifyWatchdogHotkeyMisses\s*=\s*0' -or $watchdogTextForBroker -notmatch 'stale-hotkey' -or $watchdogTextForBroker -notmatch 'pi-notify-hotkey.ps1') {
+    throw 'Watchdog must supervise the resident hotkey worker and restart it when missing.'
+}
 if ($watchdogTextForBroker -notmatch 'if \(\$listenerOk\)' -or $watchdogTextForBroker -notmatch '\$duplicateListener') {
     throw 'Watchdog must tolerate pid-file/process-shape mismatch when listener /health is OK to avoid false stale-listener restarts.'
 }
@@ -216,8 +219,8 @@ if ($hotkeyTextForArtifacts -notmatch 'brokerManaged' -or $hotkeyTextForArtifact
 if ($brokerText -notmatch 'Set-NotifyBrokerPopupActivating' -or $brokerText -notmatch '0x8df3' -or $brokerText -notmatch 'broker-activation-feedback' -or $brokerText -notmatch 'FormToClose') {
     throw 'Broker activation must give immediate popup feedback and close the feedback card after focus activation finishes.'
 }
-if ($brokerText -notmatch '/activate-oldest' -or $brokerText -notmatch 'Invoke-NotifyBrokerOldestPopupActivation' -or $hotkeyTextForArtifacts -notmatch 'Invoke-NotifyHotkeyBrokerActivateOldest') {
-    throw 'Hotkey must prefer broker /activate-oldest so Alt+L avoids popup-live file scan on the fast path.'
+if ($brokerText -notmatch '/activate-oldest' -or $brokerText -notmatch 'Invoke-NotifyBrokerOldestPopupActivation' -or $hotkeyTextForArtifacts -notmatch 'Invoke-NotifyHotkeyBrokerActivateOldest' -or $hotkeyTextForArtifacts -notmatch 'TcpClient' -or $hotkeyTextForArtifacts -notmatch 'BeginConnect') {
+    throw 'Hotkey must prefer bounded TcpClient broker /activate-oldest so Alt+L avoids popup-live file scan on the fast path.'
 }
 if ($brokerText -notmatch 'Queue-NotifyBrokerPrewarm' -or $brokerText -notmatch 'Update-NotifyBrokerTabCacheForTarget' -or $brokerText -notmatch 'broker-prewarm-cache-updated') {
     throw 'Broker must prewarm target tab cache after popup display to reduce activation cache misses.'
@@ -712,6 +715,10 @@ if ($null -ne $cfg) {
         $commandLine = [string]$_.CommandLine
         ($_.ProcessId -ne $PID) -and (Test-CheckProcessOwnedByInstance -CommandLine $commandLine) -and ($commandLine -match '(?i)-File\s+("[^"]*pi-notify-watchdog\.ps1"|[^\s"]*pi-notify-watchdog\.ps1)')
     } | Select-Object -ExpandProperty ProcessId)
+    $hotkeyPids = @($processes | Where-Object {
+        $commandLine = [string]$_.CommandLine
+        ($_.ProcessId -ne $PID) -and (Test-CheckProcessOwnedByInstance -CommandLine $commandLine) -and ($commandLine -match '(?i)-File\s+("[^"]*pi-notify-hotkey\.ps1"|[^\s"]*pi-notify-hotkey\.ps1)')
+    } | Select-Object -ExpandProperty ProcessId)
     $sshPids = @($processes | Where-Object {
         ($_.Name -eq 'ssh.exe') -and ([string]$_.CommandLine -like ('*{0}*' -f $forwardNeedle)) -and ($wrapperPids -contains $_.ParentProcessId)
     } | Select-Object -ExpandProperty ProcessId)
@@ -730,9 +737,12 @@ if ($null -ne $cfg) {
             $watchdogPidOk = @($watchdogPids | Where-Object { $_ -eq $watchdogPidValue }).Count -eq 1
         }
     }
-    Write-Host ('wrappers={0} ssh={1} watchdog={2} watchdogPidOk={3}' -f $wrapperPids.Count, $sshPids.Count, $watchdogPids.Count, $watchdogPidOk)
+    Write-Host ('wrappers={0} ssh={1} watchdog={2} watchdogPidOk={3} hotkey={4}' -f $wrapperPids.Count, $sshPids.Count, $watchdogPids.Count, $watchdogPidOk, $hotkeyPids.Count)
     if ($wrapperPids.Count -ne 1 -or $sshPids.Count -ne 1 -or $watchdogPids.Count -ne 1 -or -not $watchdogPidOk) {
         throw 'Reverse tunnel must have exactly one wrapper, one ssh process, one watchdog, and matching watchdog.pid. Run pi-notify-refresh.ps1 -SyncRemote.'
+    }
+    if ($cfg.PSObject.Properties['popupHotkeyEnabled'] -and [bool]$cfg.popupHotkeyEnabled -and $hotkeyPids.Count -ne 1) {
+        throw 'Resident hotkey must have exactly one running worker when popupHotkeyEnabled=true. Run pi-notify-refresh.ps1 -SyncRemote.'
     }
 
     $tunnelLog = Join-Path $runtimeBaseDir 'logs\tunnel.log'
