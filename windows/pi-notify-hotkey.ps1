@@ -339,10 +339,10 @@ function Invoke-NotifyHotkeyOldestPopup {
 function ConvertTo-NotifyHotkeyRegistration {
     param([string]$HotkeyValue)
 
-    $value = if ([string]::IsNullOrWhiteSpace($HotkeyValue)) { 'Alt+P' } else { [string]$HotkeyValue }
+    $value = if ([string]::IsNullOrWhiteSpace($HotkeyValue)) { 'Ctrl+{' } else { [string]$HotkeyValue }
     $parts = @($value -split '\+' | ForEach-Object { $_.Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
     if ($parts.Count -lt 2) {
-        throw ('Invalid popupHotkey "{0}". Use Alt+P, Ctrl+P, Ctrl+Alt+P, Shift+F8, or Win+P style syntax.' -f $value)
+        throw ('Invalid popupHotkey "{0}". Use Ctrl+{{, Alt+P, Ctrl+P, Ctrl+Alt+P, Shift+F8, or Win+P style syntax.' -f $value)
     }
 
     $modifiers = [uint32]0x4000 # MOD_NOREPEAT
@@ -358,14 +358,43 @@ function ConvertTo-NotifyHotkeyRegistration {
 
     $key = $parts[$parts.Count - 1].ToUpperInvariant()
     $virtualKey = [uint32]0
+    $requiresShift = $false
     if ($key.Length -eq 1) {
         $ch = [char]$key[0]
         if ((($ch -ge [char]'A') -and ($ch -le [char]'Z')) -or (($ch -ge [char]'0') -and ($ch -le [char]'9'))) {
             $virtualKey = [uint32][byte][char]$ch
         }
+        else {
+            switch ($key) {
+                '[' { $virtualKey = [uint32]0xDB; break }
+                '{' { $virtualKey = [uint32]0xDB; $requiresShift = $true; break }
+                ']' { $virtualKey = [uint32]0xDD; break }
+                '}' { $virtualKey = [uint32]0xDD; $requiresShift = $true; break }
+                '\' { $virtualKey = [uint32]0xDC; break }
+                '|' { $virtualKey = [uint32]0xDC; $requiresShift = $true; break }
+                ';' { $virtualKey = [uint32]0xBA; break }
+                ':' { $virtualKey = [uint32]0xBA; $requiresShift = $true; break }
+                "'" { $virtualKey = [uint32]0xDE; break }
+                '"' { $virtualKey = [uint32]0xDE; $requiresShift = $true; break }
+                ',' { $virtualKey = [uint32]0xBC; break }
+                '<' { $virtualKey = [uint32]0xBC; $requiresShift = $true; break }
+                '.' { $virtualKey = [uint32]0xBE; break }
+                '>' { $virtualKey = [uint32]0xBE; $requiresShift = $true; break }
+                '/' { $virtualKey = [uint32]0xBF; break }
+                '?' { $virtualKey = [uint32]0xBF; $requiresShift = $true; break }
+                '`' { $virtualKey = [uint32]0xC0; break }
+                '~' { $virtualKey = [uint32]0xC0; $requiresShift = $true; break }
+                '-' { $virtualKey = [uint32]0xBD; break }
+                '_' { $virtualKey = [uint32]0xBD; $requiresShift = $true; break }
+                '=' { $virtualKey = [uint32]0xBB; break }
+            }
+        }
     }
     elseif ($key -match '^F([1-9]|1[0-9]|2[0-4])$') {
         $virtualKey = [uint32](0x70 + [int]$Matches[1] - 1)
+    }
+    if ($requiresShift) {
+        $modifiers = $modifiers -bor [uint32]0x0004
     }
     if ($virtualKey -eq 0) {
         throw ('Unsupported popupHotkey key "{0}" in "{1}".' -f $key, $value)
