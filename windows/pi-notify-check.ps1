@@ -206,8 +206,8 @@ if ($listenerTextForLaunch -notmatch 'Invoke-NotifyBrokerPopup' -or $listenerTex
 if ($listenerTextForLaunch -notmatch 'Dictionary\[string,string\][\s\S]{0,120}OrdinalIgnoreCase' -or ([regex]::Matches($brokerText, 'Dictionary\[string,string\][\s\S]{0,120}OrdinalIgnoreCase')).Count -lt 2) {
     throw 'Listener and broker HTTP parsers must treat headers as case-insensitive so Node fetch lowercase content-length is honored.'
 }
-if ($listenerTextForLaunch -notmatch 'ContentLength\s*=\s*\$bodyBytes\.Length' -or ([regex]::Matches($hotkeyTextForArtifacts, 'ContentLength\s*=\s*\$closeBytes\.Length')).Count -lt 2) {
-    throw 'Broker popup/close POST requests must set ContentLength for the raw TCP HTTP broker parser.'
+if ($listenerTextForLaunch -notmatch 'TcpClient' -or $listenerTextForLaunch -notmatch 'BeginConnect' -or $listenerTextForLaunch -notmatch 'Content-Length: \$\(\$bodyBytes\.Length\)' -or ([regex]::Matches($hotkeyTextForArtifacts, 'ContentLength\s*=\s*\$closeBytes\.Length')).Count -lt 2) {
+    throw 'Broker popup/close POST requests must use bounded loopback POSTs with Content-Length for the raw TCP HTTP broker parser.'
 }
 if ($listenerTextForLaunch -notmatch 'Invoke-NotifyBrokerPopup[^\r\n]+-StackIndex -1') {
     throw 'Listener must let the broker allocate popup stack slots; otherwise broker-managed popups overlap at slot 0.'
@@ -222,8 +222,11 @@ if ($brokerText -notmatch 'Set-NotifyBrokerPopupActivating' -or $brokerText -not
 if ($brokerText -notmatch '/activate-oldest' -or $brokerText -notmatch 'Invoke-NotifyBrokerOldestPopupActivation' -or $hotkeyTextForArtifacts -notmatch 'Invoke-NotifyHotkeyBrokerActivateOldest' -or $hotkeyTextForArtifacts -notmatch 'TcpClient' -or $hotkeyTextForArtifacts -notmatch 'BeginConnect') {
     throw 'Hotkey must prefer bounded TcpClient broker /activate-oldest so Alt+L avoids popup-live file scan on the fast path.'
 }
-if ($brokerText -notmatch 'Queue-NotifyBrokerPrewarm' -or $brokerText -notmatch 'Update-NotifyBrokerTabCacheForTarget' -or $brokerText -notmatch 'broker-prewarm-cache-updated') {
-    throw 'Broker must prewarm target tab cache after popup display to reduce activation cache misses.'
+if ($brokerText -notmatch 'Queue-NotifyBrokerPrewarm' -or $brokerText -notmatch 'Update-NotifyBrokerTabCacheForTarget' -or $brokerText -notmatch 'broker-prewarm-cache-updated' -or $brokerText -notmatch 'broker-prewarm-skip recent-scan' -or $brokerText -notmatch 'broker-prewarm-dedupe' -or $brokerText -notmatch 'broker-prewarm-skip closed-popup' -or $brokerText -notmatch 'NotifyBrokerPrewarmDelayMs\s*=\s*1500') {
+    throw 'Broker must prewarm target tab cache after popup display while delaying/throttling repeated expensive scans and skipping closed popups.'
+}
+if ($brokerText -notmatch 'broker-client-disconnect stage=response') {
+    throw 'Broker HTTP listener must treat client-disconnect response writes as benign instead of noisy bg errors.'
 }
 if ($hotkeyTextForArtifacts -notmatch 'RegisterHotKey' -or $hotkeyTextForArtifacts -notmatch 'Start-NotifyHotkeyResident' -or $hotkeyTextForArtifacts -notmatch 'MOD_NOREPEAT' -or $hotkeyTextForArtifacts -notmatch 'ConvertTo-NotifyHotkeyRegistration') {
     throw 'Hotkey must run as a resident RegisterHotKey worker so single-modifier shortcuts like Alt+P work reliably.'

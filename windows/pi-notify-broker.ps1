@@ -123,6 +123,10 @@ $script:NotifyBrokerActivationQueue = $null
 $script:NotifyBrokerActivationTimer = $null
 $script:NotifyBrokerPrewarmQueue = $null
 $script:NotifyBrokerPrewarmTimer = $null
+$script:NotifyBrokerPrewarmLastScanByTarget = @{}
+$script:NotifyBrokerPrewarmMinIntervalSeconds = 15
+$script:NotifyBrokerPrewarmDelayMs = 1500
+$script:NotifyBrokerPrewarmMaxQueue = 4
 if ($config.PSObject.Properties['PopupMaxVisible']) {
     try { $script:NotifyBrokerPopupMaxVisible = [Math]::Max(1, [Math]::Min(8, [int]$config.PopupMaxVisible)) } catch { $script:NotifyBrokerPopupMaxVisible = 4 }
 }
@@ -617,6 +621,16 @@ function Update-NotifyBrokerTabCacheForTarget {
             return
         }
 
+        $prewarmKey = if ([string]::IsNullOrWhiteSpace($TargetFingerprint)) { Get-NotifyBrokerContextFingerprint -Value ('{0}|{1}|{2}' -f $TargetHost, $CurrentDirBase, $SourceTabTitleValue) } else { $TargetFingerprint }
+        if ($script:NotifyBrokerPrewarmLastScanByTarget.ContainsKey($prewarmKey)) {
+            $ageSeconds = ([DateTime]::UtcNow - $script:NotifyBrokerPrewarmLastScanByTarget[$prewarmKey]).TotalSeconds
+            if ($ageSeconds -lt $script:NotifyBrokerPrewarmMinIntervalSeconds) {
+                Write-NotifyBrokerLog -Message ('broker-prewarm-skip recent-scan targetFingerprint={0} ageMs={1}' -f $TargetFingerprint, [int]($ageSeconds * 1000))
+                return
+            }
+        }
+        $script:NotifyBrokerPrewarmLastScanByTarget[$prewarmKey] = [DateTime]::UtcNow
+
         $keywords = @($SourceTabTitleValue, $CurrentDirBase, $TargetHost) |
             Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
             ForEach-Object { $_.Trim() } |
@@ -678,25 +692,47 @@ function Queue-NotifyBrokerPrewarm {
     if ($null -eq $script:NotifyBrokerPrewarmQueue) { $script:NotifyBrokerPrewarmQueue = [System.Collections.Generic.Queue[object]]::new() }
     if ($null -eq $script:NotifyBrokerPrewarmTimer) {
         $script:NotifyBrokerPrewarmTimer = New-Object System.Windows.Forms.Timer
-        $script:NotifyBrokerPrewarmTimer.Interval = 150
+        $script:NotifyBrokerPrewarmTimer.Interval = $script:NotifyBrokerPrewarmDelayMs
         $script:NotifyBrokerPrewarmTimer.Add_Tick({
             $this.Stop()
             if ($null -eq $script:NotifyBrokerPrewarmQueue -or $script:NotifyBrokerPrewarmQueue.Count -le 0) { return }
             $request = $script:NotifyBrokerPrewarmQueue.Dequeue()
+            if (-not [string]::IsNullOrWhiteSpace($request.PopupId) -and -not $script:NotifyBrokerActivePopups.ContainsKey($request.PopupId)) {
+                Write-NotifyBrokerLog -Message ('broker-prewarm-skip closed-popup popupId={0} targetFingerprint={1}' -f $request.PopupId, $request.TargetFingerprint)
+                if ($script:NotifyBrokerPrewarmQueue.Count -gt 0) { $this.Start() }
+                return
+            }
             Write-NotifyBrokerLog -Message ('broker-prewarm-start popupId={0} targetFingerprint={1}' -f $request.PopupId, $request.TargetFingerprint)
             Update-NotifyBrokerTabCacheForTarget -TargetHost $request.TargetHost -CurrentDirBase $request.CurrentDirBase -SourceTabTitleValue $request.SourceTabTitleValue -TargetFingerprint $request.TargetFingerprint
             if ($script:NotifyBrokerPrewarmQueue.Count -gt 0) { $this.Start() }
         })
     }
 
-    $script:NotifyBrokerPrewarmQueue.Enqueue([pscustomobject]@{
+    $request = [pscustomobject]@{
         TargetHost = $TargetHost
         CurrentDirBase = $CurrentDirBase
         SourceTabTitleValue = $SourceTabTitleValue
         TargetFingerprint = $TargetFingerprint
         PopupId = $PopupId
-    })
-    Write-NotifyBrokerLog -Message ('broker-prewarm-queued popupId={0} targetFingerprint={1}' -f $PopupId, $TargetFingerprint)
+    }
+    $existing = @($script:NotifyBrokerPrewarmQueue.ToArray())
+    $script:NotifyBrokerPrewarmQueue.Clear()
+    foreach ($queued in $existing) {
+        if ([string]::IsNullOrWhiteSpace($TargetFingerprint) -or $queued.TargetFingerprint -ne $TargetFingerprint) {
+            if ($script:NotifyBrokerPrewarmQueue.Count -lt $script:NotifyBrokerPrewarmMaxQueue) {
+                $script:NotifyBrokerPrewarmQueue.Enqueue($queued)
+            }
+        }
+        else {
+            Write-NotifyBrokerLog -Message ('broker-prewarm-dedupe popupId={0} replacedBy={1} targetFingerprint={2}' -f $queued.PopupId, $PopupId, $TargetFingerprint)
+        }
+    }
+    if ($script:NotifyBrokerPrewarmQueue.Count -ge $script:NotifyBrokerPrewarmMaxQueue) {
+        Write-NotifyBrokerLog -Message ('broker-prewarm-drop queue-full popupId={0} targetFingerprint={1}' -f $PopupId, $TargetFingerprint)
+        return
+    }
+    $script:NotifyBrokerPrewarmQueue.Enqueue($request)
+    Write-NotifyBrokerLog -Message ('broker-prewarm-queued popupId={0} targetFingerprint={1} queue={2}' -f $PopupId, $TargetFingerprint, $script:NotifyBrokerPrewarmQueue.Count)
     $script:NotifyBrokerPrewarmTimer.Start()
 }
 
@@ -1591,12 +1627,17 @@ function Write-BrokerBgLog($Msg) {
     Add-Content -LiteralPath $LogPath -Value $line -Encoding UTF8
 }
 function Write-BgResponse($Stream, $StatusCode, $Reason, $Body, $ContentType) {
-    $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes([string]$Body)
-    $header = "HTTP/1.1 $StatusCode $Reason`r`nContent-Type: $ContentType`r`nContent-Length: $($bodyBytes.Length)`r`nConnection: close`r`n`r`n"
-    $headerBytes = [System.Text.Encoding]::ASCII.GetBytes($header)
-    $Stream.Write($headerBytes, 0, $headerBytes.Length)
-    if ($bodyBytes.Length -gt 0) { $Stream.Write($bodyBytes, 0, $bodyBytes.Length) }
-    $Stream.Flush()
+    try {
+        $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes([string]$Body)
+        $header = "HTTP/1.1 $StatusCode $Reason`r`nContent-Type: $ContentType`r`nContent-Length: $($bodyBytes.Length)`r`nConnection: close`r`n`r`n"
+        $headerBytes = [System.Text.Encoding]::ASCII.GetBytes($header)
+        $Stream.Write($headerBytes, 0, $headerBytes.Length)
+        if ($bodyBytes.Length -gt 0) { $Stream.Write($bodyBytes, 0, $bodyBytes.Length) }
+        $Stream.Flush()
+    }
+    catch {
+        try { Write-BrokerBgLog ('broker-client-disconnect stage=response status={0} "{1}"' -f $StatusCode, $_.Exception.Message) } catch {}
+    }
 }
 function Read-BgRequest($Stream) {
     $maxBodyBytes = 65536

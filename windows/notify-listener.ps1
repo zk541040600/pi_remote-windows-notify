@@ -541,21 +541,42 @@ function Send-NotifyBrokerPopup {
     } | ConvertTo-Json -Depth 4 -Compress
     $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($payload)
 
+    $timeoutMs = [Math]::Max(300, [int]$config.BrokerRequestTimeoutMs)
+    $port = [int]$config.BrokerPort
+    $client = [System.Net.Sockets.TcpClient]::new()
+    $connectHandle = $null
     try {
-        $request = [System.Net.HttpWebRequest]::Create($config.BrokerPopupUrl)
-        $request.Method = 'POST'
-        $request.ContentType = 'application/json; charset=utf-8'
-        $request.ContentLength = $bodyBytes.Length
-        $request.Timeout = $config.BrokerRequestTimeoutMs
-        $request.ReadWriteTimeout = $config.BrokerRequestTimeoutMs
-        $requestStream = $request.GetRequestStream()
-        try { $requestStream.Write($bodyBytes, 0, $bodyBytes.Length) } finally { $requestStream.Close() }
-        $response = $request.GetResponse()
-        try { return ([int]$response.StatusCode -eq 200) } finally { $response.Close() }
+        $connectResult = $client.BeginConnect('127.0.0.1', $port, $null, $null)
+        $connectHandle = $connectResult.AsyncWaitHandle
+        if (-not $connectHandle.WaitOne($timeoutMs)) {
+            throw ('broker connect timeout after {0}ms' -f $timeoutMs)
+        }
+        $client.EndConnect($connectResult)
+        $client.ReceiveTimeout = $timeoutMs
+        $client.SendTimeout = $timeoutMs
+        $requestHead = "POST /popup HTTP/1.1`r`nHost: 127.0.0.1:$port`r`nContent-Type: application/json; charset=utf-8`r`nContent-Length: $($bodyBytes.Length)`r`nConnection: close`r`n`r`n"
+        $requestBytes = [System.Text.Encoding]::ASCII.GetBytes($requestHead)
+        $stream = $client.GetStream()
+        $stream.Write($requestBytes, 0, $requestBytes.Length)
+        $stream.Write($bodyBytes, 0, $bodyBytes.Length)
+        $stream.Flush()
+        $buffer = [byte[]]::new(256)
+        $read = $stream.Read($buffer, 0, $buffer.Length)
+        if ($read -le 0) { throw 'broker returned an empty response.' }
+        $responseText = [System.Text.Encoding]::ASCII.GetString($buffer, 0, $read)
+        if ($responseText -notmatch '^HTTP/1\.1 200\b') {
+            $firstLine = (($responseText -split "`r?`n") | Select-Object -First 1)
+            throw ('broker returned {0}' -f $firstLine)
+        }
+        return $true
     }
     catch {
         Write-NotifyListenerLog -Message ('broker-post-error "{0}"' -f $_.Exception.Message)
         return $false
+    }
+    finally {
+        if ($null -ne $connectHandle) { try { $connectHandle.Close() } catch {} }
+        try { $client.Close() } catch {}
     }
 }
 
