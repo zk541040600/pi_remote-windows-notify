@@ -80,6 +80,9 @@ public static class PiNotifyPopupUser32 {
     [DllImport("user32.dll")]
     public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
 
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+
     [DllImport("user32.dll")]
     public static extern bool SetForegroundWindow(IntPtr hWnd);
 
@@ -98,6 +101,8 @@ $configArgs = @{}
 if ($PSBoundParameters.ContainsKey('ConfigPath')) { $configArgs.ConfigPath = $ConfigPath }
 $config = Ensure-NotifyBridgeConfig @configArgs
 $PopupPlacement = if ([string]::IsNullOrWhiteSpace([string]$config.PopupPlacement)) { 'cursor' } else { [string]$config.PopupPlacement }
+$script:NotifyPopupHwndTopMost = [IntPtr](-1)
+$script:NotifyPopupSwpShowNoActivate = [uint32](0x0010 -bor 0x0040)
 if ([string]::IsNullOrWhiteSpace($Title) -and -not [string]::IsNullOrWhiteSpace($env:PI_NOTIFY_TITLE)) { $Title = $env:PI_NOTIFY_TITLE }
 if ([string]::IsNullOrWhiteSpace($Body) -and -not [string]::IsNullOrWhiteSpace($env:PI_NOTIFY_BODY)) { $Body = $env:PI_NOTIFY_BODY }
 if ([string]::IsNullOrWhiteSpace($FocusTarget) -and -not [string]::IsNullOrWhiteSpace($env:PI_NOTIFY_FOCUS_TARGET)) { $FocusTarget = $env:PI_NOTIFY_FOCUS_TARGET }
@@ -810,7 +815,8 @@ $form.Size = New-Object System.Drawing.Size(420, 154)
 $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::None
 $form.StartPosition = [System.Windows.Forms.FormStartPosition]::Manual
 $form.ShowInTaskbar = $false
-$form.TopMost = $true
+# Do not use Form.TopMost: native SetWindowPos applies topmost with SWP_NOACTIVATE.
+$form.TopMost = $false
 $form.BackColor = $cardColor
 $form.Opacity = 0.98
 $form.Cursor = [System.Windows.Forms.Cursors]::Hand
@@ -955,10 +961,8 @@ $closeAction = {
 
 foreach ($control in @($form, $panel, $appLabel, $sessionLabel, $titleLabel, $bodyLabel)) {
     $control.Add_Click($activateAction)
-    $control.Add_MouseDown($activateAction)
 }
 $closeLabel.Add_Click($closeAction)
-$closeLabel.Add_MouseDown($closeAction)
 
 $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = [Math]::Max(3000, ($TimeoutSeconds * 1000))
@@ -1007,31 +1011,22 @@ function Get-NotifyPopupWorkingArea {
     return [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
 }
 
-$previousForegroundWindow = [PiNotifyPopupUser32]::GetForegroundWindow()
+$workingArea = Get-NotifyPopupWorkingArea -Placement $PopupPlacement
+$margin = 16
+$gap = 12
+$slot = [Math]::Max(0, $StackIndex)
+$x = [Math]::Max($workingArea.Left, $workingArea.Right - $form.Width - $margin)
+$bottomY = $workingArea.Bottom - $form.Height - $margin
+$stackY = $bottomY - ($slot * ($form.Height + $gap))
+$y = [Math]::Max($workingArea.Top + $margin, $stackY)
+$form.Location = New-Object System.Drawing.Point($x, $y)
+$roundedRect = New-Object System.Drawing.Rectangle(0, 0, $form.Width, $form.Height)
+$roundedPath = New-NotifyPopupRoundedPath -Rectangle $roundedRect -Radius 14
+$form.Region = New-Object System.Drawing.Region($roundedPath)
+$roundedPath.Dispose()
 
 $form.Add_Shown({
-    $workingArea = Get-NotifyPopupWorkingArea -Placement $PopupPlacement
-    $margin = 16
-    $gap = 12
-    $slot = [Math]::Max(0, $StackIndex)
-    $x = [Math]::Max($workingArea.Left, $workingArea.Right - $form.Width - $margin)
-    $bottomY = $workingArea.Bottom - $form.Height - $margin
-    $stackY = $bottomY - ($slot * ($form.Height + $gap))
-    $y = [Math]::Max($workingArea.Top + $margin, $stackY)
-    $form.Location = New-Object System.Drawing.Point($x, $y)
-    $roundedRect = New-Object System.Drawing.Rectangle(0, 0, $form.Width, $form.Height)
-    $roundedPath = New-NotifyPopupRoundedPath -Rectangle $roundedRect -Radius 14
-    $form.Region = New-Object System.Drawing.Region($roundedPath)
-    $roundedPath.Dispose()
-    [void][PiNotifyPopupUser32]::ShowWindowAsync($form.Handle, 4)
-    try {
-        if ($previousForegroundWindow -ne [IntPtr]::Zero -and [PiNotifyPopupUser32]::GetForegroundWindow() -eq $form.Handle) {
-            [void][PiNotifyPopupUser32]::SetForegroundWindow($previousForegroundWindow)
-            Write-NotifyPopupLog -Message 'popup-restore-foreground-after-show'
-        }
-    }
-    catch {
-    }
+    [void][PiNotifyPopupUser32]::SetWindowPos($form.Handle, $script:NotifyPopupHwndTopMost, $form.Left, $form.Top, $form.Width, $form.Height, $script:NotifyPopupSwpShowNoActivate)
     Write-NotifyPopupLog -Message ('popup-shown-noactivate x={0} y={1} w={2} h={3} stackIndex={4} placement={5}' -f $x, $y, $form.Width, $form.Height, $slot, $PopupPlacement)
     $timer.Start()
     $focusWatchTimer.Start()

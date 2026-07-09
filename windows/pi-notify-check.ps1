@@ -154,12 +154,19 @@ if ($brokerText -notmatch 'Get-NotifyBrokerContextFingerprint') {
     throw 'Broker must fingerprint target context in logs.'
 }
 $popupNoActivateText = [System.IO.File]::ReadAllText((Join-Path $PSScriptRoot 'pi-notify-popup.ps1'), [System.Text.UTF8Encoding]::new($false))
-if ($brokerText -notmatch 'WM_MOUSEACTIVATE' -or $brokerText -notmatch 'MA_NOACTIVATE' -or $brokerText -notmatch 'PreviousForegroundWindow' -or $popupNoActivateText -notmatch 'WM_MOUSEACTIVATE' -or $popupNoActivateText -notmatch 'MA_NOACTIVATE' -or $popupNoActivateText -notmatch 'previousForegroundWindow') {
-    throw 'Popup windows must avoid stealing keyboard or mouse activation from the current foreground app.'
+if ($brokerText -notmatch 'WM_MOUSEACTIVATE' -or $brokerText -notmatch 'MA_NOACTIVATE' -or $brokerText -notmatch 'SetWindowPos' -or $brokerText -notmatch 'NotifyBrokerSwpShowNoActivate' -or $brokerText -match 'PreviousForegroundWindow' -or $popupNoActivateText -notmatch 'WM_MOUSEACTIVATE' -or $popupNoActivateText -notmatch 'MA_NOACTIVATE' -or $popupNoActivateText -notmatch 'SetWindowPos' -or $popupNoActivateText -notmatch 'NotifyPopupSwpShowNoActivate' -or $popupNoActivateText -match 'previousForegroundWindow') {
+    throw 'Popup windows must show with native SWP_NOACTIVATE and must not restore stale foreground windows.'
 }
 # Tab cache: conservative TTL and liveness validation before reuse
-if ($brokerText -notmatch 'NotifyBrokerTabCacheTtlSeconds' -or $brokerText -notmatch 'Test-NotifyBrokerTabCacheValid' -or $brokerText -notmatch 'GetWindowThreadProcessId') {
-    throw 'Broker tab cache must use conservative TTL and liveness validation before reuse.'
+if ($brokerText -notmatch 'NotifyBrokerTabCacheTtlSeconds' -or $brokerText -notmatch 'Test-NotifyBrokerTabCacheEntryValid' -or $brokerText -notmatch 'NotifyBrokerTabCacheByTarget' -or $brokerText -notmatch 'Queue-NotifyBrokerActivation' -or $brokerText -notmatch 'GetWindowThreadProcessId') {
+    throw 'Broker tab cache must use target-specific conservative TTL, liveness validation, and deferred activation before reuse.'
+}
+if ($brokerText -notmatch 'NotifyBrokerPopupMaxVisible' -or $brokerText -notmatch 'broker-popup-drop-overflow') {
+    throw 'Broker must cap visible popup stack depth to avoid covering the mouse/caret area.'
+}
+$commonTextForBrokerConfig = [System.IO.File]::ReadAllText((Join-Path $PSScriptRoot 'NotifyBridge.Common.ps1'), [System.Text.UTF8Encoding]::new($false))
+if ($commonTextForBrokerConfig -notmatch 'popupMaxVisible' -or $commonTextForBrokerConfig -notmatch 'PopupMaxVisible') {
+    throw 'Common config must expose popupMaxVisible so the visible popup cap can be tuned.'
 }
 if ($brokerText -notmatch '\$usedSlots = @\{\}' -or $brokerText -notmatch '\$reuseSlot = -1' -or $brokerText -notmatch 'StackIndex\s*=\s*\$StackIndex' -or $brokerText -match 'activeCount = @\(\$script:NotifyBrokerActivePopups\.Keys\)\.Count') {
     throw 'Broker popup stacking must track occupied slots and reuse the first free slot instead of deriving slot from active popup count.'

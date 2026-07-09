@@ -71,6 +71,9 @@ public static class PiNotifyBrokerUser32 {
     [DllImport("user32.dll")]
     public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
 
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+
     [DllImport("user32.dll")]
     public static extern bool SetForegroundWindow(IntPtr hWnd);
 
@@ -110,8 +113,17 @@ $script:NotifyBrokerActivePopups = @{}
 $script:NotifyBrokerSequenceId = 0
 # In-memory tab cache: conservative TTL to avoid full UIAutomation scan on every click
 $script:NotifyBrokerTabCache = $null
+$script:NotifyBrokerTabCacheByTarget = @{}
 $script:NotifyBrokerTabCacheAt = [DateTime]::MinValue
-$script:NotifyBrokerTabCacheTtlSeconds = 30
+$script:NotifyBrokerTabCacheTtlSeconds = 120
+$script:NotifyBrokerHwndTopMost = [IntPtr](-1)
+$script:NotifyBrokerSwpShowNoActivate = [uint32](0x0010 -bor 0x0040)
+$script:NotifyBrokerPopupMaxVisible = 4
+$script:NotifyBrokerActivationQueue = $null
+$script:NotifyBrokerActivationTimer = $null
+if ($config.PSObject.Properties['PopupMaxVisible']) {
+    try { $script:NotifyBrokerPopupMaxVisible = [Math]::Max(1, [Math]::Min(8, [int]$config.PopupMaxVisible)) } catch { $script:NotifyBrokerPopupMaxVisible = 4 }
+}
 
 function Write-NotifyBrokerLog {
     param(
@@ -435,7 +447,8 @@ function Get-NotifyBrokerSelectedTerminalTarget {
 function Test-NotifyBrokerForegroundTarget {
     param(
         [string]$CurrentDirBase,
-        [string]$SourceTabTitleValue
+        [string]$SourceTabTitleValue,
+        [string]$TargetFingerprint = ''
     )
 
     if ([string]::IsNullOrWhiteSpace($CurrentDirBase) -and [string]::IsNullOrWhiteSpace($SourceTabTitleValue)) {
@@ -471,6 +484,11 @@ function Test-NotifyBrokerForegroundTarget {
             foreach ($value in $haystack) {
                 if ($value.IndexOf($SourceTabTitleValue, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
                     Write-NotifyBrokerLog -Message ('broker-foreground-target-match sourceTabFingerprint={0} selectedTabFingerprint={1} windowFingerprint={2}' -f (Get-NotifyBrokerContextFingerprint -Value $SourceTabTitleValue), (Get-NotifyBrokerContextFingerprint -Value $selectedTitle), (Get-NotifyBrokerContextFingerprint -Value $windowTitle))
+                    if ($selectedTab.Count -gt 0) {
+                        $windowObj = [pscustomobject]@{ Handle = $handle; Title = $windowTitle; ProcessId = [int]$processId; ProcessName = $process.ProcessName }
+                        $best = [pscustomobject]@{ Window = $windowObj; Score = 1; Tab = $selectedTab[0].Element; TabName = $selectedTitle; TabIndex = $selectedTab[0].Index }
+                        Update-NotifyBrokerTabCache -Best $best -TargetFingerprint $TargetFingerprint
+                    }
                     return $true
                 }
             }
@@ -482,6 +500,11 @@ function Test-NotifyBrokerForegroundTarget {
             foreach ($value in $haystack) {
                 if ($value.IndexOf($CurrentDirBase, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
                     Write-NotifyBrokerLog -Message ('broker-foreground-target-match cwdFingerprint={0} selectedTabFingerprint={1} windowFingerprint={2}' -f (Get-NotifyBrokerContextFingerprint -Value $CurrentDirBase), (Get-NotifyBrokerContextFingerprint -Value $selectedTitle), (Get-NotifyBrokerContextFingerprint -Value $windowTitle))
+                    if ($selectedTab.Count -gt 0) {
+                        $windowObj = [pscustomobject]@{ Handle = $handle; Title = $windowTitle; ProcessId = [int]$processId; ProcessName = $process.ProcessName }
+                        $best = [pscustomobject]@{ Window = $windowObj; Score = 1; Tab = $selectedTab[0].Element; TabName = $selectedTitle; TabIndex = $selectedTab[0].Index }
+                        Update-NotifyBrokerTabCache -Best $best -TargetFingerprint $TargetFingerprint
+                    }
                     return $true
                 }
             }
@@ -493,14 +516,16 @@ function Test-NotifyBrokerForegroundTarget {
     return $false
 }
 
-# Click activation: try in-memory cache with lightweight liveness check first; full scan on miss or stale cache
+# Click activation: keep both a global recent cache and target-specific caches to avoid
+# repeating expensive UIAutomation scans when several popup cards are visible.
 function Update-NotifyBrokerTabCache {
     param(
         [Parameter(Mandatory = $true)]
-        $Best
+        $Best,
+        [string]$TargetFingerprint = ''
     )
 
-    $script:NotifyBrokerTabCache = [pscustomobject]@{
+    $entry = [pscustomobject]@{
         WindowHandle  = $Best.Window.Handle
         WindowTitle   = $Best.Window.Title
         ProcessId     = $Best.Window.ProcessId
@@ -509,28 +534,33 @@ function Update-NotifyBrokerTabCache {
         Tab           = $Best.Tab
         UpdatedAtUtc  = [DateTime]::UtcNow
     }
-    $script:NotifyBrokerTabCacheAt = [DateTime]::UtcNow
-    Write-NotifyBrokerLog -Message ('broker-cache-updated windowFingerprint={0} tabFingerprint={1} tabIndex={2}' -f (Get-NotifyBrokerContextFingerprint -Value $Best.Window.Title), (Get-NotifyBrokerContextFingerprint -Value $Best.TabName), $Best.TabIndex)
+    $script:NotifyBrokerTabCache = $entry
+    $script:NotifyBrokerTabCacheAt = $entry.UpdatedAtUtc
+    if (-not [string]::IsNullOrWhiteSpace($TargetFingerprint)) {
+        $script:NotifyBrokerTabCacheByTarget[$TargetFingerprint] = $entry
+    }
+    Write-NotifyBrokerLog -Message ('broker-cache-updated windowFingerprint={0} tabFingerprint={1} tabIndex={2} targetFingerprint={3}' -f (Get-NotifyBrokerContextFingerprint -Value $Best.Window.Title), (Get-NotifyBrokerContextFingerprint -Value $Best.TabName), $Best.TabIndex, $TargetFingerprint)
 }
 
-function Test-NotifyBrokerTabCacheValid {
+function Test-NotifyBrokerTabCacheEntryValid {
     param(
+        $CacheEntry,
         [string]$CurrentDirBase,
         [string]$SourceTabTitleValue
     )
 
-    if ($null -eq $script:NotifyBrokerTabCache) { return $false }
-    if (([DateTime]::UtcNow - $script:NotifyBrokerTabCacheAt).TotalSeconds -gt $script:NotifyBrokerTabCacheTtlSeconds) { return $false }
-    $handle = $script:NotifyBrokerTabCache.WindowHandle
+    if ($null -eq $CacheEntry) { return $false }
+    if (([DateTime]::UtcNow - $CacheEntry.UpdatedAtUtc).TotalSeconds -gt $script:NotifyBrokerTabCacheTtlSeconds) { return $false }
+    $handle = $CacheEntry.WindowHandle
     if ($null -eq $handle -or $handle -eq [IntPtr]::Zero) { return $false }
-    if ($null -eq $script:NotifyBrokerTabCache.Tab) { return $false }
+    if ($null -eq $CacheEntry.Tab) { return $false }
     $processId = [uint32]0
     [void][PiNotifyBrokerUser32]::GetWindowThreadProcessId($handle, [ref]$processId)
     if ($processId -eq 0) { return $false }
     try { Get-Process -Id $processId -ErrorAction Stop | Out-Null } catch { return $false }
 
-    $cachedTabName = [string]$script:NotifyBrokerTabCache.TabName
-    $cachedWindowTitle = [string]$script:NotifyBrokerTabCache.WindowTitle
+    $cachedTabName = [string]$CacheEntry.TabName
+    $cachedWindowTitle = [string]$CacheEntry.WindowTitle
     if (-not [string]::IsNullOrWhiteSpace($SourceTabTitleValue) -and $cachedTabName.IndexOf($SourceTabTitleValue, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) {
         return $false
     }
@@ -540,11 +570,69 @@ function Test-NotifyBrokerTabCacheValid {
     return $true
 }
 
+function Get-NotifyBrokerTabCacheCandidate {
+    param(
+        [string]$TargetFingerprint,
+        [string]$CurrentDirBase,
+        [string]$SourceTabTitleValue
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($TargetFingerprint) -and $script:NotifyBrokerTabCacheByTarget.ContainsKey($TargetFingerprint)) {
+        $targetEntry = $script:NotifyBrokerTabCacheByTarget[$TargetFingerprint]
+        if (Test-NotifyBrokerTabCacheEntryValid -CacheEntry $targetEntry -CurrentDirBase $CurrentDirBase -SourceTabTitleValue $SourceTabTitleValue) {
+            return [pscustomobject]@{ Entry = $targetEntry; Source = 'target' }
+        }
+        $script:NotifyBrokerTabCacheByTarget.Remove($TargetFingerprint)
+    }
+
+    if (Test-NotifyBrokerTabCacheEntryValid -CacheEntry $script:NotifyBrokerTabCache -CurrentDirBase $CurrentDirBase -SourceTabTitleValue $SourceTabTitleValue) {
+        return [pscustomobject]@{ Entry = $script:NotifyBrokerTabCache; Source = 'global' }
+    }
+
+    return $null
+}
+
+function Queue-NotifyBrokerActivation {
+    param(
+        [string]$TargetHost,
+        [string]$CurrentDirBase,
+        [string]$SourceTabTitleValue,
+        [string]$TargetFingerprint
+    )
+
+    if ($null -eq $script:NotifyBrokerActivationQueue) {
+        $script:NotifyBrokerActivationQueue = [System.Collections.Generic.Queue[object]]::new()
+    }
+    if ($null -eq $script:NotifyBrokerActivationTimer) {
+        $script:NotifyBrokerActivationTimer = New-Object System.Windows.Forms.Timer
+        $script:NotifyBrokerActivationTimer.Interval = 1
+        $script:NotifyBrokerActivationTimer.Add_Tick({
+            $this.Stop()
+            if ($null -eq $script:NotifyBrokerActivationQueue -or $script:NotifyBrokerActivationQueue.Count -le 0) {
+                return
+            }
+            $request = $script:NotifyBrokerActivationQueue.Dequeue()
+            Invoke-NotifyBrokerActivation -TargetHost $request.TargetHost -CurrentDirBase $request.CurrentDirBase -SourceTabTitleValue $request.SourceTabTitleValue -TargetFingerprint $request.TargetFingerprint
+            if ($script:NotifyBrokerActivationQueue.Count -gt 0) {
+                $this.Start()
+            }
+        })
+    }
+
+    $script:NotifyBrokerActivationQueue.Enqueue([pscustomobject]@{
+        TargetHost = $TargetHost
+        CurrentDirBase = $CurrentDirBase
+        SourceTabTitleValue = $SourceTabTitleValue
+        TargetFingerprint = $TargetFingerprint
+    })
+    $script:NotifyBrokerActivationTimer.Start()
+}
 function Invoke-NotifyBrokerActivation {
     param(
         [string]$TargetHost,
         [string]$CurrentDirBase,
-        [string]$SourceTabTitleValue
+        [string]$SourceTabTitleValue,
+        [string]$TargetFingerprint = ''
     )
 
     try {
@@ -566,10 +654,13 @@ function Invoke-NotifyBrokerActivation {
 
         $best = $null
         $cacheHit = $false
-        if (Test-NotifyBrokerTabCacheValid -CurrentDirBase $CurrentDirBase -SourceTabTitleValue $SourceTabTitleValue) {
-            $cached = $script:NotifyBrokerTabCache
+        $cacheSource = 'none'
+        $cacheCandidate = Get-NotifyBrokerTabCacheCandidate -TargetFingerprint $TargetFingerprint -CurrentDirBase $CurrentDirBase -SourceTabTitleValue $SourceTabTitleValue
+        if ($null -ne $cacheCandidate) {
+            $cached = $cacheCandidate.Entry
             $cacheHit = $true
-            Write-NotifyBrokerLog -Message ('broker-cache-hit windowFingerprint={0} tabFingerprint={1} tabIndex={2}' -f (Get-NotifyBrokerContextFingerprint -Value $cached.WindowTitle), (Get-NotifyBrokerContextFingerprint -Value $cached.TabName), $cached.TabIndex)
+            $cacheSource = $cacheCandidate.Source
+            Write-NotifyBrokerLog -Message ('broker-cache-hit source={0} windowFingerprint={1} tabFingerprint={2} tabIndex={3} targetFingerprint={4}' -f $cacheSource, (Get-NotifyBrokerContextFingerprint -Value $cached.WindowTitle), (Get-NotifyBrokerContextFingerprint -Value $cached.TabName), $cached.TabIndex, $TargetFingerprint)
             $windowObj = [pscustomobject]@{
                 Handle      = $cached.WindowHandle
                 Title       = $cached.WindowTitle
@@ -635,10 +726,20 @@ function Invoke-NotifyBrokerActivation {
             return
         }
 
-        Write-NotifyBrokerLog -Message ('broker-focus-best windowFingerprint={0} tabFingerprint={1} tabIndex={2} score={3} cacheHit={4}' -f (Get-NotifyBrokerContextFingerprint -Value $best.Window.Title), (Get-NotifyBrokerContextFingerprint -Value $best.TabName), $best.TabIndex, $best.Score, $cacheHit)
+        Write-NotifyBrokerLog -Message ('broker-focus-best windowFingerprint={0} tabFingerprint={1} tabIndex={2} score={3} cacheHit={4} cacheSource={5}' -f (Get-NotifyBrokerContextFingerprint -Value $best.Window.Title), (Get-NotifyBrokerContextFingerprint -Value $best.TabName), $best.TabIndex, $best.Score, $cacheHit, $cacheSource)
         if ([PiNotifyBrokerUser32]::IsIconic($best.Window.Handle)) {
             [void][PiNotifyBrokerUser32]::ShowWindowAsync($best.Window.Handle, 9)
-            Start-Sleep -Milliseconds 120
+            Start-Sleep -Milliseconds 80
+        }
+
+        if ($cacheHit) {
+            [void][PiNotifyBrokerUser32]::SetForegroundWindow($best.Window.Handle)
+            if ($null -ne $best.Tab -and (Select-NotifyBrokerTab -TabElement $best.Tab)) {
+                Write-NotifyBrokerLog -Message ('broker-tab-selected tabFingerprint={0} elapsedMs={1} cacheHit=True cacheSource={2}' -f (Get-NotifyBrokerContextFingerprint -Value $best.TabName), [int]([DateTime]::UtcNow - $startedAt).TotalMilliseconds, $cacheSource)
+                Update-NotifyBrokerTabCache -Best $best -TargetFingerprint $TargetFingerprint
+                return
+            }
+            Write-NotifyBrokerLog -Message ('broker-cache-select-failed tabFingerprint={0}' -f (Get-NotifyBrokerContextFingerprint -Value $best.TabName))
         }
 
         try {
@@ -648,14 +749,14 @@ function Invoke-NotifyBrokerActivation {
         catch {
             Write-NotifyBrokerLog -Message ('broker-appactivate-error "{0}"' -f $_.Exception.Message)
         }
-        Start-Sleep -Milliseconds 80
+        Start-Sleep -Milliseconds 40
         [void][PiNotifyBrokerUser32]::SetForegroundWindow($best.Window.Handle)
-        Start-Sleep -Milliseconds 80
+        Start-Sleep -Milliseconds 40
 
         if ($null -ne $best.Tab) {
             if (Select-NotifyBrokerTab -TabElement $best.Tab) {
-                Write-NotifyBrokerLog -Message ('broker-tab-selected tabFingerprint={0} elapsedMs={1}' -f (Get-NotifyBrokerContextFingerprint -Value $best.TabName), [int]([DateTime]::UtcNow - $startedAt).TotalMilliseconds)
-                Update-NotifyBrokerTabCache -Best $best
+                Write-NotifyBrokerLog -Message ('broker-tab-selected tabFingerprint={0} elapsedMs={1} cacheHit={2} cacheSource={3}' -f (Get-NotifyBrokerContextFingerprint -Value $best.TabName), [int]([DateTime]::UtcNow - $startedAt).TotalMilliseconds, $cacheHit, $cacheSource)
+                Update-NotifyBrokerTabCache -Best $best -TargetFingerprint $TargetFingerprint
             }
             else {
                 Write-NotifyBrokerLog -Message ('broker-tab-select-failed tabFingerprint={0} elapsedMs={1}' -f (Get-NotifyBrokerContextFingerprint -Value $best.TabName), [int]([DateTime]::UtcNow - $startedAt).TotalMilliseconds)
@@ -775,6 +876,20 @@ function Show-NotifyBrokerPopup {
         }
     }
 
+    if ($script:NotifyBrokerPopupMaxVisible -gt 0) {
+        $activeEntries = @($script:NotifyBrokerActivePopups.Values | Where-Object { $_.TargetFingerprint -ne $TargetFingerprint } | Sort-Object { if ($_.PSObject.Properties['CreatedAtUtc']) { $_.CreatedAtUtc } else { [DateTime]::MinValue } })
+        $dropIndex = 0
+        while ($usedSlots.Count -ge $script:NotifyBrokerPopupMaxVisible -and $dropIndex -lt $activeEntries.Count) {
+            $drop = $activeEntries[$dropIndex]
+            $dropIndex += 1
+            $dropSlot = -1
+            try { $dropSlot = [int]$drop.StackIndex } catch { $dropSlot = -1 }
+            Write-NotifyBrokerLog -Message ('broker-popup-drop-overflow popupId={0} maxVisible={1}' -f $drop.PopupId, $script:NotifyBrokerPopupMaxVisible)
+            try { $drop.Form.Close() } catch {}
+            if ($dropSlot -ge 0) { $usedSlots.Remove([string]$dropSlot) }
+        }
+    }
+
     # Compute stack index from active popup slots (broker owns stacking).
     if ($StackIndex -lt 0) {
         if ($reuseSlot -ge 0 -and -not $usedSlots.ContainsKey([string]$reuseSlot)) {
@@ -803,7 +918,9 @@ function Show-NotifyBrokerPopup {
     $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::None
     $form.StartPosition = [System.Windows.Forms.FormStartPosition]::Manual
     $form.ShowInTaskbar = $false
-    $form.TopMost = $true
+    # Do not use Form.TopMost: WinForms may activate the form while changing z-order.
+    # The Shown handler applies topmost with SWP_NOACTIVATE instead.
+    $form.TopMost = $false
     $form.BackColor = $cardColor
     $form.Opacity = 0.98
     $form.Cursor = [System.Windows.Forms.Cursors]::Hand
@@ -909,7 +1026,6 @@ function Show-NotifyBrokerPopup {
     $targetHost = $FocusTarget
     $targetCwdBase = $CwdBase
     $targetSourceTabTitle = $SourceTabTitle
-    $previousForegroundWindow = [PiNotifyBrokerUser32]::GetForegroundWindow()
     $didActivate = $false
     $shouldActivate = $false
 
@@ -927,7 +1043,6 @@ function Show-NotifyBrokerPopup {
         StackIndex        = $StackIndex
         PopupPlacement    = $PopupPlacementValue
         CreatedAtUtc      = $popupCreatedAtUtc
-        PreviousForegroundWindow = $previousForegroundWindow
         DidActivate       = [ref]$didActivate
         ShouldActivate    = [ref]$shouldActivate
         Timer             = $timer
@@ -947,7 +1062,7 @@ function Show-NotifyBrokerPopup {
         $tag.DidActivate.Value = $true
         $tag.ShouldActivate.Value = $true
         Write-NotifyBrokerLog -Message ('broker-popup-click popupId={0}' -f $tag.PopupId)
-        Write-NotifyBrokerLog -Message ('broker-action activate popupId={0} targetFingerprint={1}' -f $tag.PopupId, (Get-NotifyBrokerContextFingerprint -Value $tag.TargetHost))
+        Write-NotifyBrokerLog -Message ('broker-action activate popupId={0} targetFingerprint={1}' -f $tag.PopupId, $tag.TargetFingerprint)
         $this.FindForm().Close()
     }
 
@@ -960,10 +1075,8 @@ function Show-NotifyBrokerPopup {
 
     foreach ($control in @($form, $panel, $appLabel, $sessionLabel, $titleLabel, $bodyLabel)) {
         $control.Add_Click($activateAction)
-        $control.Add_MouseDown($activateAction)
     }
     $closeLabel.Add_Click($closeAction)
-    $closeLabel.Add_MouseDown($closeAction)
 
     $timer.Interval = [Math]::Max(3000, ($TimeoutSeconds * 1000))
     $timer.Add_Tick({
@@ -978,7 +1091,7 @@ function Show-NotifyBrokerPopup {
     $focusWatchTimer.Interval = 800
     $focusWatchTimer.Add_Tick({
         $tag = $this.PopupTag
-        if (Test-NotifyBrokerForegroundTarget -CurrentDirBase $tag.TargetCwdBase -SourceTabTitleValue $tag.TargetSourceTabTitle) {
+        if (Test-NotifyBrokerForegroundTarget -CurrentDirBase $tag.TargetCwdBase -SourceTabTitleValue $tag.TargetSourceTabTitle -TargetFingerprint $tag.TargetFingerprint) {
             Write-NotifyBrokerLog -Message ('broker-action dismiss source="foreground-target" popupId={0}' -f $tag.PopupId)
             $this.Stop()
             $tag.Timer.Stop()
@@ -988,23 +1101,7 @@ function Show-NotifyBrokerPopup {
 
     $form.Add_Shown({
         $tag = $this.Tag
-        $location = Get-NotifyBrokerPopupLocation -StackIndex $tag.StackIndex -FormWidth $this.Width -FormHeight $this.Height
-        $x = $location.X
-        $y = $location.Y
-        $this.Location = New-Object System.Drawing.Point($x, $y)
-        $roundedRect = New-Object System.Drawing.Rectangle(0, 0, $this.Width, $this.Height)
-        $roundedPath = New-NotifyBrokerRoundedPath -Rectangle $roundedRect -Radius 14
-        $this.Region = New-Object System.Drawing.Region($roundedPath)
-        $roundedPath.Dispose()
-        [void][PiNotifyBrokerUser32]::ShowWindowAsync($this.Handle, 4)
-        try {
-            if ($tag.PreviousForegroundWindow -ne [IntPtr]::Zero -and [PiNotifyBrokerUser32]::GetForegroundWindow() -eq $this.Handle) {
-                [void][PiNotifyBrokerUser32]::SetForegroundWindow($tag.PreviousForegroundWindow)
-                Write-NotifyBrokerLog -Message ('broker-restore-foreground-after-show popupId={0}' -f $tag.PopupId)
-            }
-        }
-        catch {
-        }
+        [void][PiNotifyBrokerUser32]::SetWindowPos($this.Handle, $script:NotifyBrokerHwndTopMost, $this.Left, $this.Top, $this.Width, $this.Height, $script:NotifyBrokerSwpShowNoActivate)
         Write-NotifyBrokerLog -Message ('broker-shown popupId={0} stackIndex={1} placement={2} targetFingerprint={3} elapsedMs={4}' -f $tag.PopupId, $tag.StackIndex, $tag.PopupPlacement, $tag.TargetFingerprint, [int]([DateTime]::UtcNow - $tag.CreatedAtUtc).TotalMilliseconds)
         $tag.Timer.Start()
         $tag.FocusWatchTimer.Start()
@@ -1025,9 +1122,16 @@ function Show-NotifyBrokerPopup {
         $script:NotifyBrokerActivePopups.Remove($tag.PopupId) | Out-Null
 
         if ($tag.ShouldActivate.Value) {
-            Invoke-NotifyBrokerActivation -TargetHost $tag.TargetHost -CurrentDirBase $tag.TargetCwdBase -SourceTabTitleValue $tag.TargetSourceTabTitle
+            Queue-NotifyBrokerActivation -TargetHost $tag.TargetHost -CurrentDirBase $tag.TargetCwdBase -SourceTabTitleValue $tag.TargetSourceTabTitle -TargetFingerprint $tag.TargetFingerprint
         }
     })
+
+    $location = Get-NotifyBrokerPopupLocation -StackIndex $StackIndex -FormWidth $form.Width -FormHeight $form.Height
+    $form.Location = New-Object System.Drawing.Point($location.X, $location.Y)
+    $roundedRect = New-Object System.Drawing.Rectangle(0, 0, $form.Width, $form.Height)
+    $roundedPath = New-NotifyBrokerRoundedPath -Rectangle $roundedRect -Radius 14
+    $form.Region = New-Object System.Drawing.Region($roundedPath)
+    $roundedPath.Dispose()
 
     Save-NotifyBrokerLiveState -PopupId $PopupId -TargetHostValue $targetHost -CwdBaseValue $targetCwdBase -SourceTabTitleValue $targetSourceTabTitle -TargetFingerprintValue $TargetFingerprint -StackIndexValue $StackIndex -TimeoutSecondsValue $TimeoutSeconds
     $script:NotifyBrokerActivePopups[$PopupId] = [pscustomobject]@{
@@ -1035,6 +1139,7 @@ function Show-NotifyBrokerPopup {
         Form              = $form
         TargetFingerprint = $TargetFingerprint
         StackIndex        = $StackIndex
+        CreatedAtUtc      = $popupCreatedAtUtc
     }
     Write-NotifyBrokerLog -Message ('broker-popup-start popupId={0} targetFingerprint={1} hasCwd={2} hasTab={3} timeout={4} stackIndex={5}' -f $PopupId, $TargetFingerprint, (-not [string]::IsNullOrWhiteSpace($CwdBase)), (-not [string]::IsNullOrWhiteSpace($SourceTabTitle)), $TimeoutSeconds, $StackIndex)
     $form.Show()

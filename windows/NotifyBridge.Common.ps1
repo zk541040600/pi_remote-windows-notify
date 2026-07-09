@@ -632,6 +632,7 @@ function Ensure-NotifyBridgeConfig {
         [string]$DisplayMode,
         [int]$PopupTimeoutSeconds,
         [string]$PopupPlacement,
+        [int]$PopupMaxVisible,
         [string]$PopupHotkey,
         [bool]$PopupHotkeyEnabled,
         [string]$PopupWallpaperPath,
@@ -757,6 +758,16 @@ function Ensure-NotifyBridgeConfig {
         'cursor'
     }
 
+    $finalPopupMaxVisible = if ($PSBoundParameters.ContainsKey('PopupMaxVisible') -and $PopupMaxVisible -ge 1) {
+        [Math]::Min(8, $PopupMaxVisible)
+    }
+    elseif ($existing.ContainsKey('popupMaxVisible') -and [int]$existing['popupMaxVisible'] -ge 1) {
+        [Math]::Min(8, [int]$existing['popupMaxVisible'])
+    }
+    else {
+        4
+    }
+
     $finalPopupHotkey = if ($PSBoundParameters.ContainsKey('PopupHotkey')) {
         Normalize-NotifyBridgePopupHotkey -Value $PopupHotkey
     }
@@ -852,6 +863,7 @@ function Ensure-NotifyBridgeConfig {
         displayMode               = $finalDisplayMode
         popupTimeoutSeconds       = $finalPopupTimeoutSeconds
         popupPlacement            = $finalPopupPlacement
+        popupMaxVisible           = $finalPopupMaxVisible
         popupHotkey               = $finalPopupHotkey
         popupHotkeyEnabled        = $finalPopupHotkeyEnabled
         popupWallpaperPath        = $finalPopupWallpaperPath
@@ -879,6 +891,7 @@ function Ensure-NotifyBridgeConfig {
         DisplayMode               = $config.displayMode
         PopupTimeoutSeconds       = $config.popupTimeoutSeconds
         PopupPlacement            = $config.popupPlacement
+        PopupMaxVisible           = $config.popupMaxVisible
         PopupHotkey               = $config.popupHotkey
         PopupHotkeyEnabled        = $config.popupHotkeyEnabled
         PopupWallpaperPath        = $config.popupWallpaperPath
