@@ -597,7 +597,9 @@ function Queue-NotifyBrokerActivation {
         [string]$TargetHost,
         [string]$CurrentDirBase,
         [string]$SourceTabTitleValue,
-        [string]$TargetFingerprint
+        [string]$TargetFingerprint,
+        [string]$PopupId = '',
+        [System.Windows.Forms.Form]$FormToClose
     )
 
     if ($null -eq $script:NotifyBrokerActivationQueue) {
@@ -612,7 +614,20 @@ function Queue-NotifyBrokerActivation {
                 return
             }
             $request = $script:NotifyBrokerActivationQueue.Dequeue()
-            Invoke-NotifyBrokerActivation -TargetHost $request.TargetHost -CurrentDirBase $request.CurrentDirBase -SourceTabTitleValue $request.SourceTabTitleValue -TargetFingerprint $request.TargetFingerprint
+            try {
+                Invoke-NotifyBrokerActivation -TargetHost $request.TargetHost -CurrentDirBase $request.CurrentDirBase -SourceTabTitleValue $request.SourceTabTitleValue -TargetFingerprint $request.TargetFingerprint
+            }
+            finally {
+                if ($null -ne $request.FormToClose -and -not $request.FormToClose.IsDisposed) {
+                    try {
+                        Write-NotifyBrokerLog -Message ('broker-activation-feedback-close popupId={0}' -f $request.PopupId)
+                        $request.FormToClose.Close()
+                    }
+                    catch {
+                        Write-NotifyBrokerLog -Message ('broker-activation-feedback-close-error popupId={0} "{1}"' -f $request.PopupId, $_.Exception.Message)
+                    }
+                }
+            }
             if ($script:NotifyBrokerActivationQueue.Count -gt 0) {
                 $this.Start()
             }
@@ -624,9 +639,12 @@ function Queue-NotifyBrokerActivation {
         CurrentDirBase = $CurrentDirBase
         SourceTabTitleValue = $SourceTabTitleValue
         TargetFingerprint = $TargetFingerprint
+        PopupId = $PopupId
+        FormToClose = $FormToClose
     })
     $script:NotifyBrokerActivationTimer.Start()
 }
+
 function Invoke-NotifyBrokerActivation {
     param(
         [string]$TargetHost,
@@ -838,6 +856,65 @@ function Get-NotifyBrokerSessionDisplayName {
     return $sessionDisplayName
 }
 
+function Set-NotifyBrokerPopupActivating {
+    param([hashtable]$Tag)
+
+    if ($null -eq $Tag) { return }
+    try {
+        if ($Tag.Activating.Value) { return }
+        $Tag.Activating.Value = $true
+        $Tag.Timer.Stop()
+        $Tag.FocusWatchTimer.Stop()
+
+        $inactiveCardColor = [System.Drawing.Color]::FromArgb(48, 52, 60)
+        $inactiveTextColor = [System.Drawing.Color]::FromArgb(190, 198, 210)
+        $inactiveAccentColor = [System.Drawing.Color]::FromArgb(148, 163, 184)
+        $jumpingText = (-join @([char]0x8df3, [char]0x8f6c, [char]0x4e2d, '.', '.', '.'))
+        if ($null -ne $Tag.Form) {
+            $Tag.Form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+            $Tag.Form.Opacity = 0.90
+            $Tag.Form.BackColor = $inactiveCardColor
+        }
+        if ($null -ne $Tag.Panel) {
+            $Tag.Panel.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+            $Tag.Panel.BackColor = $inactiveCardColor
+        }
+        if ($null -ne $Tag.AppLabel) {
+            $Tag.AppLabel.Text = ('Pi Remote - {0}' -f $jumpingText)
+            $Tag.AppLabel.ForeColor = $inactiveTextColor
+            $Tag.AppLabel.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+        }
+        if ($null -ne $Tag.SessionLabel) {
+            $Tag.SessionLabel.Text = $jumpingText
+            $Tag.SessionLabel.ForeColor = $inactiveAccentColor
+            $Tag.SessionLabel.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+        }
+        if ($null -ne $Tag.TitleLabel) {
+            $Tag.TitleLabel.Text = 'Switching to the target terminal tab'
+            $Tag.TitleLabel.ForeColor = $inactiveTextColor
+            $Tag.TitleLabel.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+        }
+        if ($null -ne $Tag.BodyLabel) {
+            $Tag.BodyLabel.Text = 'Please wait if window scanning is slow. This popup will close automatically.'
+            $Tag.BodyLabel.ForeColor = $inactiveTextColor
+            $Tag.BodyLabel.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+        }
+        if ($null -ne $Tag.CloseLabel) {
+            $Tag.CloseLabel.Text = '...'
+            $Tag.CloseLabel.ForeColor = $inactiveTextColor
+        }
+        Write-NotifyBrokerLog -Message ('broker-activation-feedback popupId={0}' -f $Tag.PopupId)
+        if ($null -ne $Tag.Form) {
+            $Tag.Form.Invalidate($true)
+            $Tag.Form.Refresh()
+        }
+        [System.Windows.Forms.Application]::DoEvents()
+    }
+    catch {
+        Write-NotifyBrokerLog -Message ('broker-activation-feedback-error popupId={0} "{1}"' -f $Tag.PopupId, $_.Exception.Message)
+    }
+}
+
 # Create and show a popup card on the UI thread; close older popups with the same targetFingerprint first
 function Show-NotifyBrokerPopup {
     param(
@@ -1045,9 +1122,17 @@ function Show-NotifyBrokerPopup {
         CreatedAtUtc      = $popupCreatedAtUtc
         DidActivate       = [ref]$didActivate
         ShouldActivate    = [ref]$shouldActivate
+        Activating        = [ref]$false
+        ActivationQueued  = [ref]$false
         Timer             = $timer
         FocusWatchTimer   = $focusWatchTimer
         Form              = $form
+        Panel             = $panel
+        AppLabel          = $appLabel
+        CloseLabel        = $closeLabel
+        SessionLabel      = $sessionLabel
+        TitleLabel        = $titleLabel
+        BodyLabel         = $bodyLabel
     }
     $form.Tag = $popupTag
     # Timer has no Tag property; attach popupTag as NoteProperty for Tick events to read
@@ -1063,7 +1148,9 @@ function Show-NotifyBrokerPopup {
         $tag.ShouldActivate.Value = $true
         Write-NotifyBrokerLog -Message ('broker-popup-click popupId={0}' -f $tag.PopupId)
         Write-NotifyBrokerLog -Message ('broker-action activate popupId={0} targetFingerprint={1}' -f $tag.PopupId, $tag.TargetFingerprint)
-        $this.FindForm().Close()
+        Set-NotifyBrokerPopupActivating -Tag $tag
+        $tag.ActivationQueued.Value = $true
+        Queue-NotifyBrokerActivation -TargetHost $tag.TargetHost -CurrentDirBase $tag.TargetCwdBase -SourceTabTitleValue $tag.TargetSourceTabTitle -TargetFingerprint $tag.TargetFingerprint -PopupId $tag.PopupId -FormToClose $tag.Form
     }
 
     $closeAction = {
@@ -1121,8 +1208,8 @@ function Show-NotifyBrokerPopup {
         Remove-NotifyBrokerLiveState -PopupId $tag.PopupId
         $script:NotifyBrokerActivePopups.Remove($tag.PopupId) | Out-Null
 
-        if ($tag.ShouldActivate.Value) {
-            Queue-NotifyBrokerActivation -TargetHost $tag.TargetHost -CurrentDirBase $tag.TargetCwdBase -SourceTabTitleValue $tag.TargetSourceTabTitle -TargetFingerprint $tag.TargetFingerprint
+        if ($tag.ShouldActivate.Value -and -not $tag.ActivationQueued.Value) {
+            Queue-NotifyBrokerActivation -TargetHost $tag.TargetHost -CurrentDirBase $tag.TargetCwdBase -SourceTabTitleValue $tag.TargetSourceTabTitle -TargetFingerprint $tag.TargetFingerprint -PopupId $tag.PopupId
         }
     })
 
@@ -1157,9 +1244,16 @@ function Close-NotifyBrokerPopup {
         Write-NotifyBrokerLog -Message ('broker-close-by-id popupId={0} activate={1}' -f $PopupId, $Activate)
         try {
             if ($Activate -and $entry.Form.Tag -and $entry.Form.Tag.ShouldActivate) {
-                $entry.Form.Tag.ShouldActivate.Value = $true
+                $tag = $entry.Form.Tag
+                $tag.ShouldActivate.Value = $true
+                if ($tag.ContainsKey('DidActivate')) { $tag.DidActivate.Value = $true }
+                Set-NotifyBrokerPopupActivating -Tag $tag
+                $tag.ActivationQueued.Value = $true
+                Queue-NotifyBrokerActivation -TargetHost $tag.TargetHost -CurrentDirBase $tag.TargetCwdBase -SourceTabTitleValue $tag.TargetSourceTabTitle -TargetFingerprint $tag.TargetFingerprint -PopupId $tag.PopupId -FormToClose $tag.Form
             }
-            $entry.Form.Close()
+            else {
+                $entry.Form.Close()
+            }
         } catch {}
     }
     else {

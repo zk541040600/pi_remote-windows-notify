@@ -213,6 +213,9 @@ if ($listenerTextForLaunch -notmatch 'Invoke-NotifyBrokerPopup[^\r\n]+-StackInde
 if ($hotkeyTextForArtifacts -notmatch 'brokerManaged' -or $hotkeyTextForArtifacts -notmatch 'BrokerCloseUrl' -or $hotkeyTextForArtifacts -notmatch '"activate":true' -or $hotkeyTextForArtifacts -notmatch 'pi-notify-broker.ps1') {
     throw 'Hotkey must recognize broker-managed popups and activate/close them via broker /close without killing the broker.'
 }
+if ($brokerText -notmatch 'Set-NotifyBrokerPopupActivating' -or $brokerText -notmatch '0x8df3' -or $brokerText -notmatch 'broker-activation-feedback' -or $brokerText -notmatch 'FormToClose') {
+    throw 'Broker activation must give immediate popup feedback and close the feedback card after focus activation finishes.'
+}
 if ($hotkeyTextForArtifacts -notmatch 'RegisterHotKey' -or $hotkeyTextForArtifacts -notmatch 'Start-NotifyHotkeyResident' -or $hotkeyTextForArtifacts -notmatch 'MOD_NOREPEAT' -or $hotkeyTextForArtifacts -notmatch 'ConvertTo-NotifyHotkeyRegistration') {
     throw 'Hotkey must run as a resident RegisterHotKey worker so single-modifier shortcuts like Alt+P work reliably.'
 }
