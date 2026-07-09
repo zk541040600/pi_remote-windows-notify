@@ -339,10 +339,10 @@ function Invoke-NotifyHotkeyOldestPopup {
 function ConvertTo-NotifyHotkeyRegistration {
     param([string]$HotkeyValue)
 
-    $value = if ([string]::IsNullOrWhiteSpace($HotkeyValue)) { 'Ctrl+{' } else { [string]$HotkeyValue }
+    $value = if ([string]::IsNullOrWhiteSpace($HotkeyValue)) { 'Alt+L' } else { [string]$HotkeyValue }
     $parts = @($value -split '\+' | ForEach-Object { $_.Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
     if ($parts.Count -lt 2) {
-        throw ('Invalid popupHotkey "{0}". Use Ctrl+{{, Alt+P, Ctrl+P, Ctrl+Alt+P, Shift+F8, or Win+P style syntax.' -f $value)
+        throw ('Invalid popupHotkey "{0}". Use Alt+L, Ctrl+{{, Alt+P, Ctrl+P, Ctrl+Alt+P, Shift+F8, or Win+P style syntax.' -f $value)
     }
 
     $baseModifiers = [uint32]0x4000 # MOD_NOREPEAT

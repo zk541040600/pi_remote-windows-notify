@@ -359,7 +359,7 @@ function Register-NotifyBridgePopupHotkeyShortcut {
         [string]$HotkeyScript,
         [Parameter(Mandatory = $true)]
         [string]$ConfigPathValue,
-        [string]$HotkeyValue = 'Ctrl+{',
+        [string]$HotkeyValue = 'Alt+L',
         [bool]$Enabled = $true
     )
 
@@ -541,7 +541,7 @@ function Normalize-NotifyBridgePopupHotkey {
 
     $normalized = if ([string]::IsNullOrWhiteSpace($Value)) { '' } else { [string]$Value.Trim() }
     if ([string]::IsNullOrWhiteSpace($normalized)) {
-        return 'Ctrl+{'
+        return 'Alt+L'
     }
     return $normalized
 }
@@ -775,7 +775,7 @@ function Ensure-NotifyBridgeConfig {
         Normalize-NotifyBridgePopupHotkey -Value ([string]$existing['popupHotkey'])
     }
     else {
-        'Ctrl+{'
+        'Alt+L'
     }
 
     $finalPopupHotkeyEnabled = if ($PSBoundParameters.ContainsKey('PopupHotkeyEnabled')) {
