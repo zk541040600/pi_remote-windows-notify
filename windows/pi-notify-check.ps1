@@ -161,6 +161,9 @@ if ($brokerText -notmatch 'WM_MOUSEACTIVATE' -or $brokerText -notmatch 'MA_NOACT
 if ($brokerText -notmatch 'NotifyBrokerTabCacheTtlSeconds' -or $brokerText -notmatch 'Test-NotifyBrokerTabCacheValid' -or $brokerText -notmatch 'GetWindowThreadProcessId') {
     throw 'Broker tab cache must use conservative TTL and liveness validation before reuse.'
 }
+if ($brokerText -notmatch '\$usedSlots = @\{\}' -or $brokerText -notmatch '\$reuseSlot = -1' -or $brokerText -notmatch 'StackIndex\s*=\s*\$StackIndex' -or $brokerText -match 'activeCount = @\(\$script:NotifyBrokerActivePopups\.Keys\)\.Count') {
+    throw 'Broker popup stacking must track occupied slots and reuse the first free slot instead of deriving slot from active popup count.'
+}
 # Broker must be in refresh/autostart/restart runtime file lists
 $refreshTextForBroker = [System.IO.File]::ReadAllText((Join-Path $PSScriptRoot 'pi-notify-refresh.ps1'), [System.Text.UTF8Encoding]::new($false))
 $autostartTextForBroker = [System.IO.File]::ReadAllText((Join-Path $PSScriptRoot 'install-windows-autostart.ps1'), [System.Text.UTF8Encoding]::new($false))
@@ -177,7 +180,7 @@ if ($autostartTextForBroker -notmatch 'PiNotifyBroker.vbs' -or $autostartTextFor
 }
 # Watchdog broker supervision and stale-listener fix
 $watchdogTextForBroker = [System.IO.File]::ReadAllText((Join-Path $PSScriptRoot 'pi-notify-watchdog.ps1'), [System.Text.UTF8Encoding]::new($false))
-if ($watchdogTextForBroker -notmatch 'Test-NotifyBrokerHealth' -or $watchdogTextForBroker -notmatch 'NotifyWatchdogBrokerMisses' -or $watchdogTextForBroker -notmatch 'broker-restart-requested') {
+if ($watchdogTextForBroker -notmatch 'Test-NotifyBrokerHealth' -or $watchdogTextForBroker -notmatch 'NotifyWatchdogBrokerMisses\s*=\s*0' -or $watchdogTextForBroker -notmatch 'broker-restart-requested') {
     throw 'Watchdog must supervise broker health and restart it when missing or unhealthy.'
 }
 if ($watchdogTextForBroker -notmatch 'if \(\$listenerOk\)' -or $watchdogTextForBroker -notmatch '\$duplicateListener') {
@@ -188,6 +191,15 @@ $listenerTextForLaunch = [System.IO.File]::ReadAllText((Join-Path $PSScriptRoot 
 $hotkeyTextForArtifacts = [System.IO.File]::ReadAllText((Join-Path $PSScriptRoot 'pi-notify-hotkey.ps1'), [System.Text.UTF8Encoding]::new($false))
 if ($listenerTextForLaunch -notmatch 'Invoke-NotifyBrokerPopup' -or $listenerTextForLaunch -notmatch 'Start-NotifyPopupProcess' -or $listenerTextForLaunch -notmatch 'broker-unavailable fallback=popup-process' -or $listenerTextForLaunch -notmatch 'broker-post-failed fallback=popup-process' -or $listenerTextForLaunch -notmatch 'Get-NotifyBrokerProcessIds' -or $listenerTextForLaunch -notmatch 'broker-start-skip existing') {
     throw 'Listener must prefer broker for popup-focus, avoid duplicate broker starts, and fall back to pi-notify-popup.ps1 process on bounded failure.'
+}
+if ($listenerTextForLaunch -notmatch 'Dictionary\[string,string\][\s\S]{0,120}OrdinalIgnoreCase' -or ([regex]::Matches($brokerText, 'Dictionary\[string,string\][\s\S]{0,120}OrdinalIgnoreCase')).Count -lt 2) {
+    throw 'Listener and broker HTTP parsers must treat headers as case-insensitive so Node fetch lowercase content-length is honored.'
+}
+if ($listenerTextForLaunch -notmatch 'ContentLength\s*=\s*\$bodyBytes\.Length' -or ([regex]::Matches($hotkeyTextForArtifacts, 'ContentLength\s*=\s*\$closeBytes\.Length')).Count -lt 2) {
+    throw 'Broker popup/close POST requests must set ContentLength for the raw TCP HTTP broker parser.'
+}
+if ($listenerTextForLaunch -notmatch 'Invoke-NotifyBrokerPopup[^\r\n]+-StackIndex -1') {
+    throw 'Listener must let the broker allocate popup stack slots; otherwise broker-managed popups overlap at slot 0.'
 }
 # Hotkey broker compatibility
 if ($hotkeyTextForArtifacts -notmatch 'brokerManaged' -or $hotkeyTextForArtifacts -notmatch 'BrokerCloseUrl' -or $hotkeyTextForArtifacts -notmatch '"activate":true' -or $hotkeyTextForArtifacts -notmatch 'pi-notify-broker.ps1') {
@@ -268,7 +280,7 @@ if ($refreshTextForArtifacts -notmatch 'Clear-NotifyPopupRuntimeArtifacts' -or $
 }
 $restartText = [System.IO.File]::ReadAllText((Join-Path $PSScriptRoot 'pi-notify-restart-listener.ps1'), [System.Text.UTF8Encoding]::new($false))
 $runnerText = [System.IO.File]::ReadAllText((Join-Path $PSScriptRoot 'pi-notify-listener-runner.ps1'), [System.Text.UTF8Encoding]::new($false))
-if ($restartText -notmatch 'Sync-LocalRuntimeFiles' -or $restartText -notmatch 'notify-listener\.ps1' -or $restartText -notmatch 'pi-notify-listener-runner\.ps1' -or $restartText -notmatch 'Test-NotifyProcessOwnedByThisInstance' -or $restartText -notmatch 'Test-NotifyCommandLineContainsPath' -or $restartText -notmatch 'skip unowned listener process' -or $restartText -notmatch 'Split-Path -Parent \$ConfigPath' -or $restartText -match '\$baseDir = "\$env:USERPROFILE\\.pi-notify"') {
+if ($restartText -notmatch 'Sync-LocalRuntimeFiles' -or $restartText -notmatch 'notify-listener\.ps1' -or $restartText -notmatch 'pi-notify-listener-runner\.ps1' -or $restartText -notmatch 'popup-wallpaper\.png' -or $restartText -notmatch 'Test-NotifyProcessOwnedByThisInstance' -or $restartText -notmatch 'Test-NotifyCommandLineContainsPath' -or $restartText -notmatch 'skip unowned listener process' -or $restartText -notmatch 'Split-Path -Parent \$ConfigPath' -or $restartText -match '\$baseDir = "\$env:USERPROFILE\\.pi-notify"') {
     throw 'Restart listener must bootstrap required runtime files and derive instance base from ConfigPath.'
 }
 $refreshHasWatchdogDelay = ($refreshTextForArtifacts -match "'-StartupDelaySeconds', '5'" -or $refreshTextForArtifacts -match '-StartupDelaySeconds 5')

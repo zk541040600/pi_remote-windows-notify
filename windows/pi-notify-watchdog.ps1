@@ -20,6 +20,7 @@ $script:NotifyWatchdogMutex = $null
 $script:NotifyWatchdogHasLock = $false
 $script:NotifyWatchdogListenerMisses = 0
 $script:NotifyWatchdogTunnelMisses = 0
+$script:NotifyWatchdogBrokerMisses = 0
 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $script:NotifyWatchdogLogPath) | Out-Null
 
 function Write-NotifyWatchdogLog {

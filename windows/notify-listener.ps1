@@ -128,7 +128,7 @@ function Read-HttpRequest {
         throw "Missing HTTP request line."
     }
 
-    $headers = @{}
+    $headers = [System.Collections.Generic.Dictionary[string,string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     if ($lines.Length -gt 1) {
         foreach ($line in $lines[1..($lines.Length - 1)]) {
             if ([string]::IsNullOrWhiteSpace($line)) {
@@ -545,6 +545,7 @@ function Send-NotifyBrokerPopup {
         $request = [System.Net.HttpWebRequest]::Create($config.BrokerPopupUrl)
         $request.Method = 'POST'
         $request.ContentType = 'application/json; charset=utf-8'
+        $request.ContentLength = $bodyBytes.Length
         $request.Timeout = $config.BrokerRequestTimeoutMs
         $request.ReadWriteTimeout = $config.BrokerRequestTimeoutMs
         $requestStream = $request.GetRequestStream()
@@ -671,7 +672,7 @@ function Show-Toast {
         $targetKey = Get-NotifyPopupTargetKey -TargetHost $focusTarget -CwdBase $cwdBase -TabTitle $tabTitle
         $targetFingerprint = Get-NotifyPopupTargetFingerprint -TargetKey $targetKey
 
-        $brokerSent = Invoke-NotifyBrokerPopup -Title $Title -Body $Body -FocusTarget $focusTarget -CwdBase $cwdBase -TabTitle $tabTitle -SessionName $sessionName -TargetFingerprint $targetFingerprint -StackIndex 0 -TimeoutSeconds $PopupTimeoutSeconds -PopupPlacement ([string]$config.PopupPlacement)
+        $brokerSent = Invoke-NotifyBrokerPopup -Title $Title -Body $Body -FocusTarget $focusTarget -CwdBase $cwdBase -TabTitle $tabTitle -SessionName $sessionName -TargetFingerprint $targetFingerprint -StackIndex -1 -TimeoutSeconds $PopupTimeoutSeconds -PopupPlacement ([string]$config.PopupPlacement)
         if ($brokerSent) {
             return
         }

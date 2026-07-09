@@ -213,6 +213,7 @@ function Start-NotifyHotkeyActivation {
             $closeReq = [System.Net.HttpWebRequest]::Create($brokerCloseUrl)
             $closeReq.Method = 'POST'
             $closeReq.ContentType = 'application/json; charset=utf-8'
+            $closeReq.ContentLength = $closeBytes.Length
             $closeReq.Timeout = 2000
             $closeReq.ReadWriteTimeout = 2000
             $closeStream = $closeReq.GetRequestStream()
@@ -252,6 +253,7 @@ function Start-NotifyHotkeyActivation {
                     $closeReq = [System.Net.HttpWebRequest]::Create($brokerCloseUrl)
                     $closeReq.Method = 'POST'
                     $closeReq.ContentType = 'application/json; charset=utf-8'
+                    $closeReq.ContentLength = $closeBytes.Length
                     $closeReq.Timeout = 2000
                     $closeReq.ReadWriteTimeout = 2000
                     $closeStream = $closeReq.GetRequestStream()

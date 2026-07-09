@@ -753,19 +753,44 @@ function Show-NotifyBrokerPopup {
         [string]$PopupPlacementValue
     )
 
-    # Replace older popups with the same target
+    $usedSlots = @{}
+    $reuseSlot = -1
+
+    # Replace older popups with the same target and keep enough slot state to avoid overlap.
     foreach ($existingId in @($script:NotifyBrokerActivePopups.Keys)) {
         $existing = $script:NotifyBrokerActivePopups[$existingId]
+        $existingSlot = -1
+        try { $existingSlot = [int]$existing.StackIndex } catch { $existingSlot = -1 }
         if ($existing.TargetFingerprint -eq $TargetFingerprint -and $existing.PopupId -ne $PopupId) {
+            if ($existingSlot -ge 0 -and ($reuseSlot -lt 0 -or $existingSlot -lt $reuseSlot)) {
+                $reuseSlot = $existingSlot
+            }
             Write-NotifyBrokerLog -Message ('broker-popup-replace-same-target popupId={0} oldPopupId={1} targetFingerprint={2}' -f $PopupId, $existingId, $TargetFingerprint)
             try { $existing.Form.Close() } catch {}
+            continue
+        }
+
+        if ($existingSlot -ge 0) {
+            $usedSlots[[string]$existingSlot] = $true
         }
     }
 
-    # Compute stack index from currently active popups (broker owns stacking)
-    $activeCount = @($script:NotifyBrokerActivePopups.Keys).Count
-    if ($StackIndex -lt 0) { $StackIndex = $activeCount }
+    # Compute stack index from active popup slots (broker owns stacking).
+    if ($StackIndex -lt 0) {
+        if ($reuseSlot -ge 0 -and -not $usedSlots.ContainsKey([string]$reuseSlot)) {
+            $StackIndex = $reuseSlot
+        }
+        else {
+            for ($slot = 0; $slot -lt 64; $slot++) {
+                if (-not $usedSlots.ContainsKey([string]$slot)) {
+                    $StackIndex = $slot
+                    break
+                }
+            }
+        }
+    }
     if ($StackIndex -gt 63) { $StackIndex = 63 }
+    if ($StackIndex -lt 0) { $StackIndex = 63 }
 
     $cardColor = [System.Drawing.Color]::FromArgb(28, 30, 36)
     $borderColor = [System.Drawing.Color]::FromArgb(74, 80, 96)
@@ -1009,6 +1034,7 @@ function Show-NotifyBrokerPopup {
         PopupId           = $PopupId
         Form              = $form
         TargetFingerprint = $TargetFingerprint
+        StackIndex        = $StackIndex
     }
     Write-NotifyBrokerLog -Message ('broker-popup-start popupId={0} targetFingerprint={1} hasCwd={2} hasTab={3} timeout={4} stackIndex={5}' -f $PopupId, $TargetFingerprint, (-not [string]::IsNullOrWhiteSpace($CwdBase)), (-not [string]::IsNullOrWhiteSpace($SourceTabTitle)), $TimeoutSeconds, $StackIndex)
     $form.Show()
@@ -1105,7 +1131,7 @@ function Read-NotifyBrokerHttpRequest {
         throw "Missing HTTP request line."
     }
 
-    $headers = @{}
+    $headers = [System.Collections.Generic.Dictionary[string,string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     if ($lines.Length -gt 1) {
         foreach ($line in $lines[1..($lines.Length - 1)]) {
             if ([string]::IsNullOrWhiteSpace($line)) {
@@ -1269,7 +1295,7 @@ function Read-BgRequest($Stream) {
     $requestLine = if ($lines.Length -gt 0) { [string]$lines[0] } else { '' }
     $requestLine = $requestLine.Trim()
     if ([string]::IsNullOrWhiteSpace($requestLine)) { throw "Missing HTTP request line." }
-    $headers = @{}
+    $headers = [System.Collections.Generic.Dictionary[string,string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     if ($lines.Length -gt 1) {
         foreach ($line in $lines[1..($lines.Length - 1)]) {
             if ([string]::IsNullOrWhiteSpace($line)) { continue }
