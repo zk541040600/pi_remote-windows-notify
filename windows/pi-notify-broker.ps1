@@ -121,6 +121,8 @@ $script:NotifyBrokerSwpShowNoActivate = [uint32](0x0010 -bor 0x0040)
 $script:NotifyBrokerPopupMaxVisible = 4
 $script:NotifyBrokerActivationQueue = $null
 $script:NotifyBrokerActivationTimer = $null
+$script:NotifyBrokerPrewarmQueue = $null
+$script:NotifyBrokerPrewarmTimer = $null
 if ($config.PSObject.Properties['PopupMaxVisible']) {
     try { $script:NotifyBrokerPopupMaxVisible = [Math]::Max(1, [Math]::Min(8, [int]$config.PopupMaxVisible)) } catch { $script:NotifyBrokerPopupMaxVisible = 4 }
 }
@@ -590,6 +592,133 @@ function Get-NotifyBrokerTabCacheCandidate {
     }
 
     return $null
+}
+
+function Update-NotifyBrokerTabCacheForTarget {
+    param(
+        [string]$TargetHost,
+        [string]$CurrentDirBase,
+        [string]$SourceTabTitleValue,
+        [string]$TargetFingerprint
+    )
+
+    $startedAt = [DateTime]::UtcNow
+    try {
+        $cacheCandidate = Get-NotifyBrokerTabCacheCandidate -TargetFingerprint $TargetFingerprint -CurrentDirBase $CurrentDirBase -SourceTabTitleValue $SourceTabTitleValue
+        if ($null -ne $cacheCandidate) {
+            Write-NotifyBrokerLog -Message ('broker-prewarm-cache-hit source={0} targetFingerprint={1} elapsedMs={2}' -f $cacheCandidate.Source, $TargetFingerprint, [int]([DateTime]::UtcNow - $startedAt).TotalMilliseconds)
+            return
+        }
+
+        $requiresCwdMatch = -not [string]::IsNullOrWhiteSpace($CurrentDirBase)
+        $hasPreciseSourceTitle = -not [string]::IsNullOrWhiteSpace($SourceTabTitleValue)
+        if (-not $requiresCwdMatch -and -not $hasPreciseSourceTitle) {
+            Write-NotifyBrokerLog -Message ('broker-prewarm-skip missing-target-metadata targetFingerprint={0}' -f $TargetFingerprint)
+            return
+        }
+
+        $keywords = @($SourceTabTitleValue, $CurrentDirBase, $TargetHost) |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+            ForEach-Object { $_.Trim() } |
+            Select-Object -Unique
+
+        $best = $null
+        $windows = @(Get-NotifyBrokerWindows -TerminalOnly)
+        Write-NotifyBrokerLog -Message ('broker-prewarm-scan windows={0} targetFingerprint={1}' -f $windows.Count, $TargetFingerprint)
+        foreach ($window in $windows) {
+            $baseScore = 0
+            foreach ($keyword in $keywords) {
+                if ($window.Title.IndexOf($keyword, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { $baseScore += 20 }
+            }
+            $tabs = @(Get-NotifyBrokerTabs -Handle $window.Handle)
+            if ($tabs.Count -eq 0) { continue }
+            foreach ($tab in $tabs) {
+                $score = $baseScore
+                $matchedKeywords = New-Object System.Collections.Generic.List[string]
+                foreach ($keyword in $keywords) {
+                    if (-not [string]::IsNullOrWhiteSpace($tab.Name) -and $tab.Name.IndexOf($keyword, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                        $score += 120
+                        [void]$matchedKeywords.Add($keyword)
+                    }
+                }
+                $sourceTabTitleMatch = -not [string]::IsNullOrWhiteSpace($SourceTabTitleValue) -and -not [string]::IsNullOrWhiteSpace($tab.Name) -and $tab.Name.IndexOf($SourceTabTitleValue, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+                if ($sourceTabTitleMatch) { $score += 300 }
+                $windowCwdMatch = $requiresCwdMatch -and $window.Title.IndexOf($CurrentDirBase, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+                $cwdKeywordMatch = $requiresCwdMatch -and (($matchedKeywords -contains $CurrentDirBase) -or $windowCwdMatch)
+                if ($hasPreciseSourceTitle -and -not $sourceTabTitleMatch -and -not $cwdKeywordMatch) { $score = 0 }
+                elseif ($requiresCwdMatch -and -not $sourceTabTitleMatch -and -not $cwdKeywordMatch) { $score = 0 }
+                if ($score -le 0) { continue }
+                $candidate = [pscustomobject]@{ Window = $window; Score = $score; Tab = $tab.Element; TabName = $tab.Name; TabIndex = $tab.Index }
+                if ($null -eq $best -or $candidate.Score -gt $best.Score) { $best = $candidate }
+            }
+        }
+
+        if ($null -ne $best) {
+            Update-NotifyBrokerTabCache -Best $best -TargetFingerprint $TargetFingerprint
+            Write-NotifyBrokerLog -Message ('broker-prewarm-cache-updated tabFingerprint={0} targetFingerprint={1} elapsedMs={2}' -f (Get-NotifyBrokerContextFingerprint -Value $best.TabName), $TargetFingerprint, [int]([DateTime]::UtcNow - $startedAt).TotalMilliseconds)
+        }
+        else {
+            Write-NotifyBrokerLog -Message ('broker-prewarm-miss targetFingerprint={0} elapsedMs={1}' -f $TargetFingerprint, [int]([DateTime]::UtcNow - $startedAt).TotalMilliseconds)
+        }
+    }
+    catch {
+        Write-NotifyBrokerLog -Message ('broker-prewarm-error targetFingerprint={0} "{1}"' -f $TargetFingerprint, $_.Exception.Message)
+    }
+}
+
+function Queue-NotifyBrokerPrewarm {
+    param(
+        [string]$TargetHost,
+        [string]$CurrentDirBase,
+        [string]$SourceTabTitleValue,
+        [string]$TargetFingerprint,
+        [string]$PopupId = ''
+    )
+
+    if ($null -eq $script:NotifyBrokerPrewarmQueue) { $script:NotifyBrokerPrewarmQueue = [System.Collections.Generic.Queue[object]]::new() }
+    if ($null -eq $script:NotifyBrokerPrewarmTimer) {
+        $script:NotifyBrokerPrewarmTimer = New-Object System.Windows.Forms.Timer
+        $script:NotifyBrokerPrewarmTimer.Interval = 150
+        $script:NotifyBrokerPrewarmTimer.Add_Tick({
+            $this.Stop()
+            if ($null -eq $script:NotifyBrokerPrewarmQueue -or $script:NotifyBrokerPrewarmQueue.Count -le 0) { return }
+            $request = $script:NotifyBrokerPrewarmQueue.Dequeue()
+            Write-NotifyBrokerLog -Message ('broker-prewarm-start popupId={0} targetFingerprint={1}' -f $request.PopupId, $request.TargetFingerprint)
+            Update-NotifyBrokerTabCacheForTarget -TargetHost $request.TargetHost -CurrentDirBase $request.CurrentDirBase -SourceTabTitleValue $request.SourceTabTitleValue -TargetFingerprint $request.TargetFingerprint
+            if ($script:NotifyBrokerPrewarmQueue.Count -gt 0) { $this.Start() }
+        })
+    }
+
+    $script:NotifyBrokerPrewarmQueue.Enqueue([pscustomobject]@{
+        TargetHost = $TargetHost
+        CurrentDirBase = $CurrentDirBase
+        SourceTabTitleValue = $SourceTabTitleValue
+        TargetFingerprint = $TargetFingerprint
+        PopupId = $PopupId
+    })
+    Write-NotifyBrokerLog -Message ('broker-prewarm-queued popupId={0} targetFingerprint={1}' -f $PopupId, $TargetFingerprint)
+    $script:NotifyBrokerPrewarmTimer.Start()
+}
+
+function Invoke-NotifyBrokerOldestPopupActivation {
+    $entries = @($script:NotifyBrokerActivePopups.Values | Sort-Object { if ($_.PSObject.Properties['CreatedAtUtc']) { $_.CreatedAtUtc } else { [DateTime]::MinValue } }, { if ($_.PSObject.Properties['StackIndex']) { [int]$_.StackIndex } else { 0 } })
+    if ($entries.Count -eq 0) {
+        Write-NotifyBrokerLog -Message 'broker-activate-oldest no-active-popups'
+        return $false
+    }
+    $entry = $entries[0]
+    $tag = $entry.Form.Tag
+    if ($null -eq $tag) {
+        Write-NotifyBrokerLog -Message ('broker-activate-oldest missing-tag popupId={0}' -f $entry.PopupId)
+        return $false
+    }
+    Write-NotifyBrokerLog -Message ('broker-activate-oldest popupId={0} targetFingerprint={1}' -f $tag.PopupId, $tag.TargetFingerprint)
+    $tag.ShouldActivate.Value = $true
+    if ($tag.ContainsKey('DidActivate')) { $tag.DidActivate.Value = $true }
+    Set-NotifyBrokerPopupActivating -Tag $tag
+    $tag.ActivationQueued.Value = $true
+    Queue-NotifyBrokerActivation -TargetHost $tag.TargetHost -CurrentDirBase $tag.TargetCwdBase -SourceTabTitleValue $tag.TargetSourceTabTitle -TargetFingerprint $tag.TargetFingerprint -PopupId $tag.PopupId -FormToClose $tag.Form
+    return $true
 }
 
 function Queue-NotifyBrokerActivation {
@@ -1190,6 +1319,7 @@ function Show-NotifyBrokerPopup {
         $tag = $this.Tag
         [void][PiNotifyBrokerUser32]::SetWindowPos($this.Handle, $script:NotifyBrokerHwndTopMost, $this.Left, $this.Top, $this.Width, $this.Height, $script:NotifyBrokerSwpShowNoActivate)
         Write-NotifyBrokerLog -Message ('broker-shown popupId={0} stackIndex={1} placement={2} targetFingerprint={3} elapsedMs={4}' -f $tag.PopupId, $tag.StackIndex, $tag.PopupPlacement, $tag.TargetFingerprint, [int]([DateTime]::UtcNow - $tag.CreatedAtUtc).TotalMilliseconds)
+        Queue-NotifyBrokerPrewarm -TargetHost $tag.TargetHost -CurrentDirBase $tag.TargetCwdBase -SourceTabTitleValue $tag.TargetSourceTabTitle -TargetFingerprint $tag.TargetFingerprint -PopupId $tag.PopupId
         $tag.Timer.Start()
         $tag.FocusWatchTimer.Start()
     })
@@ -1544,7 +1674,7 @@ while ($true) {
             Write-BgResponse -Stream $stream -StatusCode 405 -Reason 'Method Not Allowed' -Body '{"ok":false}' -ContentType 'application/json; charset=utf-8'
             continue
         }
-        if ($path -eq '/popup' -or $path -eq '/close') {
+        if ($path -eq '/popup' -or $path -eq '/close' -or $path -eq '/activate-oldest') {
             $bodyText = if ($request.BodyBytes.Length -gt 0) { [System.Text.Encoding]::UTF8.GetString($request.BodyBytes) } else { '' }
             $Queue.Enqueue([pscustomobject]@{ Action = $path; Body = $bodyText; ReceivedAt = [DateTime]::UtcNow })
             Write-BgResponse -Stream $stream -StatusCode 200 -Reason 'OK' -Body '{"ok":true}' -ContentType 'application/json; charset=utf-8'
@@ -1642,6 +1772,9 @@ $script:NotifyBrokerDispatchTimer.Add_Tick({
                 if (-not [string]::IsNullOrWhiteSpace($closePopupId)) {
                     Close-NotifyBrokerPopup -PopupId $closePopupId -Activate $closeActivate
                 }
+            }
+            elseif ($item.Action -eq '/activate-oldest') {
+                [void](Invoke-NotifyBrokerOldestPopupActivation)
             }
         }
         catch {

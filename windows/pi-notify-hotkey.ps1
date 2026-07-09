@@ -326,7 +326,36 @@ function Start-NotifyHotkeyActivation {
     return $false
 }
 
+function Invoke-NotifyHotkeyBrokerActivateOldest {
+    $brokerActivateOldestUrl = $null
+    if ($config.PSObject.Properties['BrokerPort']) {
+        $brokerActivateOldestUrl = ('http://127.0.0.1:{0}/activate-oldest' -f [int]$config.BrokerPort)
+    }
+    if ([string]::IsNullOrWhiteSpace($brokerActivateOldestUrl)) { return $false }
+    try {
+        $payloadBytes = [System.Text.Encoding]::UTF8.GetBytes('{}')
+        $req = [System.Net.HttpWebRequest]::Create($brokerActivateOldestUrl)
+        $req.Method = 'POST'
+        $req.ContentType = 'application/json; charset=utf-8'
+        $req.ContentLength = $payloadBytes.Length
+        $req.Timeout = 700
+        $req.ReadWriteTimeout = 700
+        $stream = $req.GetRequestStream()
+        try { $stream.Write($payloadBytes, 0, $payloadBytes.Length) } finally { $stream.Close() }
+        $resp = $req.GetResponse()
+        try { } finally { $resp.Close() }
+        Write-NotifyHotkeyLog -Message 'broker-activate-oldest-request'
+        return $true
+    }
+    catch {
+        Write-NotifyHotkeyLog -Message ('broker-activate-oldest-fallback "{0}"' -f $_.Exception.Message)
+        return $false
+    }
+}
+
 function Invoke-NotifyHotkeyOldestPopup {
+    if (Invoke-NotifyHotkeyBrokerActivateOldest) { return $true }
+
     $states = @(Get-NotifyHotkeyLivePopupStates)
     if ($states.Count -eq 0) {
         Write-NotifyHotkeyLog -Message 'hotkey-no-live-popups'

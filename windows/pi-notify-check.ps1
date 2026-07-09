@@ -216,6 +216,12 @@ if ($hotkeyTextForArtifacts -notmatch 'brokerManaged' -or $hotkeyTextForArtifact
 if ($brokerText -notmatch 'Set-NotifyBrokerPopupActivating' -or $brokerText -notmatch '0x8df3' -or $brokerText -notmatch 'broker-activation-feedback' -or $brokerText -notmatch 'FormToClose') {
     throw 'Broker activation must give immediate popup feedback and close the feedback card after focus activation finishes.'
 }
+if ($brokerText -notmatch '/activate-oldest' -or $brokerText -notmatch 'Invoke-NotifyBrokerOldestPopupActivation' -or $hotkeyTextForArtifacts -notmatch 'Invoke-NotifyHotkeyBrokerActivateOldest') {
+    throw 'Hotkey must prefer broker /activate-oldest so Alt+L avoids popup-live file scan on the fast path.'
+}
+if ($brokerText -notmatch 'Queue-NotifyBrokerPrewarm' -or $brokerText -notmatch 'Update-NotifyBrokerTabCacheForTarget' -or $brokerText -notmatch 'broker-prewarm-cache-updated') {
+    throw 'Broker must prewarm target tab cache after popup display to reduce activation cache misses.'
+}
 if ($hotkeyTextForArtifacts -notmatch 'RegisterHotKey' -or $hotkeyTextForArtifacts -notmatch 'Start-NotifyHotkeyResident' -or $hotkeyTextForArtifacts -notmatch 'MOD_NOREPEAT' -or $hotkeyTextForArtifacts -notmatch 'ConvertTo-NotifyHotkeyRegistration') {
     throw 'Hotkey must run as a resident RegisterHotKey worker so single-modifier shortcuts like Alt+P work reliably.'
 }
