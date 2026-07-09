@@ -1,7 +1,7 @@
 param(
     [string]$ConfigPath = "$env:USERPROFILE\.pi-notify\config.json",
     [string]$DisplayMode = "popup-focus",
-    [int]$PopupTimeout = 300,
+    [int]$PopupTimeout = 1800,
     [string]$PopupPlacement = "cursor",
     [int]$Port = 23118,
     [switch]$Pull,

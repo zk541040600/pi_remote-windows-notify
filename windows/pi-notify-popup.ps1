@@ -9,7 +9,7 @@ param(
     [string]$PayloadPath,
     [string]$TargetFingerprint,
     [string]$ConfigPath,
-    [int]$TimeoutSeconds = 18,
+    [int]$TimeoutSeconds = 1800,
     [int]$StackIndex = 0
 )
 

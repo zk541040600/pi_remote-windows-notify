@@ -109,7 +109,7 @@ They start at user logon. `PiNotifyListener.vbs` invokes `pi-notify-restart-list
 powershell.exe -ExecutionPolicy Bypass -File .\scripts\pi-notify\pi-notify-refresh.ps1
 ```
 
-By default this sets `popup-focus`, `popupPlacement=cursor`, and a 300 second timeout, syncs Windows runtime files, restarts the listener, and restarts the reverse tunnel. Add `-Pull` to run a fast-forward-only git pull. Add `-SyncRemote` to sync the remote `my` extension/config and update any existing Pi package-cache extension copies. When using a non-default remote Pi directory, pass `-RemotePiDir` together with `-SyncRemote` so refresh updates the same directory that autostart installed. Use `-SkipRemoteSync` only when the remote host is unavailable and you know the remote config is already current.
+By default this sets `popup-focus`, `popupPlacement=cursor`, and a 1800 second (30 minute) timeout, syncs Windows runtime files, restarts the listener, and restarts the reverse tunnel. Add `-Pull` to run a fast-forward-only git pull. Add `-SyncRemote` to sync the remote `my` extension/config and update any existing Pi package-cache extension copies. When using a non-default remote Pi directory, pass `-RemotePiDir` together with `-SyncRemote` so refresh updates the same directory that autostart installed. Use `-SkipRemoteSync` only when the remote host is unavailable and you know the remote config is already current.
 
 Run the fixed-root check script when validating from another working directory:
 
@@ -183,7 +183,7 @@ Important keys:
   "tunnelRetryDelaySeconds": 5,
   "tunnelStartupDelaySeconds": 15,
   "displayMode": "system-toast",
-  "popupTimeoutSeconds": 18,
+  "popupTimeoutSeconds": 1800,
   "popupWallpaperPath": "C:/Users/Administrator/.pi-notify/bin/popup-wallpaper.png",
   "popupPlacement": "cursor",
   "popupHotkey": "Alt+L",

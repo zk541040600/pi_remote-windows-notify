@@ -106,7 +106,7 @@ $customProbeConfig = Join-Path $customProbeBase 'config.json'
 try {
     . (Join-Path $PSScriptRoot 'NotifyBridge.Common.ps1')
     $probeConfig = Ensure-NotifyBridgeConfig -ConfigPath $customProbeConfig -Port 23119 -SshExecutable 'ssh.exe' -RemoteHostAlias 'probe' -TunnelStartupDelaySeconds 0
-    if ((Get-NotifyBridgeBaseDir) -ne $customProbeBase -or (Get-NotifyBridgeBinDir) -ne (Join-Path $customProbeBase 'bin') -or (Get-NotifyBridgeLogDir) -ne (Join-Path $customProbeBase 'logs') -or [int]$probeConfig.TunnelStartupDelaySeconds -lt 5) {
+    if ((Get-NotifyBridgeBaseDir) -ne $customProbeBase -or (Get-NotifyBridgeBinDir) -ne (Join-Path $customProbeBase 'bin') -or (Get-NotifyBridgeLogDir) -ne (Join-Path $customProbeBase 'logs') -or [int]$probeConfig.TunnelStartupDelaySeconds -lt 5 -or [int]$probeConfig.PopupTimeoutSeconds -ne 1800) {
         throw 'ConfigPath probe failed.'
     }
     $reloadProbeConfig = Ensure-NotifyBridgeConfig -ConfigPath $customProbeConfig
@@ -179,8 +179,8 @@ $remoteInstallTextForBroker = [System.IO.File]::ReadAllText((Join-Path $PSScript
 if ($refreshTextForBroker -notmatch "'pi-notify-broker.ps1'" -or $autostartTextForBroker -notmatch "'pi-notify-broker.ps1'" -or $restartTextForBroker -notmatch "'pi-notify-broker.ps1'" -or $remoteInstallTextForBroker -notmatch "'pi-notify-broker.ps1'") {
     throw 'Broker script must be included in refresh/autostart/restart/remote-install runtime file lists.'
 }
-if ($refreshTextForBroker -notmatch 'Stop-NotifyBrokerProcesses' -or $refreshTextForBroker -notmatch 'Start-NotifyBroker') {
-    throw 'Refresh must stop and start the broker alongside listener/watchdog.'
+if ($refreshTextForBroker -notmatch 'Stop-NotifyBrokerProcesses' -or $refreshTextForBroker -notmatch 'Start-NotifyBroker' -or $refreshTextForBroker -notmatch '\[int\]\$PopupTimeout\s*=\s*1800') {
+    throw 'Refresh must stop and start the broker alongside listener/watchdog and default popup timeout to 30 minutes.'
 }
 if ($autostartTextForBroker -notmatch 'PiNotifyBroker.vbs' -or $autostartTextForBroker -notmatch '-STA') {
     throw 'Windows autostart must create a PiNotifyBroker.vbs launcher with -STA for the WinForms message loop.'

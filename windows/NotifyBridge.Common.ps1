@@ -745,7 +745,7 @@ function Ensure-NotifyBridgeConfig {
         [int]$existing['popupTimeoutSeconds']
     }
     else {
-        18
+        1800
     }
 
     $finalPopupPlacement = if ($PSBoundParameters.ContainsKey('PopupPlacement')) {
