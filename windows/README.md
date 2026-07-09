@@ -235,7 +235,7 @@ Notification payloads may include:
 - `right` -> the right-most screen
 - `primary` -> the Windows primary screen
 
-`popupHotkey` defaults to `Ctrl+{` (registered as `Ctrl+Shift+[` on US-style keyboard layouts) and is registered by the resident `PiNotifyHotkey.vbs` startup worker, not a Start Menu shortcut. When multiple custom popup cards are visible, pressing it activates the oldest live popup's target tab and only dismisses that selected popup. Press it again to move through the remaining popups in age order. Set `popupHotkeyEnabled` to `false` to disable the global hotkey. `Alt+P`, `Ctrl+P`, function keys, and common OEM punctuation keys also work as config values; avoid `Ctrl+P` because it conflicts with print shortcuts.
+`popupHotkey` defaults to `Ctrl+{` (registered as `Ctrl+Shift+[` plus a `Ctrl+[` convenience alias on US-style keyboard layouts) and is registered by the resident `PiNotifyHotkey.vbs` startup worker, not a Start Menu shortcut. When multiple custom popup cards are visible, pressing it activates the oldest live popup's target tab and only dismisses that selected popup. Press it again to move through the remaining popups in age order. Set `popupHotkeyEnabled` to `false` to disable the global hotkey. `Alt+P`, `Ctrl+P`, function keys, and common OEM punctuation keys also work as config values; avoid `Ctrl+P` because it conflicts with print shortcuts.
 
 Template fields:
 

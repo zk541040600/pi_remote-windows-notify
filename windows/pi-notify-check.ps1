@@ -216,8 +216,8 @@ if ($hotkeyTextForArtifacts -notmatch 'brokerManaged' -or $hotkeyTextForArtifact
 if ($hotkeyTextForArtifacts -notmatch 'RegisterHotKey' -or $hotkeyTextForArtifacts -notmatch 'Start-NotifyHotkeyResident' -or $hotkeyTextForArtifacts -notmatch 'MOD_NOREPEAT' -or $hotkeyTextForArtifacts -notmatch 'ConvertTo-NotifyHotkeyRegistration') {
     throw 'Hotkey must run as a resident RegisterHotKey worker so single-modifier shortcuts like Alt+P work reliably.'
 }
-if ($hotkeyTextForArtifacts -notmatch '0xDB' -or $hotkeyTextForArtifacts -notmatch '\$requiresShift') {
-    throw 'Hotkey parser must support Ctrl+{ by registering Ctrl+Shift+[ / VK_OEM_4.'
+if ($hotkeyTextForArtifacts -notmatch '0xDB' -or $hotkeyTextForArtifacts -notmatch '\$requiresShift' -or $hotkeyTextForArtifacts -notmatch 'resident-register' -or $hotkeyTextForArtifacts -notmatch 'resident-fired') {
+    throw 'Hotkey parser must support Ctrl+{ by registering Ctrl+Shift+[ / VK_OEM_4 plus a Ctrl+[ alias.'
 }
 if ($refreshTextForArtifacts -notmatch 'PiNotifyHotkey\.vbs' -or $refreshTextForArtifacts -notmatch 'Start-NotifyHotkey' -or $refreshTextForArtifacts -notmatch 'Stop-NotifyHotkeyProcesses' -or $refreshTextForArtifacts -match 'Register-NotifyBridgePopupHotkeyShortcut') {
     throw 'Refresh must install/start the resident hotkey worker and must not rely on Start Menu shortcut hotkeys.'
