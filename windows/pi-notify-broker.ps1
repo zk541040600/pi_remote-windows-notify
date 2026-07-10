@@ -104,7 +104,14 @@ $script:NotifyBrokerLogPath = Join-Path (Get-NotifyBridgeLogDir) 'broker.log'
 $script:NotifyBrokerPidPath = Join-Path (Get-NotifyBridgeBaseDir) 'broker.pid'
 $script:NotifyBrokerMutex = $null
 $script:NotifyBrokerHasLock = $false
-New-Item -ItemType Directory -Force -Path (Split-Path -Parent $script:NotifyBrokerLogPath) | Out-Null
+# Share one lock between UI and background runspaces while keeping log files short-lived and readable.
+$script:NotifyBrokerLogLock = [System.Object]::new()
+try {
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $script:NotifyBrokerLogPath) | Out-Null
+}
+catch {
+    # Logging is best-effort and must never prevent the broker from starting.
+}
 
 # Request queue: background listener thread enqueues /popup and /close; UI timer consumes on main thread
 $script:NotifyBrokerPopupQueue = [System.Collections.Concurrent.ConcurrentQueue[object]]::new()
@@ -131,14 +138,28 @@ if ($config.PSObject.Properties['PopupMaxVisible']) {
     try { $script:NotifyBrokerPopupMaxVisible = [Math]::Max(1, [Math]::Min(8, [int]$config.PopupMaxVisible)) } catch { $script:NotifyBrokerPopupMaxVisible = 4 }
 }
 
+# Append one broker log line without allowing diagnostic I/O to interrupt notification work.
 function Write-NotifyBrokerLog {
     param(
         [Parameter(Mandatory = $true)]
         [string]$Message
     )
 
-    $line = ('[{0}] {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'), $Message)
-    Add-Content -LiteralPath $script:NotifyBrokerLogPath -Value $line -Encoding UTF8
+    $lockTaken = $false
+    try {
+        $line = ('[{0}] {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'), $Message)
+        [System.Threading.Monitor]::Enter($script:NotifyBrokerLogLock, [ref]$lockTaken)
+        [System.IO.File]::AppendAllText(
+            $script:NotifyBrokerLogPath,
+            ($line + [System.Environment]::NewLine),
+            [System.Text.UTF8Encoding]::new($false))
+    }
+    catch {
+        # Logging is best-effort and must never escape WinForms callbacks.
+    }
+    finally {
+        if ($lockTaken) { [System.Threading.Monitor]::Exit($script:NotifyBrokerLogLock) }
+    }
 }
 
 # Fingerprint helper: logs may only contain fingerprints/booleans/timing, never raw title/body/cwd/tab/session
@@ -1506,11 +1527,25 @@ function Start-NotifyBrokerHttpListener {
     $script:NotifyBrokerListenerRunspace.SessionStateProxy.SetVariable('NotifyBrokerIoTimeoutMs', $brokerIoTimeoutMs)
 
     $scriptText = @'
-param($Listener, $Queue, $LogPath, $IoTimeoutMs)
+param($Listener, $Queue, $LogPath, $LogLock, $IoTimeoutMs)
 $ErrorActionPreference = 'Stop'
+# Append one background log line through the shared lock without stopping the listener.
 function Write-BrokerBgLog($Msg) {
-    $line = ('[{0}] {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'), $Msg)
-    Add-Content -LiteralPath $LogPath -Value $line -Encoding UTF8
+    $lockTaken = $false
+    try {
+        $line = ('[{0}] {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'), $Msg)
+        [System.Threading.Monitor]::Enter($LogLock, [ref]$lockTaken)
+        [System.IO.File]::AppendAllText(
+            $LogPath,
+            ($line + [System.Environment]::NewLine),
+            [System.Text.UTF8Encoding]::new($false))
+    }
+    catch {
+        # Background logging is best-effort and must not stop the HTTP listener.
+    }
+    finally {
+        if ($lockTaken) { [System.Threading.Monitor]::Exit($LogLock) }
+    }
 }
 function Write-BgResponse($Stream, $StatusCode, $Reason, $Body, $ContentType) {
     try {
@@ -1624,6 +1659,7 @@ while ($true) {
     [void]$ps.AddParameter('Listener', $script:NotifyBrokerListener)
     [void]$ps.AddParameter('Queue', $script:NotifyBrokerPopupQueue)
     [void]$ps.AddParameter('LogPath', $script:NotifyBrokerLogPath)
+    [void]$ps.AddParameter('LogLock', $script:NotifyBrokerLogLock)
     [void]$ps.AddParameter('IoTimeoutMs', $brokerIoTimeoutMs)
     $script:NotifyBrokerListenerHandle = $ps.BeginInvoke()
     Write-NotifyBrokerLog -Message ('broker-listener-start port={0} pid={1}' -f $brokerPort, $PID)

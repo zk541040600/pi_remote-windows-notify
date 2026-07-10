@@ -168,6 +168,70 @@ finally {
     if (Test-Path -LiteralPath $customProbeBase) { Remove-Item -LiteralPath $customProbeBase -Recurse -Force -ErrorAction SilentlyContinue }
     if (Get-Command Set-NotifyBridgeActiveConfigPath -ErrorAction SilentlyContinue) { Set-NotifyBridgeActiveConfigPath -ConfigPath $configPath | Out-Null }
 }
+$logProbePath = Join-Path ([System.IO.Path]::GetTempPath()) ('pi-notify-log-probe-' + [guid]::NewGuid().ToString('N') + '.log')
+$logProbeLock = [System.Object]::new()
+$logProbeWorkers = @()
+try {
+    $baselineLockTaken = $false
+    try {
+        [System.Threading.Monitor]::Enter($logProbeLock, [ref]$baselineLockTaken)
+        [System.IO.File]::AppendAllText(
+            $logProbePath,
+            ('worker=0 i=0' + [System.Environment]::NewLine),
+            [System.Text.UTF8Encoding]::new($false))
+    }
+    finally {
+        if ($baselineLockTaken) { [System.Threading.Monitor]::Exit($logProbeLock) }
+    }
+    $logProbeScript = @'
+param($Path, $SyncRoot, $WorkerId, $Iterations)
+$failures = New-Object System.Collections.Generic.List[string]
+for ($index = 0; $index -lt $Iterations; $index++) {
+    $lockTaken = $false
+    try {
+        [System.Threading.Monitor]::Enter($SyncRoot, [ref]$lockTaken)
+        [System.IO.File]::AppendAllText(
+            $Path,
+            (('worker={0} i={1}' -f $WorkerId, $index) + [System.Environment]::NewLine),
+            [System.Text.UTF8Encoding]::new($false))
+    }
+    catch {
+        $failures.Add($_.Exception.Message)
+    }
+    finally {
+        if ($lockTaken) { [System.Threading.Monitor]::Exit($SyncRoot) }
+    }
+}
+return $failures
+'@
+    foreach ($workerId in @(1, 2)) {
+        $workerShell = [System.Management.Automation.PowerShell]::Create()
+        [void]$workerShell.AddScript($logProbeScript)
+        [void]$workerShell.AddArgument($logProbePath)
+        [void]$workerShell.AddArgument($logProbeLock)
+        [void]$workerShell.AddArgument($workerId)
+        [void]$workerShell.AddArgument(64)
+        $logProbeWorkers += [pscustomobject]@{ Shell = $workerShell; Handle = $workerShell.BeginInvoke() }
+    }
+
+    $logProbeFailures = @()
+    foreach ($worker in $logProbeWorkers) {
+        $logProbeFailures += @($worker.Shell.EndInvoke($worker.Handle))
+    }
+    if ($logProbeFailures.Count -ne 0) {
+        throw ('Synchronized log writer probe failed with {0} write errors: {1}' -f $logProbeFailures.Count, $logProbeFailures[0])
+    }
+    $logProbeLineCount = [System.IO.File]::ReadAllLines($logProbePath, [System.Text.UTF8Encoding]::new($false)).Count
+    if ($logProbeLineCount -ne 129) {
+        throw ('Synchronized log writer probe expected 129 lines, got {0}.' -f $logProbeLineCount)
+    }
+}
+finally {
+    foreach ($worker in $logProbeWorkers) {
+        if ($null -ne $worker.Shell) { $worker.Shell.Dispose() }
+    }
+    Remove-Item -LiteralPath $logProbePath -Force -ErrorAction SilentlyContinue
+}
 if ($commonText -notmatch 'Join-NotifyBridgeProcessArguments' -or $commonText -notmatch 'ConvertTo-NotifyBridgeProcessArgument' -or $commonText -notmatch 'Clear-NotifyBridgePopupArtifacts' -or $commonText -notmatch 'popup-payload\.json' -or $commonText -notmatch 'popup-stdout\.log' -or $commonText -notmatch 'popup-stderr\.log') {
     throw 'Common helper must quote child PowerShell arguments and clean popup artifacts, including legacy exact artifact names.'
 }
@@ -314,6 +378,12 @@ if ($brokerText -notmatch 'Get-NotifyBrokerWallpaperCardImage' -or $brokerText -
 }
 if ($brokerText -notmatch 'broker-client-disconnect stage=response') {
     throw 'Broker HTTP listener must treat client-disconnect response writes as benign instead of noisy bg errors.'
+}
+$brokerLogEnterCount = ([regex]::Matches($brokerText, 'Monitor\]::Enter')).Count
+$brokerLogExitCount = ([regex]::Matches($brokerText, 'Monitor\]::Exit')).Count
+$brokerLogAppendCount = ([regex]::Matches($brokerText, 'File\]::AppendAllText')).Count
+if ($brokerText -match 'Add-Content' -or $brokerLogEnterCount -lt 2 -or $brokerLogExitCount -lt 2 -or $brokerLogAppendCount -lt 2 -or $brokerText -notmatch "AddParameter\('LogLock'" -or $brokerText -notmatch 'Logging is best-effort') {
+    throw 'Broker logs must serialize short-lived appends across UI/background runspaces and remain no-throw.'
 }
 if ($hotkeyText -notmatch 'RegisterHotKey' -or $hotkeyText -notmatch 'Start-NotifyHotkeyResident' -or $hotkeyText -notmatch 'MOD_NOREPEAT' -or $hotkeyText -notmatch 'ConvertTo-NotifyHotkeyRegistration') {
     throw 'Hotkey must run as a resident RegisterHotKey worker so single-modifier shortcuts like Alt+P work reliably.'
