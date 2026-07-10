@@ -13,81 +13,15 @@ param(
 
 $ErrorActionPreference = 'Stop'
 . "$PSScriptRoot/NotifyBridge.Common.ps1"
+. "$PSScriptRoot/NotifyBridge.Process.ps1"
 $repoDir = Split-Path -Parent $PSScriptRoot
 $configPath = [System.IO.Path]::GetFullPath($ConfigPath)
 $baseDir = Split-Path -Parent $configPath
 $binDir = Join-Path $baseDir 'bin'
+$instancePaths = @($configPath, $binDir, $baseDir)
 $piExtDir = "$env:USERPROFILE\.pi\agent\extensions"
 $listenerPidPath = Join-Path $baseDir 'listener.pid'
 $tunnelPidPath = Join-Path $baseDir 'tunnel.pid'
-
-function ConvertTo-NotifyProcessArgument {
-    param([AllowNull()][string]$Value)
-
-    if ($null -eq $Value) { return '""' }
-    $text = [string]$Value
-    if ($text.Length -eq 0) { return '""' }
-    if ($text -notmatch '[\s"]') { return $text }
-
-    $builder = [System.Text.StringBuilder]::new()
-    [void]$builder.Append('"')
-    $backslashCount = 0
-    foreach ($ch in $text.ToCharArray()) {
-        if ($ch -eq '\') { $backslashCount += 1; continue }
-        if ($ch -eq '"') {
-            if ($backslashCount -gt 0) { [void]$builder.Append(('\' * ($backslashCount * 2))) }
-            [void]$builder.Append('\"')
-            $backslashCount = 0
-            continue
-        }
-        if ($backslashCount -gt 0) {
-            [void]$builder.Append(('\' * $backslashCount))
-            $backslashCount = 0
-        }
-        [void]$builder.Append($ch)
-    }
-    if ($backslashCount -gt 0) { [void]$builder.Append(('\' * ($backslashCount * 2))) }
-    [void]$builder.Append('"')
-    return $builder.ToString()
-}
-
-function Join-NotifyProcessArguments {
-    param([object[]]$ArgumentList)
-    return (@($ArgumentList) | ForEach-Object { ConvertTo-NotifyProcessArgument -Value ([string]$_) }) -join ' '
-}
-
-function Start-NotifyDetachedCommand {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$CommandLine,
-        [string]$Name = 'process'
-    )
-
-    $vbsPath = Join-Path $env:TEMP ('pi-notify-{0}-start-{1}-{2}.vbs' -f $Name, $PID, ([Guid]::NewGuid().ToString('N')))
-    $escapedCommand = $CommandLine.Replace('"', '""')
-    $content = @"
-Set shell = CreateObject("WScript.Shell")
-shell.Run "$escapedCommand", 0, False
-"@
-    [System.IO.File]::WriteAllText($vbsPath, $content.TrimStart(), [System.Text.UTF8Encoding]::new($false))
-
-    $taskName = 'PiNotifyStart_{0}_{1}' -f $Name, ([Guid]::NewGuid().ToString('N').Substring(0, 8))
-    try {
-        $action = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument (Join-NotifyProcessArguments @($vbsPath))
-        $trigger = New-ScheduledTaskTrigger -Once -At ((Get-Date).AddMinutes(1))
-        $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
-        Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Force | Out-Null
-        Start-ScheduledTask -TaskName $taskName
-        Start-Sleep -Seconds 6
-        return
-    }
-    catch {
-        Start-Process -FilePath 'wscript.exe' -ArgumentList (Join-NotifyProcessArguments @($vbsPath)) -WindowStyle Hidden | Out-Null
-    }
-    finally {
-        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-    }
-}
 
 function Stop-NotifyProcessId {
     param(
@@ -103,7 +37,7 @@ function Stop-NotifyProcessId {
         $isOwned = $false
         $isAllowedParentScopedSsh = $false
         if ($null -ne $processInfo) {
-            $isOwned = Test-NotifyProcessOwnedByThisInstance -CommandLine ([string]$processInfo.CommandLine)
+            $isOwned = Test-NotifyBridgeProcessOwnedByPaths -CommandLine ([string]$processInfo.CommandLine) -OwnedPaths $instancePaths
             $isAllowedParentScopedSsh = [bool]$AllowParentScopedSsh -and ([string]$processInfo.Name -eq 'ssh.exe') -and (@($AllowedParentProcessIds) -contains [int]$processInfo.ParentProcessId)
         }
         if ($null -ne $processInfo -and -not $isOwned -and -not $isAllowedParentScopedSsh) {
@@ -111,7 +45,7 @@ function Stop-NotifyProcessId {
             return
         }
         $process = Get-Process -Id $ProcessId -ErrorAction Stop
-        Start-Process -FilePath 'taskkill.exe' -ArgumentList (Join-NotifyProcessArguments @('/PID', $ProcessId, '/F', '/T')) -WindowStyle Hidden -Wait | Out-Null
+        Start-Process -FilePath 'taskkill.exe' -ArgumentList (Join-NotifyBridgeProcessArguments @('/PID', $ProcessId, '/F', '/T')) -WindowStyle Hidden -Wait | Out-Null
         Write-Host ('stopped {0} pid={1} reason={2}' -f $process.ProcessName, $ProcessId, $Reason)
     }
     catch {
@@ -137,61 +71,10 @@ function Stop-NotifyPidFile {
     }
 }
 
-function Test-NotifyCommandLineContainsPath {
-    param(
-        [string]$CommandLine,
-        [string]$Path
-    )
-
-    if ([string]::IsNullOrWhiteSpace($CommandLine) -or [string]::IsNullOrWhiteSpace($Path)) { return $false }
-    $needle = [System.IO.Path]::GetFullPath($Path).TrimEnd([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
-    $start = 0
-    while ($start -lt $CommandLine.Length) {
-        $index = $CommandLine.IndexOf($needle, $start, [System.StringComparison]::OrdinalIgnoreCase)
-        if ($index -lt 0) { return $false }
-        $end = $index + $needle.Length
-        if ($end -ge $CommandLine.Length) { return $true }
-        $next = [string]$CommandLine[$end]
-        if ([char]::IsWhiteSpace($CommandLine[$end]) -or $next -eq '"' -or $next -eq "'" -or $next -eq '\' -or $next -eq '/') { return $true }
-        $start = $index + 1
-    }
-    return $false
-}
-
-function Test-NotifyProcessOwnedByThisInstance {
-    param([string]$CommandLine)
-
-    if ([string]::IsNullOrWhiteSpace($CommandLine)) { return $false }
-    foreach ($needle in @($configPath, $binDir, $baseDir)) {
-        if (Test-NotifyCommandLineContainsPath -CommandLine $CommandLine -Path $needle) { return $true }
-    }
-    return $false
-}
-
-function Get-NotifyScriptProcessIds {
-    param([string]$ScriptName)
-
-    $ids = @()
-    $escaped = [regex]::Escape($ScriptName)
-    try {
-        $items = Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object {
-            $commandLine = [string]$_.CommandLine
-            ($_.ProcessId -ne $PID) -and (Test-NotifyProcessOwnedByThisInstance -CommandLine $commandLine) -and ($commandLine -match ('(?i)-File\s+("[^"]*{0}"|[^\s"]*{0})' -f $escaped))
-        }
-        foreach ($item in $items) {
-            if ($item.ProcessId) { $ids += [int]$item.ProcessId }
-        }
-    }
-    catch {
-    }
-
-    return @($ids | Select-Object -Unique)
-}
-
 function Get-NotifyTunnelProcessIds {
     param([int]$Port)
 
-    $ids = @(Get-NotifyScriptProcessIds -ScriptName 'pi-notify-reverse-tunnel.ps1')
+    $ids = @(Get-NotifyBridgeScriptProcessIds -ScriptName 'pi-notify-reverse-tunnel.ps1' -OwnedPaths $instancePaths)
     $wrapperIds = @($ids)
     $forwardNeedle = ('127.0.0.1:{0}:127.0.0.1:{0}' -f $Port)
     try {
@@ -213,7 +96,7 @@ function Get-NotifyTunnelProcessIds {
 function Stop-NotifyTunnelProcesses {
     param([int]$Port)
 
-    $wrapperIds = @(Get-NotifyScriptProcessIds -ScriptName 'pi-notify-reverse-tunnel.ps1')
+    $wrapperIds = @(Get-NotifyBridgeScriptProcessIds -ScriptName 'pi-notify-reverse-tunnel.ps1' -OwnedPaths $instancePaths)
     foreach ($processId in Get-NotifyTunnelProcessIds -Port $Port) {
         $processInfo = $null
         try { $processInfo = Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f $processId) -ErrorAction Stop } catch {}
@@ -227,20 +110,20 @@ function Stop-NotifyTunnelProcesses {
 }
 
 function Stop-NotifyWatchdogProcesses {
-    foreach ($processId in Get-NotifyScriptProcessIds -ScriptName 'pi-notify-watchdog.ps1') {
+    foreach ($processId in Get-NotifyBridgeScriptProcessIds -ScriptName 'pi-notify-watchdog.ps1' -OwnedPaths $instancePaths) {
         Stop-NotifyProcessId -ProcessId $processId -Reason 'watchdog-process-scan'
     }
 }
 
 function Stop-NotifyBrokerProcesses {
-    foreach ($processId in Get-NotifyScriptProcessIds -ScriptName 'pi-notify-broker.ps1') {
+    foreach ($processId in Get-NotifyBridgeScriptProcessIds -ScriptName 'pi-notify-broker.ps1' -OwnedPaths $instancePaths) {
         Stop-NotifyProcessId -ProcessId $processId -Reason 'broker-process-scan'
     }
     Remove-Item -LiteralPath (Join-Path $baseDir 'broker.pid') -Force -ErrorAction SilentlyContinue
 }
 
 function Stop-NotifyHotkeyProcesses {
-    foreach ($processId in Get-NotifyScriptProcessIds -ScriptName 'pi-notify-hotkey.ps1') {
+    foreach ($processId in Get-NotifyBridgeScriptProcessIds -ScriptName 'pi-notify-hotkey.ps1' -OwnedPaths $instancePaths) {
         Stop-NotifyProcessId -ProcessId $processId -Reason 'hotkey-process-scan'
     }
 }
@@ -287,7 +170,7 @@ function Start-NotifyHotkey {
     }
     Stop-NotifyHotkeyProcesses
     $hotkeyCommand = ('"{0}" -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{1}" -ConfigPath "{2}"' -f (Get-NotifyBridgePowerShellExe), $HotkeyScript, $configPath)
-    Start-NotifyDetachedCommand -CommandLine $hotkeyCommand -Name 'hotkey'
+    Start-NotifyBridgeDetachedCommand -CommandLine $hotkeyCommand -Name 'hotkey'
     Write-Host 'hotkey started'
 }
 
@@ -307,7 +190,7 @@ function Start-NotifyBroker {
         return
     }
     $brokerCommand = ('"{0}" -NoProfile -STA -WindowStyle Hidden -ExecutionPolicy Bypass -File "{1}" -ConfigPath "{2}"' -f (Get-NotifyBridgePowerShellExe), $brokerScript, $configPath)
-    Start-NotifyDetachedCommand -CommandLine $brokerCommand -Name 'broker'
+    Start-NotifyBridgeDetachedCommand -CommandLine $brokerCommand -Name 'broker'
     Write-Host 'broker started'
 }
 
@@ -403,6 +286,8 @@ Write-Host "[3/7] sync runtime files..."
 New-Item -ItemType Directory -Force -Path $binDir, $piExtDir | Out-Null
 $runtimeFiles = @(
     'NotifyBridge.Common.ps1',
+    'NotifyBridge.Process.ps1',
+    'NotifyBridge.Remote.ps1',
     'notify-listener.ps1',
     'pi-notify-popup.ps1',
     'pi-notify-broker.ps1',
@@ -494,7 +379,7 @@ $listenerStatusPath = Join-Path $listenerLogDir 'restart-listener.status.json'
 $listenerRestartLogPath = Join-Path $listenerLogDir 'restart-listener.log'
 Remove-Item -LiteralPath $listenerStatusPath -Force -ErrorAction SilentlyContinue
 $listenerRestartCommand = ('"{0}" -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{1}" -ConfigPath "{2}" -TimeoutSeconds 60 -StatusPath "{3}" -LogPath "{4}"' -f (Get-NotifyBridgePowerShellExe), (Join-Path $binDir 'pi-notify-restart-listener.ps1'), $configPath, $listenerStatusPath, $listenerRestartLogPath)
-Start-NotifyDetachedCommand -CommandLine $listenerRestartCommand -Name 'listener'
+Start-NotifyBridgeDetachedCommand -CommandLine $listenerRestartCommand -Name 'listener'
 $listenerStatus = $null
 $health = $null
 for ($attempt = 1; $attempt -le 120; $attempt++) {
@@ -532,16 +417,16 @@ if ($SkipTunnel) {
     Write-Host "[7/7] keep reverse tunnel; start broker/watchdog..."
     Start-NotifyBroker
     $watchdogCommand = ('"{0}" -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{1}" -ConfigPath "{2}" -StartupDelaySeconds 5' -f (Get-NotifyBridgePowerShellExe), (Join-Path $binDir 'pi-notify-watchdog.ps1'), $configPath)
-    Start-NotifyDetachedCommand -CommandLine $watchdogCommand -Name 'watchdog'
+    Start-NotifyBridgeDetachedCommand -CommandLine $watchdogCommand -Name 'watchdog'
     Start-NotifyHotkey -Enabled ([bool]$cfg.popupHotkeyEnabled) -HotkeyScript (Join-Path $binDir 'pi-notify-hotkey.ps1')
 }
 else {
     Write-Host "[7/7] start reverse tunnel/broker/watchdog..."
     $tunnelCommand = ('"{0}" -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{1}" -ConfigPath "{2}" -TunnelStartupDelaySeconds 5' -f (Get-NotifyBridgePowerShellExe), (Join-Path $binDir 'pi-notify-reverse-tunnel.ps1'), $configPath)
-    Start-NotifyDetachedCommand -CommandLine $tunnelCommand -Name 'tunnel'
+    Start-NotifyBridgeDetachedCommand -CommandLine $tunnelCommand -Name 'tunnel'
     Start-NotifyBroker
     $watchdogCommand = ('"{0}" -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{1}" -ConfigPath "{2}" -StartupDelaySeconds 5' -f (Get-NotifyBridgePowerShellExe), (Join-Path $binDir 'pi-notify-watchdog.ps1'), $configPath)
-    Start-NotifyDetachedCommand -CommandLine $watchdogCommand -Name 'watchdog'
+    Start-NotifyBridgeDetachedCommand -CommandLine $watchdogCommand -Name 'watchdog'
     Start-NotifyHotkey -Enabled ([bool]$cfg.popupHotkeyEnabled) -HotkeyScript (Join-Path $binDir 'pi-notify-hotkey.ps1')
 }
 

@@ -298,28 +298,6 @@ function Get-NotifyCommandLineArgument {
     return ''
 }
 
-function Get-NotifyPopupPayloadPathFromCommandLine {
-    param([string]$CommandLine)
-    return Get-NotifyCommandLineArgument -CommandLine $CommandLine -Name 'PayloadPath'
-}
-
-function Test-NotifyPathUnderDirectory {
-    param(
-        [string]$Path,
-        [string]$Directory
-    )
-
-    if ([string]::IsNullOrWhiteSpace($Path) -or [string]::IsNullOrWhiteSpace($Directory)) { return $false }
-    try {
-        $fullPath = [System.IO.Path]::GetFullPath($Path).TrimEnd([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
-        $fullDirectory = [System.IO.Path]::GetFullPath($Directory).TrimEnd([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
-        return ($fullPath.Equals($fullDirectory, [System.StringComparison]::OrdinalIgnoreCase) -or $fullPath.StartsWith(($fullDirectory + [System.IO.Path]::DirectorySeparatorChar), [System.StringComparison]::OrdinalIgnoreCase))
-    }
-    catch {
-        return $false
-    }
-}
-
 function Get-NotifyPopupProcesses {
     $rows = @()
     try {

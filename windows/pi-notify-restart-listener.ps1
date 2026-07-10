@@ -7,85 +7,22 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+. "$PSScriptRoot/NotifyBridge.Common.ps1"
+. "$PSScriptRoot/NotifyBridge.Process.ps1"
 $ConfigPath = [System.IO.Path]::GetFullPath($ConfigPath)
 $baseDir = Split-Path -Parent $ConfigPath
 $binDir = Join-Path $baseDir 'bin'
+$instancePaths = @($ConfigPath, $binDir, $baseDir)
 $logDir = Join-Path $baseDir 'logs'
 $listenerPath = Join-Path $binDir 'notify-listener.ps1'
 $runnerPath = Join-Path $binDir 'pi-notify-listener-runner.ps1'
 $pidPath = Join-Path $baseDir 'listener.pid'
 
-function ConvertTo-NotifyProcessArgument {
-    param([AllowNull()][string]$Value)
-
-    if ($null -eq $Value) { return '""' }
-    $text = [string]$Value
-    if ($text.Length -eq 0) { return '""' }
-    if ($text -notmatch '[\s"]') { return $text }
-
-    $builder = [System.Text.StringBuilder]::new()
-    [void]$builder.Append('"')
-    $backslashCount = 0
-    foreach ($ch in $text.ToCharArray()) {
-        if ($ch -eq '\') { $backslashCount += 1; continue }
-        if ($ch -eq '"') {
-            if ($backslashCount -gt 0) { [void]$builder.Append(('\' * ($backslashCount * 2))) }
-            [void]$builder.Append('\"')
-            $backslashCount = 0
-            continue
-        }
-        if ($backslashCount -gt 0) {
-            [void]$builder.Append(('\' * $backslashCount))
-            $backslashCount = 0
-        }
-        [void]$builder.Append($ch)
-    }
-    if ($backslashCount -gt 0) { [void]$builder.Append(('\' * ($backslashCount * 2))) }
-    [void]$builder.Append('"')
-    return $builder.ToString()
-}
-
-function Join-NotifyProcessArguments {
-    param([object[]]$ArgumentList)
-    return (@($ArgumentList) | ForEach-Object { ConvertTo-NotifyProcessArgument -Value ([string]$_) }) -join ' '
-}
-
-function Start-NotifyDetachedCommand {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$CommandLine,
-        [string]$Name = 'listener'
-    )
-
-    $vbsPath = Join-Path $env:TEMP ('pi-notify-{0}-start-{1}-{2}.vbs' -f $Name, $PID, ([Guid]::NewGuid().ToString('N')))
-    $escapedCommand = $CommandLine.Replace('"', '""')
-    $content = @"
-Set shell = CreateObject("WScript.Shell")
-shell.Run "$escapedCommand", 0, False
-"@
-    [System.IO.File]::WriteAllText($vbsPath, $content.TrimStart(), [System.Text.UTF8Encoding]::new($false))
-
-    $taskName = 'PiNotifyStart_{0}_{1}' -f $Name, ([Guid]::NewGuid().ToString('N').Substring(0, 8))
-    try {
-        $action = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument (Join-NotifyProcessArguments @($vbsPath))
-        $trigger = New-ScheduledTaskTrigger -Once -At ((Get-Date).AddMinutes(1))
-        $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
-        Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Force | Out-Null
-        Start-ScheduledTask -TaskName $taskName
-        Start-Sleep -Seconds 6
-        return
-    }
-    catch {
-        Start-Process -FilePath 'wscript.exe' -ArgumentList (Join-NotifyProcessArguments @($vbsPath)) -WindowStyle Hidden | Out-Null
-    }
-    finally {
-        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-    }
-}
-
 function Sync-LocalRuntimeFiles {
     $runtimeFiles = @(
         'NotifyBridge.Common.ps1',
+        'NotifyBridge.Process.ps1',
+        'NotifyBridge.Remote.ps1',
         'notify-listener.ps1',
         'pi-notify-listener-runner.ps1',
         'pi-notify-restart-listener.ps1',
@@ -172,60 +109,9 @@ function Test-NewListenerAlive {
         $process = Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f $pidValue) -ErrorAction Stop
         if ($null -eq $process) { return $false }
         $commandLine = [string]$process.CommandLine
-        return (($commandLine -like '*pi-notify-listener-runner.ps1*') -and (Test-NotifyProcessOwnedByThisInstance -CommandLine $commandLine))
+        return (($commandLine -like '*pi-notify-listener-runner.ps1*') -and (Test-NotifyBridgeProcessOwnedByPaths -CommandLine $commandLine -OwnedPaths $instancePaths))
     }
     catch { return $false }
-}
-
-function Test-NotifyCommandLineContainsPath {
-    param(
-        [string]$CommandLine,
-        [string]$Path
-    )
-
-    if ([string]::IsNullOrWhiteSpace($CommandLine) -or [string]::IsNullOrWhiteSpace($Path)) { return $false }
-    $needle = [System.IO.Path]::GetFullPath($Path).TrimEnd([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
-    $start = 0
-    while ($start -lt $CommandLine.Length) {
-        $index = $CommandLine.IndexOf($needle, $start, [System.StringComparison]::OrdinalIgnoreCase)
-        if ($index -lt 0) { return $false }
-        $end = $index + $needle.Length
-        if ($end -ge $CommandLine.Length) { return $true }
-        $next = [string]$CommandLine[$end]
-        if ([char]::IsWhiteSpace($CommandLine[$end]) -or $next -eq '"' -or $next -eq "'" -or $next -eq '\' -or $next -eq '/') { return $true }
-        $start = $index + 1
-    }
-    return $false
-}
-
-function Test-NotifyProcessOwnedByThisInstance {
-    param([string]$CommandLine)
-
-    if ([string]::IsNullOrWhiteSpace($CommandLine)) { return $false }
-    foreach ($needle in @($ConfigPath, $binDir, $baseDir)) {
-        if (Test-NotifyCommandLineContainsPath -CommandLine $CommandLine -Path $needle) { return $true }
-    }
-    return $false
-}
-
-function Get-NotifyScriptProcessIds {
-    param([string]$ScriptName)
-
-    $processIds = @()
-    $escaped = [regex]::Escape($ScriptName)
-    try {
-        $items = Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object {
-            $commandLine = [string]$_.CommandLine
-            ($_.ProcessId -ne $PID) -and (Test-NotifyProcessOwnedByThisInstance -CommandLine $commandLine) -and ($commandLine -match ('(?i)-File\s+("[^"]*{0}"|[^\s"]*{0})' -f $escaped))
-        } | Select-Object -ExpandProperty ProcessId
-        foreach ($processId in $items) {
-            if ($processId) { $processIds += [int]$processId }
-        }
-    }
-    catch {
-    }
-
-    return @($processIds | Select-Object -Unique)
 }
 
 function Stop-NotifyProcessId {
@@ -237,11 +123,11 @@ function Stop-NotifyProcessId {
     if ($ProcessId -le 0 -or $ProcessId -eq $PID) { return }
     try {
         $processInfo = Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f $ProcessId) -ErrorAction Stop
-        if ($null -ne $processInfo -and -not (Test-NotifyProcessOwnedByThisInstance -CommandLine ([string]$processInfo.CommandLine))) {
+        if ($null -ne $processInfo -and -not (Test-NotifyBridgeProcessOwnedByPaths -CommandLine ([string]$processInfo.CommandLine) -OwnedPaths $instancePaths)) {
             Write-RestartLog ('skip unowned listener process pid={0} reason={1}' -f $ProcessId, $Reason)
             return
         }
-        Start-Process -FilePath 'taskkill.exe' -ArgumentList (Join-NotifyProcessArguments @('/PID', $ProcessId, '/F', '/T')) -WindowStyle Hidden -Wait | Out-Null
+        Start-Process -FilePath 'taskkill.exe' -ArgumentList (Join-NotifyBridgeProcessArguments @('/PID', $ProcessId, '/F', '/T')) -WindowStyle Hidden -Wait | Out-Null
         Write-RestartLog ('stopped listener process pid={0} reason={1}' -f $ProcessId, $Reason)
     }
     catch {
@@ -256,8 +142,8 @@ function Stop-ExistingListenerProcesses {
         $pidValue = 0
         if ([int]::TryParse($raw.Trim(), [ref]$pidValue)) { $ids += $pidValue }
     }
-    $ids += Get-NotifyScriptProcessIds -ScriptName 'notify-listener.ps1'
-    $ids += Get-NotifyScriptProcessIds -ScriptName 'pi-notify-listener-runner.ps1'
+    $ids += Get-NotifyBridgeScriptProcessIds -ScriptName 'notify-listener.ps1' -OwnedPaths $instancePaths
+    $ids += Get-NotifyBridgeScriptProcessIds -ScriptName 'pi-notify-listener-runner.ps1' -OwnedPaths $instancePaths
     foreach ($processId in @($ids | Where-Object { $_ -gt 0 } | Select-Object -Unique)) {
         Stop-NotifyProcessId -ProcessId $processId -Reason 'listener-restart'
     }
@@ -284,7 +170,7 @@ function Invoke-Worker {
 
     Start-Sleep -Milliseconds 300
     $runnerCommand = ('"{0}" -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{1}" -ConfigPath "{2}"' -f (Get-Command powershell.exe).Source, $runnerPath, $ConfigPath)
-    Start-NotifyDetachedCommand -CommandLine $runnerCommand -Name 'listener'
+    Start-NotifyBridgeDetachedCommand -CommandLine $runnerCommand -Name 'listener'
 
     $maxAttempts = [Math]::Max(6, ([Math]::Max(3, $TimeoutSeconds) * 2))
     for ($i = 0; $i -lt $maxAttempts; $i++) {
@@ -320,7 +206,7 @@ if ([string]::IsNullOrWhiteSpace($StatusPath)) { $StatusPath = Join-Path $logDir
 if ([string]::IsNullOrWhiteSpace($LogPath)) { $LogPath = Join-Path $logDir 'restart-listener.log' }
 Remove-Item -LiteralPath $StatusPath -Force -ErrorAction SilentlyContinue
 
-$workerProcess = Start-Process -FilePath powershell.exe -WindowStyle Hidden -ArgumentList (Join-NotifyProcessArguments @(
+$workerProcess = Start-Process -FilePath powershell.exe -WindowStyle Hidden -ArgumentList (Join-NotifyBridgeProcessArguments @(
     '-NoProfile',
     '-ExecutionPolicy', 'Bypass',
     '-File', $PSCommandPath,

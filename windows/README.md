@@ -4,7 +4,9 @@ This folder implements a reliable **Windows local notification bridge** for runn
 
 ## Files
 
-- `NotifyBridge.Common.ps1` — shared config / path / SSH helpers
+- `NotifyBridge.Common.ps1` — shared config, path, argument quoting, and toast setup helpers
+- `NotifyBridge.Process.ps1` — shared detached-start and instance-owned process helpers
+- `NotifyBridge.Remote.ps1` — shared remote path, SSH probe, and in-memory upload helpers
 - `notify-listener.ps1` — Windows local HTTP listener that shows toast notifications
 - `pi-notify-broker.ps1` — long-lived low-latency WinForms broker for popup-focus mode (loopback HTTP on port 23119)
 - `pi-notify-popup.ps1` — fallback per-notification popup process used when the broker is unavailable or disabled

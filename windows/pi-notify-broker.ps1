@@ -156,15 +156,6 @@ function Get-NotifyBrokerContextFingerprint {
     }
 }
 
-function Protect-NotifyBrokerLiveValue {
-    param([string]$Value)
-
-    if ([string]::IsNullOrWhiteSpace($Value)) { return '' }
-    $bytes = [System.Text.Encoding]::UTF8.GetBytes([string]$Value)
-    $protected = [System.Security.Cryptography.ProtectedData]::Protect($bytes, $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser)
-    return [Convert]::ToBase64String($protected)
-}
-
 # Preload wallpaper: avoid re-reading and decoding the file for each popup
 function Get-NotifyBrokerWallpaperImage {
     param([string]$Path)
@@ -473,23 +464,6 @@ function Select-NotifyBrokerTab {
     }
 
     return $false
-}
-
-function Get-NotifyBrokerSelectedTerminalTarget {
-    foreach ($window in @(Get-NotifyBrokerWindows -TerminalOnly)) {
-        foreach ($tab in @(Get-NotifyBrokerTabs -Handle $window.Handle)) {
-            if ($tab.IsSelected) {
-                return [pscustomobject]@{
-                    WindowTitle = $window.Title
-                    TabTitle    = $tab.Name
-                    TabIndex    = $tab.Index
-                    WindowHandle = $window.Handle
-                }
-            }
-        }
-    }
-
-    return $null
 }
 
 # Foreground target detection: auto-close popup when user switches to the target tab
@@ -1462,131 +1436,6 @@ function Close-NotifyBrokerPopup {
     else {
         Write-NotifyBrokerLog -Message ('broker-close-by-id-miss popupId={0}' -f $PopupId)
         Remove-NotifyBrokerLiveState -PopupId $PopupId
-    }
-}
-
-# HTTP response helper
-function Write-NotifyBrokerHttpResponse {
-    param(
-        [Parameter(Mandatory = $true)]
-        [System.IO.Stream]$Stream,
-        [Parameter(Mandatory = $true)]
-        [int]$StatusCode,
-        [Parameter(Mandatory = $true)]
-        [string]$Reason,
-        [string]$Body = "",
-        [string]$ContentType = "application/json; charset=utf-8"
-    )
-
-    $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes([string]$Body)
-    $header = "HTTP/1.1 $StatusCode $Reason`r`nContent-Type: $ContentType`r`nContent-Length: $($bodyBytes.Length)`r`nConnection: close`r`n`r`n"
-    $headerBytes = [System.Text.Encoding]::ASCII.GetBytes($header)
-    $Stream.Write($headerBytes, 0, $headerBytes.Length)
-    if ($bodyBytes.Length -gt 0) {
-        $Stream.Write($bodyBytes, 0, $bodyBytes.Length)
-    }
-    $Stream.Flush()
-}
-
-function Read-NotifyBrokerHttpRequest {
-    param(
-        [Parameter(Mandatory = $true)]
-        [System.IO.Stream]$Stream
-    )
-
-    $maxBodyBytes = 65536
-    $buffer = [byte[]]::new(4096)
-    $memory = [System.IO.MemoryStream]::new()
-    $headerEnd = -1
-
-    while ($headerEnd -lt 0) {
-        $read = $Stream.Read($buffer, 0, $buffer.Length)
-        if ($read -le 0) {
-            break
-        }
-
-        $memory.Write($buffer, 0, $read)
-        $bytes = $memory.ToArray()
-        $startIndex = [Math]::Max(0, $bytes.Length - $read - 3)
-        for ($i = $startIndex; $i -le $bytes.Length - 4; $i++) {
-            if ($bytes[$i] -eq 13 -and $bytes[$i + 1] -eq 10 -and $bytes[$i + 2] -eq 13 -and $bytes[$i + 3] -eq 10) {
-                $headerEnd = $i + 4
-                break
-            }
-        }
-
-        if ($memory.Length -gt 65536) {
-            throw "HTTP header too large."
-        }
-    }
-
-    if ($headerEnd -lt 0) {
-        throw "Incomplete HTTP request header."
-    }
-
-    $allBytes = $memory.ToArray()
-    $headerText = [System.Text.Encoding]::ASCII.GetString($allBytes, 0, $headerEnd)
-    $lines = $headerText -split "`r`n"
-    $requestLine = if ($lines.Length -gt 0) { [string]$lines[0] } else { '' }
-    $requestLine = $requestLine.Trim()
-    if ([string]::IsNullOrWhiteSpace($requestLine)) {
-        throw "Missing HTTP request line."
-    }
-
-    $headers = [System.Collections.Generic.Dictionary[string,string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-    if ($lines.Length -gt 1) {
-        foreach ($line in $lines[1..($lines.Length - 1)]) {
-            if ([string]::IsNullOrWhiteSpace($line)) {
-                continue
-            }
-            $index = $line.IndexOf(':')
-            if ($index -le 0) {
-                continue
-            }
-            $headers[$line.Substring(0, $index).Trim()] = $line.Substring($index + 1).Trim()
-        }
-    }
-
-    $contentLength = 0
-    if ($headers.ContainsKey('Content-Length')) {
-        [int]::TryParse([string]$headers['Content-Length'], [ref]$contentLength) | Out-Null
-    }
-    if ($contentLength -lt 0) {
-        throw "Invalid HTTP content length."
-    }
-    if ($contentLength -gt $maxBodyBytes) {
-        throw "HTTP request body too large."
-    }
-
-    $bodyMemory = [System.IO.MemoryStream]::new()
-    $existingBytes = $allBytes.Length - $headerEnd
-    if ($existingBytes -gt $maxBodyBytes) {
-        throw "HTTP request body too large."
-    }
-    if ($existingBytes -gt 0) {
-        $bodyMemory.Write($allBytes, $headerEnd, $existingBytes)
-    }
-
-    while ($bodyMemory.Length -lt $contentLength) {
-        $remaining = [Math]::Min($buffer.Length, $contentLength - [int]$bodyMemory.Length)
-        $read = $Stream.Read($buffer, 0, $remaining)
-        if ($read -le 0) {
-            break
-        }
-        $bodyMemory.Write($buffer, 0, $read)
-    }
-
-    $bodyBytes = $bodyMemory.ToArray()
-    if ($bodyBytes.Length -gt $contentLength) {
-        $trimmed = [byte[]]::new($contentLength)
-        [Array]::Copy($bodyBytes, 0, $trimmed, 0, $contentLength)
-        $bodyBytes = $trimmed
-    }
-
-    return [pscustomobject]@{
-        RequestLine = $requestLine
-        Headers     = $headers
-        BodyBytes   = $bodyBytes
     }
 }
 

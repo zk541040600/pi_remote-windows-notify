@@ -119,6 +119,8 @@ $null = New-Item -ItemType Directory -Force -Path $baseDir, $binDir, $logDir, $s
 
 $filesToCopy = @(
     'NotifyBridge.Common.ps1',
+    'NotifyBridge.Process.ps1',
+    'NotifyBridge.Remote.ps1',
     'notify-listener.ps1',
     'pi-notify-reverse-tunnel.ps1',
     'pi-notify-activate.ps1',

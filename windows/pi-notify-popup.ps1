@@ -304,19 +304,6 @@ function Test-NotifyPopupDedupeStateFresh {
     return ($expiresAtTicks -gt [DateTime]::UtcNow.Ticks)
 }
 
-function Save-NotifyPopupDedupeState {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Path,
-        [bool]$Precise,
-        [string]$PayloadPathValue
-    )
-
-    # Dedupe state is kept in the listener process; live popups must not leave
-    # popup-dedupe.*.json files behind for auditors/users to clean up.
-    return
-}
-
 function Initialize-NotifyPopupDedupe {
     param(
         [string]$TitleValue,
