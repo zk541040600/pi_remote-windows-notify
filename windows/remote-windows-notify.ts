@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { hostname, homedir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
@@ -33,43 +33,57 @@ type AgentMessageLike = {
   isError?: boolean;
 };
 
+type ContextSnapshot = {
+  cwd: string;
+  mode?: string;
+  explicitSessionName?: string;
+  displaySessionName?: string;
+};
+
 const DEFAULT_ENDPOINT = "http://127.0.0.1:23118/notify";
 const DEFAULT_TIMEOUT_MS = 4000;
 const DEFAULT_CONFIG_PATH = join(homedir(), ".pi", "agent", "remote-windows-notify.json");
 const PI_TERMINAL_TITLE = "π";
 const globalState = globalThis as {
-  __piRemoteWindowsNotifyRegistered?: boolean;
   __piRemoteWindowsNotifyActiveToken?: symbol;
+  __piRemoteWindowsNotifyLifecycleController?: AbortController;
 };
 
 function isTruthy(value: string | undefined): boolean {
   return /^(1|true|yes|on)$/i.test((value ?? "").trim());
 }
 
-function normalizeText(value: string | undefined, fallback: string, maxLength: number): string {
-  const collapsed = (value ?? "").replace(/\s+/g, " ").trim();
+function configString(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function normalizeText(value: unknown, fallback: string, maxLength: number): string {
+  const raw = typeof value === "string" ? value : "";
+  const collapsed = raw.replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim();
   const next = collapsed || fallback;
-  return next.length > maxLength ? `${next.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…` : next;
+  const characters = [...next];
+  if (characters.length <= maxLength) {
+    return next;
+  }
+  return `${characters.slice(0, Math.max(0, maxLength - 1)).join("").trimEnd()}…`;
 }
 
-function renderBody(template: string): string {
-  const cwd = process.cwd();
-  const cwdTail = basename(cwd) || cwd;
-  return template
-    .replace(/\{host\}/g, hostname())
-    .replace(/\{cwd\}/g, cwd)
-    .replace(/\{cwdBase\}/g, cwdTail);
-}
-
-function normalizeMode(value: string | undefined): "dynamic" | "static" {
-  return value === "static" ? "static" : "dynamic";
+function renderBody(template: string, cwd: string): string {
+  const cwdBase = basename(cwd) || cwd;
+  return normalizeText(
+    template
+      .replace(/\{host\}/g, hostname())
+      .replace(/\{cwd\}/g, cwd)
+      .replace(/\{cwdBase\}/g, cwdBase),
+    "Pi completed a turn",
+    220,
+  );
 }
 
 function extractTextContent(content: unknown): string {
   if (typeof content === "string") {
     return content;
   }
-
   if (!Array.isArray(content)) {
     return "";
   }
@@ -79,63 +93,56 @@ function extractTextContent(content: unknown): string {
     if (!item || typeof item !== "object") {
       continue;
     }
-
     const maybeText = item as { type?: string; text?: string };
     if (maybeText.type === "text" && typeof maybeText.text === "string") {
       parts.push(maybeText.text);
     }
   }
-
   return parts.join(" ");
 }
 
-function findLastTextForRole(messages: AgentMessageLike[], role: string): string {
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
+function findTextForRole(messages: AgentMessageLike[], role: string, fromEnd: boolean): string {
+  const start = fromEnd ? messages.length - 1 : 0;
+  const end = fromEnd ? -1 : messages.length;
+  const step = fromEnd ? -1 : 1;
+  for (let index = start; index !== end; index += step) {
     const message = messages[index];
     if (message?.role !== role) {
       continue;
     }
-
     const text = extractTextContent(message.content);
     if (text.trim()) {
       return text;
     }
   }
-
   return "";
 }
 
-function findFirstUserTextFromBranch(ctx: unknown): string {
+function readContextSnapshot(ctx: unknown, messages: AgentMessageLike[] = []): ContextSnapshot {
+  let cwd = process.cwd();
+  let mode: string | undefined;
+  let explicitSessionName: string | undefined;
+
   try {
-    const branch = (ctx as { sessionManager?: { getBranch?: () => unknown[] } })?.sessionManager?.getBranch?.() ?? [];
-    for (const entry of branch) {
-      const message = (entry as { message?: AgentMessageLike })?.message;
-      if (message?.role !== "user") {
-        continue;
-      }
-      const text = extractTextContent(message.content);
-      if (text.trim()) {
-        return text;
-      }
+    const context = ctx as { cwd?: unknown; mode?: unknown };
+    if (typeof context?.cwd === "string" && context.cwd.trim()) {
+      cwd = context.cwd;
+    }
+    if (typeof context?.mode === "string") {
+      mode = context.mode;
     }
   } catch {
   }
 
-  return "";
-}
-
-function getSessionNames(ctx: unknown): { explicitName?: string; displayName?: string } {
   try {
-    const explicitName = normalizeText(
-      (ctx as { sessionManager?: { getSessionName?: () => string | undefined } })?.sessionManager?.getSessionName?.(),
-      "",
-      96,
-    ) || undefined;
-    const displayName = explicitName || normalizeText(findFirstUserTextFromBranch(ctx), "", 96) || undefined;
-    return { explicitName, displayName };
+    const manager = (ctx as { sessionManager?: { getSessionName?: () => unknown } })?.sessionManager;
+    explicitSessionName = normalizeText(manager?.getSessionName?.(), "", 96) || undefined;
   } catch {
-    return {};
   }
+
+  const displaySessionName =
+    explicitSessionName || normalizeText(findTextForRole(messages, "user", false), "", 96) || undefined;
+  return { cwd, mode, explicitSessionName, displaySessionName };
 }
 
 function collectToolInfo(messages: AgentMessageLike[]): {
@@ -155,21 +162,17 @@ function collectToolInfo(messages: AgentMessageLike[]): {
       }
       continue;
     }
-
     if (message.isError) {
       hasToolError = true;
       hasTrailingToolError = true;
     }
-
-    const toolName = normalizeText(typeof message.toolName === "string" ? message.toolName : "", "", 32);
+    const toolName = normalizeText(message.toolName, "", 32);
     if (!toolName || seen.has(toolName)) {
       continue;
     }
-
     seen.add(toolName);
     toolNames.push(toolName);
   }
-
   return { toolNames, hasToolError, hasTrailingToolError };
 }
 
@@ -178,7 +181,6 @@ function assistantTextSignalsProblem(text: string): boolean {
   if (!value) {
     return false;
   }
-
   return (
     /(^|\n)\s*(❌|⚠️)/.test(value) ||
     /(?:测试|验证|构建|命令|执行|运行|提交|上传|push|commit|build|test|verify)\S{0,12}(?:失败|报错|未通过)/i.test(value) ||
@@ -187,36 +189,32 @@ function assistantTextSignalsProblem(text: string): boolean {
   );
 }
 
-function buildDynamicNotification(messages: AgentMessageLike[], config: RuntimeConfig): { title: string; body: string } {
-  const userPrompt = normalizeText(findLastTextForRole(messages, "user"), "", 72);
-  const assistantText = normalizeText(findLastTextForRole(messages, "assistant"), "", 120);
+function buildDynamicNotification(
+  messages: AgentMessageLike[],
+  config: RuntimeConfig,
+  cwd: string,
+): { title: string; body: string } {
+  const userPrompt = normalizeText(findTextForRole(messages, "user", true), "", 72);
+  const assistantText = normalizeText(findTextForRole(messages, "assistant", true), "", 120);
   const { toolNames, hasToolError, hasTrailingToolError } = collectToolInfo(messages);
-
   const title = normalizeText(userPrompt || assistantText || config.title, "Pi", 72);
   const hasUnresolvedError = hasTrailingToolError || (hasToolError && assistantTextSignalsProblem(assistantText));
   const status = hasUnresolvedError ? "有报错，等你看" : toolNames.length > 0 ? "已完成，等你确认" : "已回复，等你输入";
-  const bodyParts: string[] = [status];
+  const bodyParts = [status];
 
   if (toolNames.length > 0) {
     bodyParts.push(`tools: ${toolNames.slice(0, 4).join(", ")}`);
   }
-
-  if (assistantText && assistantText !== title) {
-    bodyParts.push(assistantText);
-  } else {
-    bodyParts.push(renderBody(config.bodyTemplate));
-  }
-
+  bodyParts.push(assistantText && assistantText !== title ? assistantText : renderBody(config.bodyTemplate, cwd));
   return {
     title,
-    body: normalizeText(bodyParts.join(" · "), renderBody(config.bodyTemplate), 220),
+    body: normalizeText(bodyParts.join(" · "), renderBody(config.bodyTemplate, cwd), 220),
   };
 }
 
 function getExtensionConfigPaths(): string[] {
   const paths: string[] = [];
   let current = dirname(fileURLToPath(import.meta.url));
-
   while (true) {
     paths.push(join(current, "remote-windows-notify.json"));
     const parent = dirname(current);
@@ -225,40 +223,112 @@ function getExtensionConfigPaths(): string[] {
     }
     current = parent;
   }
-
   return paths;
 }
 
+function isConfigShapeValid(file: NotifyConfigFile): boolean {
+  if (file.enabled !== undefined && typeof file.enabled !== "boolean") return false;
+  if (file.endpoint !== undefined && typeof file.endpoint !== "string") return false;
+  if (file.token !== undefined && typeof file.token !== "string") return false;
+  if (file.timeoutMs !== undefined && typeof file.timeoutMs !== "number") return false;
+  if (file.title !== undefined && typeof file.title !== "string") return false;
+  if (file.bodyTemplate !== undefined && typeof file.bodyTemplate !== "string") return false;
+  if (file.messageMode !== undefined && file.messageMode !== "dynamic" && file.messageMode !== "static") return false;
+  if (file.remoteHostAlias !== undefined && typeof file.remoteHostAlias !== "string") return false;
+  return true;
+}
+
 async function loadConfigFile(): Promise<NotifyConfigFile> {
-  const configPaths = [process.env.PI_NOTIFY_CONFIG, ...getExtensionConfigPaths(), DEFAULT_CONFIG_PATH]
-    .filter((value): value is string => Boolean(value));
+  const explicitPath = configString(process.env.PI_NOTIFY_CONFIG);
+  const paths = [explicitPath, ...getExtensionConfigPaths(), DEFAULT_CONFIG_PATH].filter(Boolean);
   const seen = new Set<string>();
 
-  for (const configPath of configPaths) {
+  for (const candidate of paths) {
+    const configPath = resolve(candidate);
     if (seen.has(configPath)) {
       continue;
     }
     seen.add(configPath);
 
+    let raw: string;
     try {
-      return JSON.parse(await readFile(configPath, "utf8")) as NotifyConfigFile;
+      raw = await readFile(configPath, "utf8");
+    } catch (error) {
+      const missing = (error as { code?: unknown })?.code === "ENOENT";
+      if (missing && explicitPath && configPath === resolve(explicitPath)) {
+        return { enabled: false };
+      }
+      if (missing) {
+        continue;
+      }
+      return { enabled: false };
+    }
+
+    try {
+      const parsed = JSON.parse(raw) as unknown;
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        return { enabled: false };
+      }
+      const config = parsed as NotifyConfigFile;
+      return isConfigShapeValid(config) ? config : { enabled: false };
     } catch {
+      return { enabled: false };
     }
   }
-
   return {};
 }
 
-async function getRuntimeConfig(): Promise<RuntimeConfig> {
+function isLoopbackHostname(hostnameValue: string): boolean {
+  const value = hostnameValue.toLowerCase().replace(/^\[|\]$/g, "");
+  return value === "localhost" || value === "::1" || /^127(?:\.\d{1,3}){3}$/.test(value);
+}
+
+function applyEndpointPolicy(
+  endpoint: string,
+  requestedMode: "dynamic" | "static",
+): { allowed: boolean; messageMode: "dynamic" | "static" } {
+  let parsed: URL;
+  try {
+    parsed = new URL(endpoint);
+  } catch {
+    return { allowed: false, messageMode: "static" };
+  }
+  if (parsed.username || parsed.password) {
+    return { allowed: false, messageMode: "static" };
+  }
+
+  const protocolAllowed = parsed.protocol === "http:" || parsed.protocol === "https:";
+  if (!protocolAllowed) {
+    return { allowed: false, messageMode: "static" };
+  }
+  if (isLoopbackHostname(parsed.hostname)) {
+    return { allowed: true, messageMode: requestedMode };
+  }
+  if (parsed.protocol !== "https:" || !isTruthy(process.env.PI_NOTIFY_ALLOW_NONLOCAL)) {
+    return { allowed: false, messageMode: "static" };
+  }
+  if (requestedMode === "dynamic" && !isTruthy(process.env.PI_NOTIFY_ALLOW_NONLOCAL_DYNAMIC)) {
+    return { allowed: true, messageMode: "static" };
+  }
+  return { allowed: true, messageMode: requestedMode };
+}
+
+export async function getRuntimeConfig(): Promise<RuntimeConfig> {
   const file = await loadConfigFile();
-  const enabled = !isTruthy(process.env.PI_NOTIFY_DISABLED) && file.enabled !== false;
-  const timeoutRaw = Number(process.env.PI_NOTIFY_TIMEOUT_MS || file.timeoutMs || DEFAULT_TIMEOUT_MS);
-  const timeoutMs = Number.isFinite(timeoutRaw) ? Math.max(1000, Math.min(timeoutRaw, 15000)) : DEFAULT_TIMEOUT_MS;
+  const endpoint = configString(process.env.PI_NOTIFY_ENDPOINT) || configString(file.endpoint) || DEFAULT_ENDPOINT;
+  const modeValue = configString(process.env.PI_NOTIFY_MESSAGE_MODE) || file.messageMode;
+  const requestedMode = modeValue === "static" ? "static" : "dynamic";
+  const endpointPolicy = applyEndpointPolicy(endpoint, requestedMode);
+  const timeoutValue = configString(process.env.PI_NOTIFY_TIMEOUT_MS) || (file.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+  const timeoutRaw = Number(timeoutValue);
+  const timeoutMs = Number.isFinite(timeoutRaw)
+    ? Math.max(1000, Math.min(timeoutRaw, 15000))
+    : DEFAULT_TIMEOUT_MS;
 
   return {
-    enabled,
-    endpoint: process.env.PI_NOTIFY_ENDPOINT || file.endpoint || DEFAULT_ENDPOINT,
-    token: process.env.PI_NOTIFY_TOKEN || file.token || "",
+    enabled: file.enabled !== false && !isTruthy(process.env.PI_NOTIFY_DISABLED) && endpointPolicy.allowed,
+    endpoint,
+    token: configString(process.env.PI_NOTIFY_TOKEN) || configString(file.token),
     timeoutMs,
     title: normalizeText(process.env.PI_NOTIFY_TITLE || file.title, "Pi", 80),
     bodyTemplate: normalizeText(
@@ -266,35 +336,42 @@ async function getRuntimeConfig(): Promise<RuntimeConfig> {
       "host: {host} | cwd: {cwdBase}",
       220,
     ),
-    messageMode: normalizeMode(process.env.PI_NOTIFY_MESSAGE_MODE || file.messageMode),
+    messageMode: endpointPolicy.messageMode,
     remoteHostAlias: normalizeText(process.env.PI_NOTIFY_REMOTE_ALIAS || file.remoteHostAlias, "", 64),
   };
 }
 
 function shouldSkipNotificationForThisProcess(): boolean {
-  if (process.env.PI_SUBAGENT_CHILD === "1" || process.env.TRELLIS_SUBAGENT_CHILD === "1") return true;
-  // Trellis channel workers (meeting Pi workers) should not send notifications
-  // unless explicitly allowed via PI_NOTIFY_ALLOW_TRELLIS_CHANNEL=1.
-  if (process.env.TRELLIS_CHANNEL && process.env.TRELLIS_CHANNEL_AS && process.env.PI_NOTIFY_ALLOW_TRELLIS_CHANNEL !== "1") return true;
+  if (process.env.PI_SUBAGENT_CHILD === "1" || process.env.TRELLIS_SUBAGENT_CHILD === "1") {
+    return true;
+  }
+  if (
+    process.env.TRELLIS_CHANNEL &&
+    process.env.TRELLIS_CHANNEL_AS &&
+    process.env.PI_NOTIFY_ALLOW_TRELLIS_CHANNEL !== "1"
+  ) {
+    return true;
+  }
   return false;
 }
 
 function normalizeTabTitlePart(value: string, fallback: string): string {
-  const cleaned = value.replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim();
-  return cleaned || fallback;
+  return normalizeText(value, fallback, 96);
 }
 
-function getNotifyTabTitle(cwdBase: string, explicitSessionName?: string): string {
-  const safeCwd = normalizeTabTitlePart(cwdBase, "Pi");
+function getNotifyTarget(cwd: string, explicitSessionName?: string): { cwdBase: string; tabTitle: string } {
+  const cwdBase = normalizeTabTitlePart(basename(cwd) || cwd, "Pi");
   const safeName = explicitSessionName ? normalizeTabTitlePart(explicitSessionName, "") : "";
-  return safeName ? `${PI_TERMINAL_TITLE} - ${safeName} - ${safeCwd}` : `${PI_TERMINAL_TITLE} - ${safeCwd}`;
+  const tabTitle = safeName
+    ? `${PI_TERMINAL_TITLE} - ${safeName} - ${cwdBase}`
+    : `${PI_TERMINAL_TITLE} - ${cwdBase}`;
+  return { cwdBase, tabTitle };
 }
 
-function setTerminalTitle(title: string): void {
-  if (!process.stdout.isTTY) {
+function setTerminalTitle(title: string, mode?: string): void {
+  if (mode !== "tui" || !process.stdout.isTTY) {
     return;
   }
-
   try {
     process.stdout.write(`\u001b]0;${title}\u0007`);
   } catch {
@@ -306,76 +383,75 @@ async function notify(
   token: string,
   payload: { title: string; body: string; focusTarget?: string; cwdBase?: string; tabTitle?: string; sessionName?: string },
   timeoutMs: number,
+  lifecycleSignal: AbortSignal,
 ): Promise<void> {
+  if (lifecycleSignal.aborted) {
+    return;
+  }
   const controller = new AbortController();
+  const abortForLifecycle = () => controller.abort();
+  lifecycleSignal.addEventListener("abort", abortForLifecycle, { once: true });
   const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    const response = await fetch(endpoint, {
+    await fetch(endpoint, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         "X-Pi-Notify-Token": token,
       },
       body: JSON.stringify(payload),
+      redirect: "error",
       signal: controller.signal,
     });
-
-    if (!response.ok) {
-      return;
-    }
   } catch {
-    // Notification failure must never break Pi.
+    // Notification and diagnostic failures must never break Pi.
   } finally {
     clearTimeout(timer);
+    lifecycleSignal.removeEventListener("abort", abortForLifecycle);
   }
 }
 
-function getCurrentNotifyTabTitle(explicitSessionName?: string): { cwdBase: string | undefined; tabTitle: string } {
-  const cwdBase = basename(process.cwd()) || undefined;
-  return { cwdBase, tabTitle: getNotifyTabTitle(cwdBase || "", explicitSessionName) };
-}
-
-export default function remoteWindowsNotify(pi: ExtensionAPI) {
+export default function remoteWindowsNotify(pi: ExtensionAPI): void {
   if (shouldSkipNotificationForThisProcess()) {
     return;
   }
 
   const activeToken = Symbol("pi-remote-windows-notify");
-  globalState.__piRemoteWindowsNotifyRegistered = true;
+  const lifecycleController = new AbortController();
+  globalState.__piRemoteWindowsNotifyLifecycleController?.abort();
   globalState.__piRemoteWindowsNotifyActiveToken = activeToken;
-
+  globalState.__piRemoteWindowsNotifyLifecycleController = lifecycleController;
   const isActiveExtension = () => globalState.__piRemoteWindowsNotifyActiveToken === activeToken;
 
   let currentExplicitSessionName: string | undefined;
   let currentDisplaySessionName: string | undefined;
-  const initialTitle = getCurrentNotifyTabTitle();
-  setTerminalTitle(initialTitle.tabTitle);
 
   pi.on("session_start", (_event, ctx) => {
     if (!isActiveExtension()) {
       return;
     }
-
-    const sessionNames = getSessionNames(ctx);
-    currentExplicitSessionName = sessionNames.explicitName;
-    currentDisplaySessionName = sessionNames.displayName;
-    setTerminalTitle(getCurrentNotifyTabTitle(currentExplicitSessionName).tabTitle);
+    const snapshot = readContextSnapshot(ctx);
+    currentExplicitSessionName = snapshot.explicitSessionName;
+    currentDisplaySessionName = snapshot.displaySessionName;
+    setTerminalTitle(getNotifyTarget(snapshot.cwd, currentExplicitSessionName).tabTitle, snapshot.mode);
   });
 
-  pi.on("session_info_changed", (event) => {
+  pi.on("session_info_changed", (event, ctx) => {
     if (!isActiveExtension()) {
       return;
     }
-
     currentExplicitSessionName = normalizeText(event.name, "", 96) || undefined;
     currentDisplaySessionName = currentExplicitSessionName;
-    setTerminalTitle(getCurrentNotifyTabTitle(currentExplicitSessionName).tabTitle);
+    const snapshot = readContextSnapshot(ctx);
+    setTerminalTitle(getNotifyTarget(snapshot.cwd, currentExplicitSessionName).tabTitle, snapshot.mode);
   });
 
   pi.on("session_shutdown", () => {
+    lifecycleController.abort();
     if (isActiveExtension()) {
-      globalState.__piRemoteWindowsNotifyActiveToken = undefined;
+      delete globalState.__piRemoteWindowsNotifyActiveToken;
+      delete globalState.__piRemoteWindowsNotifyLifecycleController;
     }
   });
 
@@ -383,40 +459,37 @@ export default function remoteWindowsNotify(pi: ExtensionAPI) {
     if (shouldSkipNotificationForThisProcess() || !isActiveExtension()) {
       return;
     }
-
     const config = await getRuntimeConfig();
-    if (!config.enabled || !config.token) {
+    if (!isActiveExtension() || lifecycleController.signal.aborted || !config.enabled || !config.token) {
       return;
     }
 
     const messages = Array.isArray((event as { messages?: AgentMessageLike[] }).messages)
       ? ((event as { messages: AgentMessageLike[] }).messages ?? [])
       : [];
+    const snapshot = readContextSnapshot(ctx, messages);
+    const explicitSessionName = snapshot.explicitSessionName ?? currentExplicitSessionName;
+    const sessionName = snapshot.displaySessionName ?? currentDisplaySessionName;
+    const target = getNotifyTarget(snapshot.cwd, explicitSessionName);
+    const payload = config.messageMode === "static"
+      ? { title: config.title, body: renderBody(config.bodyTemplate, snapshot.cwd) }
+      : buildDynamicNotification(messages, config, snapshot.cwd);
 
-    const payload =
-      config.messageMode === "static"
-        ? { title: config.title, body: renderBody(config.bodyTemplate) }
-        : buildDynamicNotification(messages, config);
-
-    const sessionNames = getSessionNames(ctx);
-    const explicitSessionName = sessionNames.explicitName ?? currentExplicitSessionName;
-    const sessionName = sessionNames.displayName ?? currentDisplaySessionName;
-    const { cwdBase, tabTitle } = getCurrentNotifyTabTitle(explicitSessionName);
     currentExplicitSessionName = explicitSessionName;
     currentDisplaySessionName = sessionName;
-    setTerminalTitle(tabTitle);
-
+    setTerminalTitle(target.tabTitle, snapshot.mode);
     await notify(
       config.endpoint,
       config.token,
       {
         ...payload,
         focusTarget: config.remoteHostAlias || undefined,
-        cwdBase,
-        tabTitle,
+        cwdBase: target.cwdBase,
+        tabTitle: target.tabTitle,
         sessionName,
       },
       config.timeoutMs,
+      lifecycleController.signal,
     );
   });
 }

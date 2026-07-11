@@ -19,7 +19,6 @@ $configPath = [System.IO.Path]::GetFullPath($ConfigPath)
 $baseDir = Split-Path -Parent $configPath
 $binDir = Join-Path $baseDir 'bin'
 $instancePaths = @($configPath, $binDir, $baseDir)
-$piExtDir = "$env:USERPROFILE\.pi\agent\extensions"
 $listenerPidPath = Join-Path $baseDir 'listener.pid'
 $tunnelPidPath = Join-Path $baseDir 'tunnel.pid'
 
@@ -283,7 +282,7 @@ if ($Port -gt 0 -and (($null -eq $cfg.port) -or ([int]$cfg.port -eq 23117) -or (
 $cfg | ConvertTo-Json -Depth 10 | Set-Content $configPath -Encoding UTF8
 
 Write-Host "[3/7] sync runtime files..."
-New-Item -ItemType Directory -Force -Path $binDir, $piExtDir | Out-Null
+New-Item -ItemType Directory -Force -Path $binDir | Out-Null
 $runtimeFiles = @(
     'NotifyBridge.Common.ps1',
     'NotifyBridge.Process.ps1',
@@ -302,6 +301,7 @@ $runtimeFiles = @(
     'pi-notify-noop.ps1',
     'set-notify-mode.ps1',
     'register-toast-shortcut.py',
+    'pi-notify-ensure.mjs',
     'remote-windows-notify.ts',
     'popup-wallpaper.png',
     'install-remote-windows-notify.ps1',
@@ -316,7 +316,6 @@ foreach ($name in $runtimeFiles) {
         Copy-Item -LiteralPath $source -Destination $destination -Force
     }
 }
-Copy-Item "$PSScriptRoot\remote-windows-notify.ts" "$piExtDir\remote-windows-notify.ts" -Force
 $bundledWallpaperPath = Join-Path $binDir 'popup-wallpaper.png'
 if ((Test-Path -LiteralPath $bundledWallpaperPath) -and ((-not $cfg.PSObject.Properties['popupWallpaperPath']) -or [string]::IsNullOrWhiteSpace([string]$cfg.popupWallpaperPath) -or -not (Test-Path -LiteralPath ([string]$cfg.popupWallpaperPath)))) {
     if ($cfg.PSObject.Properties['popupWallpaperPath']) { $cfg.popupWallpaperPath = $bundledWallpaperPath } else { $cfg | Add-Member -NotePropertyName 'popupWallpaperPath' -NotePropertyValue $bundledWallpaperPath }

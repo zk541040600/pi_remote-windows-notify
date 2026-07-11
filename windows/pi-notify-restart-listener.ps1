@@ -37,6 +37,7 @@ function Sync-LocalRuntimeFiles {
         'pi-notify-noop.ps1',
         'register-toast-shortcut.py',
         'set-notify-mode.ps1',
+        'pi-notify-ensure.mjs',
         'remote-windows-notify.ts',
         'popup-wallpaper.png',
         'install-remote-windows-notify.ps1',

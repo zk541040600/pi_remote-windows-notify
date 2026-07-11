@@ -52,6 +52,7 @@ $runtimeFiles = @(
     'pi-notify-noop.ps1',
     'register-toast-shortcut.py',
     'set-notify-mode.ps1',
+    'pi-notify-ensure.mjs',
     'remote-windows-notify.ts',
     'popup-wallpaper.png',
     'install-remote-windows-notify.ps1',
@@ -73,6 +74,10 @@ $templatePath = Join-Path $PSScriptRoot 'remote-windows-notify.ts'
 if (-not (Test-Path -LiteralPath $templatePath)) {
     throw "Extension template not found: $templatePath"
 }
+$ensurePath = Join-Path $PSScriptRoot 'pi-notify-ensure.mjs'
+if (-not (Test-Path -LiteralPath $ensurePath)) {
+    throw "Remote ensure program not found: $ensurePath"
+}
 
 $sshExe = Resolve-NotifyBridgeWorkingSshExecutable -PreferredSshExe $preferredSshExe -RemoteHost $RemoteHostAlias -SshOptions $sshOptions
 if ($sshExe -ne [string]$config.SshExecutable) {
@@ -87,14 +92,16 @@ $remoteHome = (& $sshExe @sshOptions $RemoteHostAlias 'printf %s "$HOME"').Trim(
 if ([string]::IsNullOrWhiteSpace($remoteHome)) {
     throw "Failed to resolve remote HOME on $RemoteHostAlias."
 }
+$remoteNode = (& $sshExe @sshOptions $RemoteHostAlias 'command -v node').Trim()
+if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($remoteNode)) {
+    throw "Failed to resolve remote Node.js on $RemoteHostAlias."
+}
 
 $remotePiDir = Resolve-NotifyBridgeRemotePiDir -PathValue $RemotePiDir -RemoteHome $remoteHome
-$remoteExtensionDir = "$remotePiDir/extensions"
-$remoteExtensionPath = "$remoteExtensionDir/remote-windows-notify.ts"
 $remoteManagedDir = "$remoteHome/.local/share/pi-notify"
 $remoteManagedExtensionPath = "$remoteManagedDir/remote-windows-notify.ts"
+$remoteManagedEnsurePath = "$remoteManagedDir/pi-notify-ensure.mjs"
 $remoteManagedConfigPath = "$remoteManagedDir/remote-windows-notify.json"
-$remoteConfigPath = "$remotePiDir/remote-windows-notify.json"
 
 $remoteConfig = @{
     enabled         = $true
@@ -109,15 +116,10 @@ $remoteConfig = @{
 $remoteConfigJson = $remoteConfig | ConvertTo-Json -Depth 6
 
 Write-Host "Installing remote Pi notify bridge on $RemoteHostAlias ..."
-$mkdirCommand = ('mkdir -p {0} {1}' -f (ConvertTo-NotifyBridgeRemoteShellLiteral -Value $remoteExtensionDir), (ConvertTo-NotifyBridgeRemoteShellLiteral -Value $remoteManagedDir))
+$mkdirCommand = ('mkdir -p {0}' -f (ConvertTo-NotifyBridgeRemoteShellLiteral -Value $remoteManagedDir))
 & $sshExe @sshOptions $RemoteHostAlias $mkdirCommand
 if ($LASTEXITCODE -ne 0) {
-    throw "Failed to create remote extension directories on $RemoteHostAlias."
-}
-
-Copy-NotifyBridgeFileToRemotePath @remoteTransferArgs -LocalPath $templatePath -RemotePath $remoteExtensionPath
-if ($LASTEXITCODE -ne 0) {
-    throw "Failed to upload remote extension to $RemoteHostAlias."
+    throw "Failed to create remote managed directory on $RemoteHostAlias."
 }
 
 Copy-NotifyBridgeFileToRemotePath @remoteTransferArgs -LocalPath $templatePath -RemotePath $remoteManagedExtensionPath
@@ -125,35 +127,9 @@ if ($LASTEXITCODE -ne 0) {
     throw "Failed to upload managed remote extension to $RemoteHostAlias."
 }
 
-$syncCommand = ('REMOTE_MANAGED_EXT={0} REMOTE_PI_DIR={1} python3 -' -f (ConvertTo-NotifyBridgeRemoteShellLiteral -Value $remoteManagedExtensionPath), (ConvertTo-NotifyBridgeRemoteShellLiteral -Value $remotePiDir))
-@'
-import os
-import shutil
-
-src = os.environ["REMOTE_MANAGED_EXT"]
-remote_pi_dir = os.environ["REMOTE_PI_DIR"]
-roots = [
-    os.path.join(os.path.expanduser("~"), ".pi", "agent", "git", "github.com", "zk541040600", "pi_remote-windows-notify"),
-    os.path.join(remote_pi_dir, "git", "github.com", "zk541040600", "pi_remote-windows-notify"),
-]
-for root in dict.fromkeys(roots):
-    if not (os.path.isfile(src) and os.path.isdir(root)):
-        continue
-    for dirpath, _dirnames, filenames in os.walk(root):
-        if "remote-windows-notify.ts" not in filenames:
-            continue
-        dest = os.path.join(dirpath, "remote-windows-notify.ts")
-        shutil.copyfile(src, dest)
-        os.chmod(dest, 0o644)
-        print(f"synced package extension: {dest}")
-'@ | & $sshExe @sshOptions $RemoteHostAlias $syncCommand
+Copy-NotifyBridgeFileToRemotePath @remoteTransferArgs -LocalPath $ensurePath -RemotePath $remoteManagedEnsurePath
 if ($LASTEXITCODE -ne 0) {
-    throw "Failed to sync remote package extension copies on $RemoteHostAlias."
-}
-
-Copy-NotifyBridgeTextToRemotePath @remoteTransferArgs -Content $remoteConfigJson -RemotePath $remoteConfigPath -Mode '0600'
-if ($LASTEXITCODE -ne 0) {
-    throw "Failed to upload remote config to $RemoteHostAlias."
+    throw "Failed to upload remote ensure program to $RemoteHostAlias."
 }
 
 Copy-NotifyBridgeTextToRemotePath @remoteTransferArgs -Content $remoteConfigJson -RemotePath $remoteManagedConfigPath -Mode '0600'
@@ -161,7 +137,13 @@ if ($LASTEXITCODE -ne 0) {
     throw "Failed to upload managed remote config to $RemoteHostAlias."
 }
 
-$verifyCommand = ('test -f {0} && test -f {1} && test -f {2} && test "$(stat -c ''%a'' {1})" = 600 && test "$(stat -c ''%a'' {2})" = 600 && printf ''REMOTE_INSTALLED=1\nEXT=%s\nCFG=%s\nMANAGED_CFG=%s\n'' {3} {4} {5}' -f (ConvertTo-NotifyBridgeRemoteShellLiteral -Value $remoteExtensionPath), (ConvertTo-NotifyBridgeRemoteShellLiteral -Value $remoteConfigPath), (ConvertTo-NotifyBridgeRemoteShellLiteral -Value $remoteManagedConfigPath), (ConvertTo-NotifyBridgeRemoteShellLiteral -Value $remoteExtensionPath), (ConvertTo-NotifyBridgeRemoteShellLiteral -Value $remoteConfigPath), (ConvertTo-NotifyBridgeRemoteShellLiteral -Value $remoteManagedConfigPath))
+$ensureCommand = ('{0} {1} --managed-dir {2} --pi-dir {3}' -f (ConvertTo-NotifyBridgeRemoteShellLiteral -Value $remoteNode), (ConvertTo-NotifyBridgeRemoteShellLiteral -Value $remoteManagedEnsurePath), (ConvertTo-NotifyBridgeRemoteShellLiteral -Value $remoteManagedDir), (ConvertTo-NotifyBridgeRemoteShellLiteral -Value $remotePiDir))
+& $sshExe @sshOptions $RemoteHostAlias $ensureCommand
+if ($LASTEXITCODE -ne 0) {
+    throw "Failed to converge remote extension ownership on $RemoteHostAlias."
+}
+
+$verifyCommand = ('{0} {1} --check --managed-dir {2}' -f (ConvertTo-NotifyBridgeRemoteShellLiteral -Value $remoteNode), (ConvertTo-NotifyBridgeRemoteShellLiteral -Value $remoteManagedEnsurePath), (ConvertTo-NotifyBridgeRemoteShellLiteral -Value $remoteManagedDir))
 & $sshExe @sshOptions $RemoteHostAlias $verifyCommand
 if ($LASTEXITCODE -ne 0) {
     throw "Remote verify failed on $RemoteHostAlias."

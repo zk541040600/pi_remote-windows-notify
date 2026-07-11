@@ -19,6 +19,7 @@ This folder implements a reliable **Windows local notification bridge** for runn
 - `install-linux-autostart.ps1` — installs Linux systemd boot-time remote guard on `my`
 - `install-autostart-all.ps1` — one-shot installer for both Windows + Linux autostart
 - `remote-windows-notify.ts` — Pi extension template installed on the remote host
+- `pi-notify-ensure.mjs` — atomic package/standalone ownership, config restore, and read-only drift check on the remote host
 
 ## Architecture
 
@@ -47,8 +48,12 @@ powershell.exe -ExecutionPolicy Bypass -File .\scripts\pi-notify\install-remote-
 This creates/updates:
 
 - local config: `%USERPROFILE%\.pi-notify\config.json`
-- remote extension: `~/.pi/agent/extensions/remote-windows-notify.ts`
+- remote extension: the installed package entry, or `~/.pi/agent/extensions/remote-windows-notify.ts` only when the package is absent
 - remote config: `~/.pi/agent/remote-windows-notify.json`
+
+If the package is installed, an identical legacy global extension is removed to prevent duplicate Pi
+hook registration. A different global file is treated as a conflict and the installer stops without
+overwriting it.
 
 ## Manual mode
 
@@ -132,7 +137,10 @@ Installs and enables a user-level autostart guard:
 - preferred: `systemd --user` service `pi-remote-windows-notify-ensure.service`
 - fallback: user `crontab @reboot` entry when `systemd --user` is unavailable
 
-It runs on Linux user startup and ensures the remote Pi extension/config are restored into `-RemotePiDir` from a managed copy. The default remote Pi directory is `~/.pi/agent/`.
+It runs on Linux user startup and calls the same atomic ensure program used during install. The saved
+install state restores the selected `-RemotePiDir`, keeps package and standalone modes mutually
+exclusive, and verifies the remote config remains mode `0600`. The default remote Pi directory is
+`~/.pi/agent/`.
 
 ## After autostart is installed
 
@@ -248,6 +256,10 @@ Template fields:
 The default popup background is bundled as `popup-wallpaper.png` and copied into `%USERPROFILE%\.pi-notify\bin` by install/refresh.
 
 Default behavior is `messageMode: dynamic`: the toast title/body are generated from the last prompt, tool names, and final reply. `bodyTemplate` is used as fallback, or when `messageMode` is set to `static`.
+
+Loopback HTTP/HTTPS endpoints are allowed. Non-loopback HTTP is rejected. A non-loopback HTTPS
+endpoint requires `PI_NOTIFY_ALLOW_NONLOCAL=1`; dynamic prompt/reply content additionally requires
+`PI_NOTIFY_ALLOW_NONLOCAL_DYNAMIC=1`, otherwise the extension forces static mode.
 
 Display modes:
 

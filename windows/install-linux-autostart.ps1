@@ -33,12 +33,6 @@ $config = Ensure-NotifyBridgeConfig @configArgs
 $preferredSshExe = [string]$config.SshExecutable
 $sshOptions = @('-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10')
 
-function ConvertTo-SingleQuotedShellContent {
-    param([Parameter(Mandatory = $true)][string]$Value)
-    $quote = [string][char]39
-    return $Value.Replace($quote, ($quote + '"' + $quote + '"' + $quote))
-}
-
 $sshExe = Resolve-NotifyBridgeWorkingSshExecutable -PreferredSshExe $preferredSshExe -RemoteHost $RemoteHostAlias -SshOptions $sshOptions
 if ($sshExe -ne [string]$config.SshExecutable) {
     $config = Ensure-NotifyBridgeConfig -ConfigPath $config.ConfigPath -SshExecutable $sshExe
@@ -51,6 +45,10 @@ $remoteTransferArgs = @{
 $remoteHome = (& $sshExe @sshOptions $RemoteHostAlias 'printf %s "$HOME"').Trim()
 if ([string]::IsNullOrWhiteSpace($remoteHome)) {
     throw "Failed to resolve remote HOME on $RemoteHostAlias."
+}
+$remoteNode = (& $sshExe @sshOptions $RemoteHostAlias 'command -v node').Trim()
+if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($remoteNode)) {
+    throw "Failed to resolve remote Node.js on $RemoteHostAlias."
 }
 
 $remoteManagedDir = "$remoteHome/.local/share/pi-notify"
@@ -67,35 +65,14 @@ try {
     $tempScript = Join-Path $tempRoot 'pi-notify-bridge-ensure.sh'
     $tempUnit = Join-Path $tempRoot "$remoteServiceName.service"
 
-    $remoteConfig = @{
-        enabled         = $true
-        endpoint        = $config.RemoteUrl
-        token           = $config.Token
-        timeoutMs       = 4000
-        title           = 'Pi'
-        bodyTemplate    = 'host: {host} | cwd: {cwdBase}'
-        messageMode     = 'dynamic'
-        remoteHostAlias = $RemoteHostAlias
-    }
-    $remoteConfigJson = $remoteConfig | ConvertTo-Json -Depth 6
-
     $ensureScript = @'
 #!/usr/bin/env bash
 set -euo pipefail
-managed_dir='__MANAGED_DIR__'
-pi_dir='__PI_DIR__'
-mkdir -p "$pi_dir/extensions"
-install -m 0644 "$managed_dir/remote-windows-notify.ts" "$pi_dir/extensions/remote-windows-notify.ts"
-package_root="$pi_dir/git/github.com/zk541040600/pi_remote-windows-notify"
-if [ -d "$package_root" ]; then
-  find "$package_root" -type f -name remote-windows-notify.ts -print0 | while IFS= read -r -d '' dest; do
-    install -m 0644 "$managed_dir/remote-windows-notify.ts" "$dest"
-  done
-fi
-install -m 0600 "$managed_dir/remote-windows-notify.json" "$pi_dir/remote-windows-notify.json"
-echo "Pi notify bridge ensured in $pi_dir"
+managed_dir=__MANAGED_DIR__
+node_exe=__NODE_EXE__
+exec "$node_exe" "$managed_dir/pi-notify-ensure.mjs" --managed-dir "$managed_dir"
 '@
-    $ensureScript = $ensureScript.Replace('__MANAGED_DIR__', (ConvertTo-SingleQuotedShellContent -Value $remoteManagedDir)).Replace('__PI_DIR__', (ConvertTo-SingleQuotedShellContent -Value $remotePiDir))
+    $ensureScript = $ensureScript.Replace('__MANAGED_DIR__', (ConvertTo-NotifyBridgeRemoteShellLiteral -Value $remoteManagedDir)).Replace('__NODE_EXE__', (ConvertTo-NotifyBridgeRemoteShellLiteral -Value $remoteNode))
     [System.IO.File]::WriteAllText($tempScript, $ensureScript.TrimStart(), [System.Text.UTF8Encoding]::new($false))
 
     $serviceUnit = @"
@@ -116,12 +93,6 @@ WantedBy=default.target
     $mkdirManagedCommand = ('mkdir -p {0}' -f (ConvertTo-NotifyBridgeRemoteShellLiteral -Value $remoteManagedDir))
     & $sshExe @sshOptions $RemoteHostAlias $mkdirManagedCommand
     if ($LASTEXITCODE -ne 0) { throw "Failed to create remote managed dir on $RemoteHostAlias." }
-
-    Copy-NotifyBridgeFileToRemotePath @remoteTransferArgs -LocalPath (Join-Path $PSScriptRoot 'remote-windows-notify.ts') -RemotePath "$remoteManagedDir/remote-windows-notify.ts"
-    if ($LASTEXITCODE -ne 0) { throw "Failed to upload managed extension to $RemoteHostAlias." }
-
-    Copy-NotifyBridgeTextToRemotePath @remoteTransferArgs -Content $remoteConfigJson -RemotePath "$remoteManagedDir/remote-windows-notify.json" -Mode '0600'
-    if ($LASTEXITCODE -ne 0) { throw "Failed to upload managed config to $RemoteHostAlias." }
 
     Copy-NotifyBridgeFileToRemotePath @remoteTransferArgs -LocalPath $tempScript -RemotePath "$remoteManagedDir/pi-notify-bridge-ensure.sh"
     if ($LASTEXITCODE -ne 0) { throw "Failed to upload ensure script to $RemoteHostAlias." }

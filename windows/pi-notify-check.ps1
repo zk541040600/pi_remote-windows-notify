@@ -19,7 +19,7 @@ $runtimeBin = Join-Path $runtimeBaseDir 'bin'
 
 Write-Host ('repo: {0}' -f $repoDir)
 
-$sourcePaths = @(Get-ChildItem -LiteralPath $PSScriptRoot -File | Where-Object { $_.Extension -in @('.ps1', '.py', '.ts') })
+$sourcePaths = @(Get-ChildItem -LiteralPath $PSScriptRoot -File | Where-Object { $_.Extension -in @('.ps1', '.py', '.ts', '.mjs') })
 $sourceText = @{}
 foreach ($path in $sourcePaths) {
     $sourceText[$path.Name] = [System.IO.File]::ReadAllText($path.FullName, [System.Text.UTF8Encoding]::new($false))
@@ -74,14 +74,14 @@ if ((Test-Path -LiteralPath $linuxExtensionPath) -and (Test-Path -LiteralPath $w
     if ($linuxExtension -ne $windowsExtension) {
         throw 'Linux and Windows extension templates differ. Copy the canonical extension before shipping.'
     }
-    if ($windowsExtension -notmatch 'getExtensionConfigPaths' -or $windowsExtension -notmatch 'fileURLToPath\(import\.meta\.url\)') {
+    if ($windowsExtension -notmatch '__piRemoteWindowsNotifyActiveToken' -or $windowsExtension -match '__piRemoteWindowsNotifyRegistered' -or $windowsExtension -notmatch 'getExtensionConfigPaths' -or $windowsExtension -notmatch 'fileURLToPath\(import\.meta\.url\)') {
         throw 'Extension template must discover remote-windows-notify.json relative to its installed path for custom -RemotePiDir.'
     }
     Write-Host 'OK extension templates match'
 }
 elseif (Test-Path -LiteralPath $flatExtensionPath) {
     $flatExtension = [string]$sourceText['remote-windows-notify.ts']
-    if ($flatExtension -notmatch '__piRemoteWindowsNotifyRegistered' -or $flatExtension -match 'cachedConfigPromise' -or $flatExtension -notmatch '127\.0\.0\.1:23118/notify' -or $flatExtension -notmatch 'getExtensionConfigPaths' -or $flatExtension -notmatch 'fileURLToPath\(import\.meta\.url\)') {
+    if ($flatExtension -notmatch '__piRemoteWindowsNotifyActiveToken' -or $flatExtension -match '__piRemoteWindowsNotifyRegistered' -or $flatExtension -match 'cachedConfigPromise' -or $flatExtension -notmatch '127\.0\.0\.1:23118/notify' -or $flatExtension -notmatch 'getExtensionConfigPaths' -or $flatExtension -notmatch 'fileURLToPath\(import\.meta\.url\)') {
         throw 'Flat extension template is stale.'
     }
     Write-Host 'OK flat extension template is current'
@@ -506,7 +506,7 @@ if ($refreshText -match 'origin master' -or $refreshText -notmatch 'rev-parse --
 if ($refreshText -notmatch '\$runtimeFiles' -or $refreshText -notmatch 'GetFullPath\(\$source\)' -or $refreshText -notmatch 'GetFullPath\(\$destination\)') {
     throw 'Refresh runtime sync must use a runtime file list with same-path skip so it works from the runtime bin.'
 }
-foreach ($requiredRuntimeName in @('NotifyBridge.Process.ps1', 'NotifyBridge.Remote.ps1', 'remote-windows-notify.ts', 'popup-wallpaper.png', 'install-remote-windows-notify.ps1', 'install-linux-autostart.ps1', 'install-windows-autostart.ps1', 'install-autostart-all.ps1', 'pi-notify-check.ps1', 'pi-notify-hotkey.ps1', 'pi-notify-broker.ps1')) {
+foreach ($requiredRuntimeName in @('NotifyBridge.Process.ps1', 'NotifyBridge.Remote.ps1', 'pi-notify-ensure.mjs', 'remote-windows-notify.ts', 'popup-wallpaper.png', 'install-remote-windows-notify.ps1', 'install-linux-autostart.ps1', 'install-windows-autostart.ps1', 'install-autostart-all.ps1', 'pi-notify-check.ps1', 'pi-notify-hotkey.ps1', 'pi-notify-broker.ps1')) {
     if ($refreshText -notmatch [regex]::Escape($requiredRuntimeName) -or $autostartAllText -match 'unused-never-match') {
         throw ('Refresh runtime sync must copy required file: {0}' -f $requiredRuntimeName)
     }
@@ -516,7 +516,7 @@ foreach ($requiredRuntimeName in @('NotifyBridge.Process.ps1', 'NotifyBridge.Rem
 }
 $runtimeBin = Join-Path $runtimeBaseDir 'bin'
 if (Test-Path -LiteralPath $runtimeBin) {
-    foreach ($requiredRuntimeName in @('NotifyBridge.Process.ps1', 'NotifyBridge.Remote.ps1', 'remote-windows-notify.ts', 'popup-wallpaper.png', 'install-remote-windows-notify.ps1', 'install-linux-autostart.ps1', 'install-windows-autostart.ps1', 'install-autostart-all.ps1', 'pi-notify-check.ps1', 'pi-notify-hotkey.ps1', 'pi-notify-broker.ps1')) {
+    foreach ($requiredRuntimeName in @('NotifyBridge.Process.ps1', 'NotifyBridge.Remote.ps1', 'pi-notify-ensure.mjs', 'remote-windows-notify.ts', 'popup-wallpaper.png', 'install-remote-windows-notify.ps1', 'install-linux-autostart.ps1', 'install-windows-autostart.ps1', 'install-autostart-all.ps1', 'pi-notify-check.ps1', 'pi-notify-hotkey.ps1', 'pi-notify-broker.ps1')) {
         if (-not (Test-Path -LiteralPath (Join-Path $runtimeBin $requiredRuntimeName))) {
             throw ('Runtime bin is missing required file: {0}' -f $requiredRuntimeName)
         }
@@ -639,70 +639,8 @@ else {
 
 Write-Host '[7/10] remote extension copies...'
 if ($null -ne $cfg -and -not [string]::IsNullOrWhiteSpace([string]$cfg.remoteHostAlias)) {
-    $remoteAudit = @'
-import os
-import stat
-import sys
-
-paths = []
-for name in (
-    "~/.local/share/pi-notify/remote-windows-notify.ts",
-    "~/.pi/agent/extensions/remote-windows-notify.ts",
-):
-    path = os.path.expanduser(name)
-    if os.path.isfile(path):
-        paths.append(path)
-
-package_root = os.path.expanduser("~/.pi/agent/git/github.com/zk541040600/pi_remote-windows-notify")
-if os.path.isdir(package_root):
-    for dirpath, _dirnames, filenames in os.walk(package_root):
-        if "remote-windows-notify.ts" in filenames:
-            paths.append(os.path.join(dirpath, "remote-windows-notify.ts"))
-
-paths = sorted(set(paths))
-if not paths:
-    print("BAD no remote extension copies found")
-    sys.exit(3)
-
-bad = []
-for path in paths:
-    with open(path, "r", encoding="utf-8-sig") as handle:
-        text = handle.read()
-    ok = "__piRemoteWindowsNotifyRegistered" in text and "cachedConfigPromise" not in text and "127.0.0.1:23118/notify" in text and "getExtensionConfigPaths" in text and "fileURLToPath(import.meta.url)" in text
-    print(("OK " if ok else "BAD ") + path)
-    if not ok:
-        bad.append(path)
-
-if bad:
-    sys.exit(2)
-print(f"checked {len(paths)} remote extension copies")
-
-config_bad = []
-checked_config = 0
-for name in (
-    "~/.local/share/pi-notify/remote-windows-notify.json",
-    "~/.pi/agent/remote-windows-notify.json",
-):
-    path = os.path.expanduser(name)
-    if not os.path.isfile(path):
-        continue
-    checked_config += 1
-    mode = stat.S_IMODE(os.stat(path).st_mode)
-    ok = mode == 0o600
-    print(("OK " if ok else "BAD ") + f"{path} mode={mode:03o}")
-    if not ok:
-        config_bad.append(path)
-
-if checked_config == 0:
-    print("BAD no remote token config files found")
-    sys.exit(4)
-if config_bad:
-    sys.exit(4)
-print(f"checked {checked_config} remote token config files")
-'@
     $remoteSsh = if ($cfg.PSObject.Properties['sshExecutable'] -and -not [string]::IsNullOrWhiteSpace([string]$cfg.sshExecutable)) { [string]$cfg.sshExecutable } else { 'ssh.exe' }
-    $remoteAuditB64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($remoteAudit))
-    $remoteCommand = ('tmp=/tmp/pi_notify_audit_$$.py; printf %s ''{0}'' | base64 -d > "$tmp" && python3 "$tmp"; rc=$?; rm -f "$tmp"; exit $rc' -f $remoteAuditB64)
+    $remoteCommand = 'node_exe="$(command -v node)" && "$node_exe" "$HOME/.local/share/pi-notify/pi-notify-ensure.mjs" --check --managed-dir "$HOME/.local/share/pi-notify"'
     $remoteArgs = Join-NotifyBridgeProcessArguments @(
         '-T',
         '-o', 'BatchMode=yes',
@@ -735,25 +673,13 @@ print(f"checked {checked_config} remote token config files")
     $remoteText = $remoteOutput -join "`n"
     $remoteExitCodeText = ''
     try { $remoteExitCodeText = [string]$remoteProcess.ExitCode } catch { $remoteExitCodeText = '' }
-    $remoteSuccessByOutput = ($remoteText -match 'checked \d+ remote extension copies' -and $remoteText -match 'checked \d+ remote token config files' -and $remoteText -notmatch '^BAD ')
+    $remoteSuccessByOutput = ($remoteText -match '^OK Pi notify bridge verified mode=(package|standalone) packageCopies=\d+ active=' -and $remoteText -notmatch '^BAD ')
     if ($remoteExitCodeText -eq '0' -or $remoteSuccessByOutput) {
         $remoteOutput | ForEach-Object { Write-Host $_ }
     }
-    elseif ($remoteExitCodeText -eq '2' -or $remoteText -match '^BAD .*remote-windows-notify\.ts') {
-        $remoteOutput | ForEach-Object { Write-Host $_ }
-        throw 'Stale remote extension copy found. Run pi-notify-refresh.ps1 -SyncRemote.'
-    }
-    elseif ($remoteExitCodeText -eq '3' -or $remoteText -match 'BAD no remote extension copies found') {
-        $remoteOutput | ForEach-Object { Write-Host $_ }
-        throw 'No remote extension copies found. Run pi-notify-refresh.ps1 -SyncRemote.'
-    }
-    elseif ($remoteExitCodeText -eq '4' -or $remoteText -match 'BAD .*mode=|BAD no remote token config files found') {
-        $remoteOutput | ForEach-Object { Write-Host $_ }
-        throw 'Remote token config permissions are unsafe. Run pi-notify-refresh.ps1 -SyncRemote.'
-    }
     else {
         $remoteOutput | ForEach-Object { Write-Host $_ }
-        throw ('Remote extension audit failed via {0}. Run pi-notify-refresh.ps1 -SyncRemote.' -f $remoteSsh)
+        throw ('Remote extension ownership/config audit failed via {0}. Run pi-notify-refresh.ps1 -SyncRemote.' -f $remoteSsh)
     }
 }
 else {

@@ -8,6 +8,10 @@
     "pi-package",
     "pi-extension"
   ],
+  "scripts": {
+    "check": "node scripts/check-package.mjs",
+    "test": "node --experimental-transform-types --test test/*.test.mjs"
+  },
   "pi": {
     "extensions": [
       "./linux/extensions/remote-windows-notify.ts"

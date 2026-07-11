@@ -30,6 +30,11 @@ Edit `~/.pi/agent/remote-windows-notify.json`:
 
 Then restart Pi or run `/reload`.
 
+The package entry is the preferred active source. `pi-notify-ensure.mjs`, used by the Windows
+installer and Linux boot guard, keeps exactly one load path: package copies when this package is
+installed, otherwise the standalone global extension. A different pre-existing global copy causes
+the installer to fail for manual review instead of overwriting it.
+
 ## Environment overrides
 
 - `PI_NOTIFY_CONFIG` - config file path.
@@ -40,5 +45,7 @@ Then restart Pi or run `/reload`.
 - `PI_NOTIFY_BODY_TEMPLATE` - body template, supports `{host}`, `{cwd}`, and `{cwdBase}`.
 - `PI_NOTIFY_REMOTE_ALIAS` - Windows listener focus target / remote host alias.
 - `PI_NOTIFY_DISABLED=1` - disable notifications.
+- `PI_NOTIFY_ALLOW_NONLOCAL=1` - allow a non-loopback HTTPS endpoint. Non-loopback HTTP is always rejected.
+- `PI_NOTIFY_ALLOW_NONLOCAL_DYNAMIC=1` - additionally allow prompts/replies in notifications sent to a non-loopback HTTPS endpoint; without this flag they are forced to static mode.
 
 Notification failures are ignored so they never break Pi.
