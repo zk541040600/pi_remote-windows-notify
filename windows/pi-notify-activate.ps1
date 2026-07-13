@@ -268,6 +268,7 @@ function Focus-NotifyWindow {
     $windows = Get-CandidateWindows
 
     $best = $null
+    $eligibleCount = 0
     foreach ($window in $windows) {
         $baseScore = 0
         foreach ($keyword in $normalized) {
@@ -309,6 +310,7 @@ function Focus-NotifyWindow {
                 continue
             }
 
+            $eligibleCount += 1
             $candidate = [pscustomobject]@{
                 Window   = $window
                 Score    = $score
@@ -320,6 +322,11 @@ function Focus-NotifyWindow {
                 $best = $candidate
             }
         }
+    }
+
+    if ($eligibleCount -gt 1) {
+        Write-NotifyActivateLog -Message ('focus-ambiguous candidateCount={0} bestScore={1} requiredFingerprint="{2}"' -f $eligibleCount, $best.Score, (Get-NotifyActivateFingerprint $required))
+        return $false
     }
 
     if ($null -eq $best) {

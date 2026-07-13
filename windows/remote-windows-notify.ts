@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { hostname, homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
@@ -38,12 +39,21 @@ type ContextSnapshot = {
   mode?: string;
   explicitSessionName?: string;
   displaySessionName?: string;
+  sessionKey?: string;
 };
 
 const DEFAULT_ENDPOINT = "http://127.0.0.1:23118/notify";
 const DEFAULT_TIMEOUT_MS = 4000;
 const DEFAULT_CONFIG_PATH = join(homedir(), ".pi", "agent", "remote-windows-notify.json");
 const PI_TERMINAL_TITLE = "π";
+const MAX_CANONICAL_TITLE_BYTES = 144;
+const SESSION_KEY_LENGTH = 12;
+const OSC_SEQUENCE_PATTERN = /(?:\u001b\]|\u009d)[\s\S]*?(?:\u0007|\u001b\\|\u009c|$)/gu;
+const TERMINAL_STRING_PATTERN = /(?:\u001b[P^_X]|\u0090|\u0098|\u009e|\u009f)[\s\S]*?(?:\u001b\\|\u009c|$)/gu;
+const CSI_SEQUENCE_PATTERN = /(?:\u001b\[|\u009b)[0-?]*[ -/]*[@-~]/gu;
+const ESC_SEQUENCE_PATTERN = /\u001b(?:[ -/]*[@-~])?/gu;
+const TITLE_CONTROL_PATTERN = /[\u0000-\u001f\u007f-\u009f]+/gu;
+const BIDI_CONTROL_PATTERN = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]+/gu;
 const globalState = globalThis as {
   __piRemoteWindowsNotifyActiveToken?: symbol;
   __piRemoteWindowsNotifyLifecycleController?: AbortController;
@@ -66,6 +76,39 @@ function normalizeText(value: unknown, fallback: string, maxLength: number): str
     return next;
   }
   return `${characters.slice(0, Math.max(0, maxLength - 1)).join("").trimEnd()}…`;
+}
+
+function truncateUtf8(value: string, maxBytes: number): string {
+  if (Buffer.byteLength(value, "utf8") <= maxBytes) {
+    return value;
+  }
+
+  const ellipsis = "…";
+  const contentBudget = Math.max(0, maxBytes - Buffer.byteLength(ellipsis, "utf8"));
+  let bytes = 0;
+  let prefix = "";
+  for (const character of value) {
+    const characterBytes = Buffer.byteLength(character, "utf8");
+    if (bytes + characterBytes > contentBudget) {
+      break;
+    }
+    prefix += character;
+    bytes += characterBytes;
+  }
+  return `${prefix.trimEnd()}${ellipsis}`;
+}
+
+function readSessionKey(ctx: unknown): string | undefined {
+  try {
+    const manager = (ctx as { sessionManager?: { getSessionId?: () => unknown } })?.sessionManager;
+    const sessionId = manager?.getSessionId?.();
+    if (typeof sessionId !== "string" || !sessionId.trim()) {
+      return undefined;
+    }
+    return createHash("sha256").update(sessionId).digest("hex").slice(0, SESSION_KEY_LENGTH);
+  } catch {
+    return undefined;
+  }
 }
 
 function renderBody(template: string, cwd: string): string {
@@ -124,8 +167,11 @@ function readContextSnapshot(ctx: unknown, messages: AgentMessageLike[] = []): C
   let explicitSessionName: string | undefined;
 
   try {
-    const context = ctx as { cwd?: unknown; mode?: unknown };
-    if (typeof context?.cwd === "string" && context.cwd.trim()) {
+    const context = ctx as { cwd?: unknown; mode?: unknown; sessionManager?: { getCwd?: () => unknown } };
+    const managedCwd = context?.sessionManager?.getCwd?.();
+    if (typeof managedCwd === "string" && managedCwd.trim()) {
+      cwd = managedCwd;
+    } else if (typeof context?.cwd === "string" && context.cwd.trim()) {
       cwd = context.cwd;
     }
     if (typeof context?.mode === "string") {
@@ -136,13 +182,13 @@ function readContextSnapshot(ctx: unknown, messages: AgentMessageLike[] = []): C
 
   try {
     const manager = (ctx as { sessionManager?: { getSessionName?: () => unknown } })?.sessionManager;
-    explicitSessionName = normalizeText(manager?.getSessionName?.(), "", 96) || undefined;
+    explicitSessionName = normalizeTabTitlePart(manager?.getSessionName?.(), "") || undefined;
   } catch {
   }
 
   const displaySessionName =
     explicitSessionName || normalizeText(findTextForRole(messages, "user", false), "", 96) || undefined;
-  return { cwd, mode, explicitSessionName, displaySessionName };
+  return { cwd, mode, explicitSessionName, displaySessionName, sessionKey: readSessionKey(ctx) };
 }
 
 function collectToolInfo(messages: AgentMessageLike[]): {
@@ -355,16 +401,38 @@ function shouldSkipNotificationForThisProcess(): boolean {
   return false;
 }
 
-function normalizeTabTitlePart(value: string, fallback: string): string {
-  return normalizeText(value, fallback, 96);
+function normalizeTabTitlePart(value: unknown, fallback: string): string {
+  const raw = typeof value === "string" ? value : "";
+  const cleaned = raw
+    .toWellFormed()
+    .replace(OSC_SEQUENCE_PATTERN, " ")
+    .replace(TERMINAL_STRING_PATTERN, " ")
+    .replace(CSI_SEQUENCE_PATTERN, " ")
+    .replace(ESC_SEQUENCE_PATTERN, " ")
+    .replace(TITLE_CONTROL_PATTERN, " ")
+    .replace(BIDI_CONTROL_PATTERN, " ")
+    .replace(/\s+/gu, " ")
+    .trim() || fallback;
+  const characters = [...cleaned];
+  if (characters.length <= 96) {
+    return cleaned;
+  }
+  return `${characters.slice(0, 95).join("").trimEnd()}…`;
 }
 
-function getNotifyTarget(cwd: string, explicitSessionName?: string): { cwdBase: string; tabTitle: string } {
+function getNotifyTarget(
+  cwd: string,
+  explicitSessionName?: string,
+  sessionKey?: string,
+): { cwdBase: string; tabTitle: string } {
   const cwdBase = normalizeTabTitlePart(basename(cwd) || cwd, "Pi");
   const safeName = explicitSessionName ? normalizeTabTitlePart(explicitSessionName, "") : "";
-  const tabTitle = safeName
+  const readableTitle = safeName
     ? `${PI_TERMINAL_TITLE} - ${safeName} - ${cwdBase}`
     : `${PI_TERMINAL_TITLE} - ${cwdBase}`;
+  const identitySuffix = sessionKey ? ` · #${sessionKey}` : "";
+  const readableBudget = MAX_CANONICAL_TITLE_BYTES - Buffer.byteLength(identitySuffix, "utf8");
+  const tabTitle = `${truncateUtf8(readableTitle, readableBudget)}${identitySuffix}`;
   return { cwdBase, tabTitle };
 }
 
@@ -426,6 +494,7 @@ export default function remoteWindowsNotify(pi: ExtensionAPI): void {
 
   let currentExplicitSessionName: string | undefined;
   let currentDisplaySessionName: string | undefined;
+  let currentSessionKey: string | undefined;
 
   pi.on("session_start", (_event, ctx) => {
     if (!isActiveExtension()) {
@@ -434,17 +503,19 @@ export default function remoteWindowsNotify(pi: ExtensionAPI): void {
     const snapshot = readContextSnapshot(ctx);
     currentExplicitSessionName = snapshot.explicitSessionName;
     currentDisplaySessionName = snapshot.displaySessionName;
-    setTerminalTitle(getNotifyTarget(snapshot.cwd, currentExplicitSessionName).tabTitle, snapshot.mode);
+    currentSessionKey = snapshot.sessionKey;
+    setTerminalTitle(getNotifyTarget(snapshot.cwd, currentExplicitSessionName, currentSessionKey).tabTitle, snapshot.mode);
   });
 
   pi.on("session_info_changed", (event, ctx) => {
     if (!isActiveExtension()) {
       return;
     }
-    currentExplicitSessionName = normalizeText(event.name, "", 96) || undefined;
+    currentExplicitSessionName = normalizeTabTitlePart(event.name, "") || undefined;
     currentDisplaySessionName = currentExplicitSessionName;
     const snapshot = readContextSnapshot(ctx);
-    setTerminalTitle(getNotifyTarget(snapshot.cwd, currentExplicitSessionName).tabTitle, snapshot.mode);
+    currentSessionKey = snapshot.sessionKey ?? currentSessionKey;
+    setTerminalTitle(getNotifyTarget(snapshot.cwd, currentExplicitSessionName, currentSessionKey).tabTitle, snapshot.mode);
   });
 
   pi.on("session_shutdown", () => {
@@ -470,13 +541,15 @@ export default function remoteWindowsNotify(pi: ExtensionAPI): void {
     const snapshot = readContextSnapshot(ctx, messages);
     const explicitSessionName = snapshot.explicitSessionName ?? currentExplicitSessionName;
     const sessionName = snapshot.displaySessionName ?? currentDisplaySessionName;
-    const target = getNotifyTarget(snapshot.cwd, explicitSessionName);
+    const sessionKey = snapshot.sessionKey ?? currentSessionKey;
+    const target = getNotifyTarget(snapshot.cwd, explicitSessionName, sessionKey);
     const payload = config.messageMode === "static"
       ? { title: config.title, body: renderBody(config.bodyTemplate, snapshot.cwd) }
       : buildDynamicNotification(messages, config, snapshot.cwd);
 
     currentExplicitSessionName = explicitSessionName;
     currentDisplaySessionName = sessionName;
+    currentSessionKey = sessionKey;
     setTerminalTitle(target.tabTitle, snapshot.mode);
     await notify(
       config.endpoint,

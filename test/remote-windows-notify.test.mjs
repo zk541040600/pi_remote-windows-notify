@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -223,6 +224,107 @@ test("agent_end uses live context, sanitizes text, and sends one bounded payload
   assert.doesNotMatch(requests[0].payload.sessionName, /[\u0000-\u001f\u007f]/);
   assert.ok([...requests[0].payload.body].length <= 220);
   assert.doesNotMatch(requests[0].payload.body, /[\uD800-\uDFFF](?![\uDC00-\uDFFF])/u);
+});
+
+test("session identity makes same-cwd targets stable, distinct, and non-reversible", async (t) => {
+  writeConfig(t, {
+    endpoint: "http://127.0.0.1:23118/notify",
+    token: "test-token",
+    messageMode: "static",
+  });
+  const requests = [];
+  globalThis.fetch = async (_endpoint, options) => {
+    requests.push(JSON.parse(options.body));
+    return { ok: true };
+  };
+
+  const originalIsTty = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+  const originalWrite = process.stdout.write;
+  const terminalWrites = [];
+  Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
+  process.stdout.write = (chunk) => {
+    terminalWrites.push(String(chunk));
+    return true;
+  };
+  t.after(() => {
+    process.stdout.write = originalWrite;
+    if (originalIsTty) {
+      Object.defineProperty(process.stdout, "isTTY", originalIsTty);
+    } else {
+      delete process.stdout.isTTY;
+    }
+  });
+
+  const sessionId = "private-session-alpha";
+  const expectedKey = createHash("sha256").update(sessionId).digest("hex").slice(0, 12);
+  const runtime = createFakePi();
+  remoteWindowsNotify(runtime.pi);
+  const context = createContext({
+    mode: "tui",
+    sessionManager: {
+      getSessionName: () => "shared-name",
+      getSessionId: () => sessionId,
+    },
+  });
+  await runtime.emit("session_start", { type: "session_start" }, context);
+  await runtime.emit("session_info_changed", { type: "session_info_changed", name: "shared-name" }, context);
+  await runtime.emit("agent_end", { type: "agent_end", messages: [] }, context);
+
+  const expectedTitle = `π - shared-name - actual-project · #${expectedKey}`;
+  assert.equal(requests[0].tabTitle, expectedTitle);
+  const titleWrites = terminalWrites.filter((write) => write.startsWith("\u001b]0;"));
+  assert.equal(titleWrites.length, 3);
+  assert.ok(titleWrites.every((write) => write === `\u001b]0;${expectedTitle}\u0007`));
+  assert.doesNotMatch(JSON.stringify(requests[0]), new RegExp(sessionId));
+
+  await runtime.emit("session_shutdown", { type: "session_shutdown" }, context);
+  const secondSessionId = "private-session-beta";
+  const secondRuntime = createFakePi();
+  remoteWindowsNotify(secondRuntime.pi);
+  const secondContext = createContext({
+    mode: "tui",
+    sessionManager: {
+      getSessionName: () => "shared-name",
+      getSessionId: () => secondSessionId,
+    },
+  });
+  await secondRuntime.emit("agent_end", { type: "agent_end", messages: [] }, secondContext);
+  assert.notEqual(requests[1].tabTitle, expectedTitle);
+  assert.match(requests[1].tabTitle, /^π - shared-name - actual-project · #[0-9a-f]{12}$/);
+  assert.doesNotMatch(JSON.stringify(requests[1]), new RegExp(secondSessionId));
+});
+
+test("canonical target keeps its session suffix within the UTF-8 byte cap", async (t) => {
+  writeConfig(t, {
+    endpoint: "http://127.0.0.1:23118/notify",
+    token: "test-token",
+    messageMode: "static",
+  });
+  let payload;
+  globalThis.fetch = async (_endpoint, options) => {
+    payload = JSON.parse(options.body);
+    return { ok: true };
+  };
+
+  const sessionId = "long-unicode-session";
+  const expectedKey = createHash("sha256").update(sessionId).digest("hex").slice(0, 12);
+  const runtime = createFakePi();
+  remoteWindowsNotify(runtime.pi);
+  await runtime.emit(
+    "agent_end",
+    { type: "agent_end", messages: [] },
+    createContext({
+      cwd: `/workspace/${"界".repeat(100)}`,
+      sessionManager: {
+        getSessionName: () => "会话".repeat(100),
+        getSessionId: () => sessionId,
+      },
+    }),
+  );
+
+  assert.ok(Buffer.byteLength(payload.tabTitle, "utf8") <= 144);
+  assert.match(payload.tabTitle, new RegExp(` · #${expectedKey}$`));
+  assert.equal(payload.tabTitle.isWellFormed(), true);
 });
 
 test("static body expansion is bounded and uses context cwd", async (t) => {

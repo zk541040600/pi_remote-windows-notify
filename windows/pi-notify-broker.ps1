@@ -531,7 +531,7 @@ function Test-NotifyBrokerForegroundTarget {
                     if ($selectedTab.Count -gt 0) {
                         $windowObj = [pscustomobject]@{ Handle = $handle; Title = $windowTitle; ProcessId = [int]$processId; ProcessName = $process.ProcessName }
                         $best = [pscustomobject]@{ Window = $windowObj; Score = 1; Tab = $selectedTab[0].Element; TabName = $selectedTitle; TabIndex = $selectedTab[0].Index }
-                        Update-NotifyBrokerTabCache -Best $best -TargetFingerprint $TargetFingerprint
+                        Update-NotifyBrokerTabCache -Best $best -TargetFingerprint $TargetFingerprint -SourceTabTitleValue $SourceTabTitleValue
                     }
                     return $true
                 }
@@ -566,8 +566,11 @@ function Update-NotifyBrokerTabCache {
     param(
         [Parameter(Mandatory = $true)]
         $Best,
-        [string]$TargetFingerprint = ''
+        [string]$TargetFingerprint = '',
+        [string]$SourceTabTitleValue = ''
     )
+
+    if (-not (Test-NotifyBrokerSessionTaggedTitle -Value $SourceTabTitleValue)) { return }
 
     $entry = [pscustomobject]@{
         WindowHandle  = $Best.Window.Handle
@@ -586,6 +589,13 @@ function Update-NotifyBrokerTabCache {
     Write-NotifyBrokerLog -Message ('broker-cache-updated windowFingerprint={0} tabFingerprint={1} tabIndex={2} targetFingerprint={3}' -f (Get-NotifyBrokerContextFingerprint -Value $Best.Window.Title), (Get-NotifyBrokerContextFingerprint -Value $Best.TabName), $Best.TabIndex, $TargetFingerprint)
 }
 
+function Test-NotifyBrokerSessionTaggedTitle {
+    param([string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
+    return $Value.Trim() -match ' \u00B7 #[0-9a-f]{12}$'
+}
+
 function Test-NotifyBrokerTabCacheEntryValid {
     param(
         $CacheEntry,
@@ -593,6 +603,7 @@ function Test-NotifyBrokerTabCacheEntryValid {
         [string]$SourceTabTitleValue
     )
 
+    if (-not (Test-NotifyBrokerSessionTaggedTitle -Value $SourceTabTitleValue)) { return $false }
     if ($null -eq $CacheEntry) { return $false }
     if (([DateTime]::UtcNow - $CacheEntry.UpdatedAtUtc).TotalSeconds -gt $script:NotifyBrokerTabCacheTtlSeconds) { return $false }
     $handle = $CacheEntry.WindowHandle
@@ -603,7 +614,14 @@ function Test-NotifyBrokerTabCacheEntryValid {
     if ($processId -eq 0) { return $false }
     try { Get-Process -Id $processId -ErrorAction Stop | Out-Null } catch { return $false }
 
-    $cachedTabName = [string]$CacheEntry.TabName
+    try {
+        $cachedTabName = ([string]$CacheEntry.Tab.Current.Name).Trim()
+    }
+    catch {
+        return $false
+    }
+    if ([string]::IsNullOrWhiteSpace($cachedTabName)) { return $false }
+    $CacheEntry.TabName = $cachedTabName
     $cachedWindowTitle = [string]$CacheEntry.WindowTitle
     if (-not [string]::IsNullOrWhiteSpace($SourceTabTitleValue) -and $cachedTabName.IndexOf($SourceTabTitleValue, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) {
         return $false
@@ -620,6 +638,8 @@ function Get-NotifyBrokerTabCacheCandidate {
         [string]$CurrentDirBase,
         [string]$SourceTabTitleValue
     )
+
+    if (-not (Test-NotifyBrokerSessionTaggedTitle -Value $SourceTabTitleValue)) { return $null }
 
     if (-not [string]::IsNullOrWhiteSpace($TargetFingerprint) -and $script:NotifyBrokerTabCacheByTarget.ContainsKey($TargetFingerprint)) {
         $targetEntry = $script:NotifyBrokerTabCacheByTarget[$TargetFingerprint]
@@ -646,10 +666,14 @@ function Update-NotifyBrokerTabCacheForTarget {
 
     $startedAt = [DateTime]::UtcNow
     try {
+        if (-not (Test-NotifyBrokerSessionTaggedTitle -Value $SourceTabTitleValue)) {
+            Write-NotifyBrokerLog -Message ('broker-prewarm-skip untagged-source targetFingerprint={0}' -f $TargetFingerprint)
+            return
+        }
+
         $cacheCandidate = Get-NotifyBrokerTabCacheCandidate -TargetFingerprint $TargetFingerprint -CurrentDirBase $CurrentDirBase -SourceTabTitleValue $SourceTabTitleValue
         if ($null -ne $cacheCandidate) {
             Write-NotifyBrokerLog -Message ('broker-prewarm-cache-hit source={0} targetFingerprint={1} elapsedMs={2}' -f $cacheCandidate.Source, $TargetFingerprint, [int]([DateTime]::UtcNow - $startedAt).TotalMilliseconds)
-            return
         }
 
         $requiresCwdMatch = -not [string]::IsNullOrWhiteSpace($CurrentDirBase)
@@ -675,6 +699,7 @@ function Update-NotifyBrokerTabCacheForTarget {
             Select-Object -Unique
 
         $best = $null
+        $eligibleCount = 0
         $windows = @(Get-NotifyBrokerWindows -TerminalOnly)
         Write-NotifyBrokerLog -Message ('broker-prewarm-scan windows={0} targetFingerprint={1}' -f $windows.Count, $TargetFingerprint)
         foreach ($window in $windows) {
@@ -695,18 +720,26 @@ function Update-NotifyBrokerTabCacheForTarget {
                 }
                 $sourceTabTitleMatch = -not [string]::IsNullOrWhiteSpace($SourceTabTitleValue) -and -not [string]::IsNullOrWhiteSpace($tab.Name) -and $tab.Name.IndexOf($SourceTabTitleValue, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
                 if ($sourceTabTitleMatch) { $score += 300 }
-                $windowCwdMatch = $requiresCwdMatch -and $window.Title.IndexOf($CurrentDirBase, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
-                $cwdKeywordMatch = $requiresCwdMatch -and (($matchedKeywords -contains $CurrentDirBase) -or $windowCwdMatch)
-                if ($hasPreciseSourceTitle -and -not $sourceTabTitleMatch -and -not $cwdKeywordMatch) { $score = 0 }
-                elseif ($requiresCwdMatch -and -not $sourceTabTitleMatch -and -not $cwdKeywordMatch) { $score = 0 }
+                $cwdKeywordMatch = $requiresCwdMatch -and ($matchedKeywords -contains $CurrentDirBase)
+                if ($hasPreciseSourceTitle -and -not $sourceTabTitleMatch) { $score = 0 }
+                elseif ($requiresCwdMatch -and -not $cwdKeywordMatch) { $score = 0 }
                 if ($score -le 0) { continue }
+                $eligibleCount += 1
                 $candidate = [pscustomobject]@{ Window = $window; Score = $score; Tab = $tab.Element; TabName = $tab.Name; TabIndex = $tab.Index }
                 if ($null -eq $best -or $candidate.Score -gt $best.Score) { $best = $candidate }
             }
         }
 
+        if ($eligibleCount -gt 1) {
+            if (-not [string]::IsNullOrWhiteSpace($TargetFingerprint)) {
+                $script:NotifyBrokerTabCacheByTarget.Remove($TargetFingerprint)
+            }
+            Write-NotifyBrokerLog -Message ('broker-prewarm-ambiguous targetFingerprint={0} candidateCount={1} bestScore={2} elapsedMs={3}' -f $TargetFingerprint, $eligibleCount, $best.Score, [int]([DateTime]::UtcNow - $startedAt).TotalMilliseconds)
+            return
+        }
+
         if ($null -ne $best) {
-            Update-NotifyBrokerTabCache -Best $best -TargetFingerprint $TargetFingerprint
+            Update-NotifyBrokerTabCache -Best $best -TargetFingerprint $TargetFingerprint -SourceTabTitleValue $SourceTabTitleValue
             Write-NotifyBrokerLog -Message ('broker-prewarm-cache-updated tabFingerprint={0} targetFingerprint={1} elapsedMs={2}' -f (Get-NotifyBrokerContextFingerprint -Value $best.TabName), $TargetFingerprint, [int]([DateTime]::UtcNow - $startedAt).TotalMilliseconds)
         }
         else {
@@ -874,6 +907,7 @@ function Invoke-NotifyBrokerActivation {
         Write-NotifyBrokerLog -Message ('broker-keywords count={0}' -f @($keywords).Count)
 
         $best = $null
+        $eligibleCount = 0
         $cacheHit = $false
         $cacheSource = 'none'
         $cacheCandidate = Get-NotifyBrokerTabCacheCandidate -TargetFingerprint $TargetFingerprint -CurrentDirBase $CurrentDirBase -SourceTabTitleValue $SourceTabTitleValue
@@ -882,13 +916,6 @@ function Invoke-NotifyBrokerActivation {
             $cacheHit = $true
             $cacheSource = $cacheCandidate.Source
             Write-NotifyBrokerLog -Message ('broker-cache-hit source={0} windowFingerprint={1} tabFingerprint={2} tabIndex={3} targetFingerprint={4}' -f $cacheSource, (Get-NotifyBrokerContextFingerprint -Value $cached.WindowTitle), (Get-NotifyBrokerContextFingerprint -Value $cached.TabName), $cached.TabIndex, $TargetFingerprint)
-            $windowObj = [pscustomobject]@{
-                Handle      = $cached.WindowHandle
-                Title       = $cached.WindowTitle
-                ProcessId   = $cached.ProcessId
-                ProcessName = ''
-            }
-            $best = [pscustomobject]@{ Window = $windowObj; Score = 1; TabName = $cached.TabName; TabIndex = $cached.TabIndex; Tab = $cached.Tab }
         }
 
         if ($null -eq $best) {
@@ -921,12 +948,11 @@ function Invoke-NotifyBrokerActivation {
                     if ($sourceTabTitleMatch) {
                         $score += 300
                     }
-                    $windowCwdMatch = $requiresCwdMatch -and $window.Title.IndexOf($CurrentDirBase, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
-                    $cwdKeywordMatch = $requiresCwdMatch -and (($matchedKeywords -contains $CurrentDirBase) -or $windowCwdMatch)
-                    if ($hasPreciseSourceTitle -and -not $sourceTabTitleMatch -and -not $cwdKeywordMatch) {
+                    $cwdKeywordMatch = $requiresCwdMatch -and ($matchedKeywords -contains $CurrentDirBase)
+                    if ($hasPreciseSourceTitle -and -not $sourceTabTitleMatch) {
                         $score = 0
                     }
-                    elseif ($requiresCwdMatch -and -not $sourceTabTitleMatch -and -not $cwdKeywordMatch) {
+                    elseif ($requiresCwdMatch -and -not $cwdKeywordMatch) {
                         $score = 0
                     }
                     Write-NotifyBrokerLog -Message ('broker-tab index={0} nameFingerprint={1} selected={2} score={3} matchedKeywordCount={4} sourceTabTitleMatch={5}' -f $tab.Index, (Get-NotifyBrokerContextFingerprint -Value $tab.Name), $tab.IsSelected, $score, @($matchedKeywords).Count, $sourceTabTitleMatch)
@@ -934,12 +960,18 @@ function Invoke-NotifyBrokerActivation {
                         continue
                     }
 
+                    $eligibleCount += 1
                     $candidate = [pscustomobject]@{ Window = $window; Score = $score; Tab = $tab.Element; TabName = $tab.Name; TabIndex = $tab.Index }
                     if ($null -eq $best -or $candidate.Score -gt $best.Score) {
                         $best = $candidate
                     }
                 }
             }
+        }
+
+        if ($eligibleCount -gt 1) {
+            Write-NotifyBrokerLog -Message ('broker-focus-ambiguous targetFingerprint={0} sourceTabFingerprint={1} candidateCount={2} bestScore={3} cacheHit={4} elapsedMs={5}' -f (Get-NotifyBrokerContextFingerprint -Value $TargetHost), (Get-NotifyBrokerContextFingerprint -Value $SourceTabTitleValue), $eligibleCount, $best.Score, $cacheHit, [int]([DateTime]::UtcNow - $startedAt).TotalMilliseconds)
+            return
         }
 
         if ($null -eq $best) {
@@ -957,7 +989,7 @@ function Invoke-NotifyBrokerActivation {
             [void][PiNotifyBrokerUser32]::SetForegroundWindow($best.Window.Handle)
             if ($null -ne $best.Tab -and (Select-NotifyBrokerTab -TabElement $best.Tab)) {
                 Write-NotifyBrokerLog -Message ('broker-tab-selected tabFingerprint={0} elapsedMs={1} cacheHit=True cacheSource={2}' -f (Get-NotifyBrokerContextFingerprint -Value $best.TabName), [int]([DateTime]::UtcNow - $startedAt).TotalMilliseconds, $cacheSource)
-                Update-NotifyBrokerTabCache -Best $best -TargetFingerprint $TargetFingerprint
+                Update-NotifyBrokerTabCache -Best $best -TargetFingerprint $TargetFingerprint -SourceTabTitleValue $SourceTabTitleValue
                 return
             }
             Write-NotifyBrokerLog -Message ('broker-cache-select-failed tabFingerprint={0}' -f (Get-NotifyBrokerContextFingerprint -Value $best.TabName))
@@ -977,7 +1009,7 @@ function Invoke-NotifyBrokerActivation {
         if ($null -ne $best.Tab) {
             if (Select-NotifyBrokerTab -TabElement $best.Tab) {
                 Write-NotifyBrokerLog -Message ('broker-tab-selected tabFingerprint={0} elapsedMs={1} cacheHit={2} cacheSource={3}' -f (Get-NotifyBrokerContextFingerprint -Value $best.TabName), [int]([DateTime]::UtcNow - $startedAt).TotalMilliseconds, $cacheHit, $cacheSource)
-                Update-NotifyBrokerTabCache -Best $best -TargetFingerprint $TargetFingerprint
+                Update-NotifyBrokerTabCache -Best $best -TargetFingerprint $TargetFingerprint -SourceTabTitleValue $SourceTabTitleValue
             }
             else {
                 Write-NotifyBrokerLog -Message ('broker-tab-select-failed tabFingerprint={0} elapsedMs={1}' -f (Get-NotifyBrokerContextFingerprint -Value $best.TabName), [int]([DateTime]::UtcNow - $startedAt).TotalMilliseconds)

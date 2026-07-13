@@ -373,6 +373,9 @@ if ($brokerText -notmatch '/activate-oldest' -or $brokerText -notmatch 'Invoke-N
 if ($brokerText -notmatch 'Queue-NotifyBrokerPrewarm' -or $brokerText -notmatch 'Update-NotifyBrokerTabCacheForTarget' -or $brokerText -notmatch 'broker-prewarm-cache-updated' -or $brokerText -notmatch 'broker-prewarm-skip recent-scan' -or $brokerText -notmatch 'broker-prewarm-dedupe' -or $brokerText -notmatch 'broker-prewarm-skip closed-popup' -or $brokerText -notmatch 'NotifyBrokerPrewarmDelayMs\s*=\s*10000') {
     throw 'Broker must prewarm target tab cache after popup display while delaying/throttling repeated expensive scans and skipping closed popups.'
 }
+if ($brokerText -notmatch 'Test-NotifyBrokerSessionTaggedTitle' -or $brokerText -notmatch '\$CacheEntry\.Tab\.Current\.Name' -or $brokerText -notmatch 'broker-prewarm-ambiguous' -or $brokerText -notmatch 'broker-focus-ambiguous' -or $brokerText -notmatch 'if \(\$hasPreciseSourceTitle -and -not \$sourceTabTitleMatch\)') {
+    throw 'Broker must require precise source-title matches, reject ambiguous candidates, and validate only session-tagged caches against the live tab name.'
+}
 if ($brokerText -notmatch 'Get-NotifyBrokerWallpaperCardImage' -or $brokerText -notmatch 'broker-wallpaper-card-rendered' -or $brokerText -notmatch 'DrawImageUnscaled' -or $brokerText -notmatch 'Get-NotifyBrokerWallpaperCardImage -Width 420 -Height 154') {
     throw 'Broker popup paint must use startup-warmed cached card-size wallpaper rendering instead of per-paint high-quality scaling.'
 }
@@ -407,6 +410,9 @@ if ($popupText -match 'sanitizedPayload' -or $popupText -match 'WriteAllText\(\$
 if ($popupText -notmatch 'Get-NotifyPopupContextFingerprint' -or $popupText -match 'popup-cache host="' -or $popupText -match 'popup-cache .*cwdBase=' -or $popupText -match 'popup-window title="' -or $popupText -match 'popup-tab .*name="' -or $popupText -match 'popup-focus-best windowTitle=' -or $popupText -match 'popup-initial-captured windowTitle=' -or $popupText -match 'popup-keywords "\{0\}"' -or $popupText -match 'popup-action activate host=') {
     throw 'Popup cache/logs must persist only fingerprints/counts for cwd/tab/window/keyword context.'
 }
+if ($popupText -notmatch 'Test-NotifyPopupSessionTaggedTitle' -or $popupText -notmatch 'popup-focus-ambiguous' -or $popupText -notmatch 'if \(\$hasPreciseSourceTitle -and -not \$sourceTabTitleMatch\)') {
+    throw 'Fallback popup must require precise source-title matches, reject ambiguous candidates, and ignore untagged target caches.'
+}
 if ($popupText -match 'host\s*=\s*\$TargetHostValue' -or $popupText -match 'cwdBase\s*=\s*\$CwdBaseValue' -or $popupText -match 'windowTitle\s*=\s*\$WindowTitle' -or $popupText -match 'tabTitle\s*=\s*\$TabTitle') {
     throw 'Popup cache must not persist raw host/cwd/window/tab context.'
 }
@@ -424,6 +430,9 @@ if ($listenerText -match $badListenerNotificationLogPattern -or $popupText -matc
 }
 if ($activateText -notmatch 'Get-NotifyActivateFingerprint \$targetHost' -or $activateText -match 'activate-target host="' -or $activateText -match 'activate-focus-miss .*host="') {
     throw 'Activate script must log target host only as a fingerprint.'
+}
+if ($activateText -notmatch 'focus-ambiguous' -or $activateText -notmatch '\$eligibleCount -gt 1') {
+    throw 'System-toast activation must reject ambiguous required-title/cwd candidates instead of selecting the first tab.'
 }
 if ($listenerText -notmatch '\$maxBodyBytes\s*=\s*65536' -or $listenerText -notmatch '\$contentLength -gt \$maxBodyBytes' -or $listenerText -notmatch 'HTTP request body too large') {
     throw 'Listener Read-HttpRequest must cap request bodies to avoid memory/connection abuse.'
@@ -497,7 +506,7 @@ if ($remoteInstallText -notmatch [regex]::Escape("Join-Path `$binDir 'pi-notify-
 }
 $badRemoteUmask = 'umask 0' + '22'
 $badLinuxTempConfigPattern = '\$temp' + 'Config'
-if ($remoteHelperText -match $badRemoteUmask -or $remoteHelperText -notmatch 'umask 077' -or $remoteHelperText -notmatch '\[string\]\$Mode = ''0600''' -or $remoteInstallText -notmatch "-Mode '0600'" -or $remoteInstallText -notmatch 'remoteManagedConfigPath' -or $remoteInstallText -notmatch 'stat -c' -or $linuxInstallText -notmatch 'Copy-NotifyBridgeTextToRemotePath' -or $linuxInstallText -match $badLinuxTempConfigPattern -or $linuxInstallText -notmatch 'install -m 0600 "\$managed_dir/remote-windows-notify\.json"' -or $linuxInstallText -notmatch "-Mode '0600'") {
+if ($remoteHelperText -match $badRemoteUmask -or $remoteHelperText -notmatch 'umask 077' -or $remoteHelperText -notmatch '\[string\]\$Mode = ''0600''' -or $remoteInstallText -notmatch "-Mode '0600'" -or $remoteInstallText -notmatch 'remoteManagedConfigPath' -or $remoteInstallText -notmatch '--check --managed-dir' -or $linuxInstallText -notmatch 'install-remote-windows-notify\.ps1' -or $linuxInstallText -notmatch '-Token \$config\.Token' -or $linuxInstallText -match $badLinuxTempConfigPattern) {
     throw 'Remote token config files must be uploaded/installed with umask 077 and mode 0600.'
 }
 if ($refreshText -match 'origin master' -or $refreshText -notmatch 'rev-parse --abbrev-ref --symbolic-full-name' -or $refreshText -notmatch 'branch --show-current') {

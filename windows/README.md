@@ -232,12 +232,14 @@ Notification payloads may include:
 {
   "focusTarget": "my",
   "cwdBase": "project-name",
-  "tabTitle": "π - session-name - project-name",
+  "tabTitle": "π - session-name - project-name · #12hex-session-key",
   "sessionName": "human-readable session name"
 }
 ```
 
-`popup-focus` uses `tabTitle` first, then `cwdBase`. It never opens a new Windows Terminal tab/window as a fallback. The custom popup renders `sessionName` as a large accent-colored line above the prompt/body; if no explicit session name is available, it falls back to the tab title/project name.
+Current senders derive the 12-hex session key from a SHA-256 digest of Pi's session ID; the raw session ID is never sent or displayed. The same canonical title is used by the notification payload and the terminal-title spinner, whose activity frame is only a prefix.
+
+When `tabTitle` is present, `popup-focus` requires that complete title and never downgrades the match to `cwdBase`. `cwdBase` is only a compatibility path for older payloads that omit `tabTitle`. It never opens a new Windows Terminal tab/window as a fallback. The custom popup renders `sessionName` as a large accent-colored line above the prompt/body; if no explicit session name is available, it falls back to the tab title/project name.
 
 `popupPlacement` controls which monitor gets the popup card:
 
@@ -268,9 +270,11 @@ Display modes:
 
 `popup-focus` matching rules:
 
-1. Prefer exact-ish `tabTitle` from the sender (`π - <sessionName> - <cwdBase>` when the Pi session is named, otherwise `π - <cwdBase>`).
-2. Fall back to `cwdBase` when older senders do not provide `tabTitle`.
-3. If no matching tab is found, log `popup-focus-miss` and do nothing. It does **not** open a new tab/window and does **not** jump to `Windows PowerShell`.
+1. Require the full canonical `tabTitle` from current senders (`π - <sessionName> - <cwdBase> · #<sessionKey>` when named, otherwise `π - <cwdBase> · #<sessionKey>`). A spinner frame before that title is allowed.
+2. Use `cwdBase` only when an older sender does not provide `tabTitle`.
+3. Activate only when exactly one candidate matches. Multiple title or cwd matches log an `ambiguous` diagnostic and do nothing; enumeration order and the currently selected tab are never tie-breakers.
+4. Cache only session-tagged titles and revalidate the live UIAutomation tab name before reuse.
+5. If no unique matching tab is found, log `popup-focus-miss` and do nothing. It does **not** open a new tab/window and does **not** jump to `Windows PowerShell`.
 
 Switch modes:
 

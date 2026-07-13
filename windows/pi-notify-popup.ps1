@@ -423,6 +423,13 @@ function Get-NotifyPopupCache {
     }
 }
 
+function Test-NotifyPopupSessionTaggedTitle {
+    param([string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
+    return $Value.Trim() -match ' \u00B7 #[0-9a-f]{12}$'
+}
+
 function Save-NotifyPopupCache {
     param(
         [string]$TargetHostValue,
@@ -614,6 +621,7 @@ function Invoke-NotifyPopupActivation {
         $startedAt = [DateTime]::UtcNow
         $requiresCwdMatch = -not [string]::IsNullOrWhiteSpace($CurrentDirBase)
         $hasPreciseSourceTitle = -not [string]::IsNullOrWhiteSpace($SourceTabTitleValue)
+        $allowTargetCache = Test-NotifyPopupSessionTaggedTitle -Value $SourceTabTitleValue
         Write-NotifyPopupLog -Message ('popup-activate targetFingerprint={0} cwdFingerprint={1} sourceTabFingerprint={2}' -f (Get-NotifyPopupContextFingerprint -Value $TargetHost), (Get-NotifyPopupContextFingerprint -Value $CurrentDirBase), (Get-NotifyPopupContextFingerprint -Value $SourceTabTitleValue))
         if (-not $requiresCwdMatch -and -not $hasPreciseSourceTitle) {
             Write-NotifyPopupLog -Message ('popup-focus-miss missing-target-metadata no-target-open-skipped targetFingerprint={0} elapsedMs={1}' -f (Get-NotifyPopupContextFingerprint -Value $TargetHost), [int]([DateTime]::UtcNow - $startedAt).TotalMilliseconds)
@@ -627,7 +635,7 @@ function Invoke-NotifyPopupActivation {
             Select-Object -Unique
         Write-NotifyPopupLog -Message ('popup-keywords count={0}' -f @($keywords).Count)
 
-        $cache = Get-NotifyPopupCache
+        $cache = if ($allowTargetCache) { Get-NotifyPopupCache } else { $null }
         $cacheMatches = $false
         $cacheWindowFingerprint = ''
         $cacheTabFingerprint = ''
@@ -650,6 +658,7 @@ function Invoke-NotifyPopupActivation {
         $windows = @(Get-NotifyPopupWindows -TerminalOnly)
         Write-NotifyPopupLog -Message ('popup-terminal-window-count {0}' -f $windows.Count)
         $best = $null
+        $eligibleCount = 0
         foreach ($window in $windows) {
             $baseScore = 0
             foreach ($keyword in $keywords) {
@@ -689,17 +698,15 @@ function Invoke-NotifyPopupActivation {
                 if ($sourceTabTitleMatch) {
                     $score += 300
                 }
-                $cacheTitleMatchesSource = -not $hasPreciseSourceTitle -or (-not [string]::IsNullOrWhiteSpace($cacheTabFingerprint) -and $cacheTabFingerprint -eq (Get-NotifyPopupContextFingerprint -Value $SourceTabTitleValue))
-                $cacheTabMatch = $cacheMatches -and $cacheTitleMatchesSource -and -not [string]::IsNullOrWhiteSpace($cacheTabFingerprint) -and (Get-NotifyPopupContextFingerprint -Value $tab.Name) -eq $cacheTabFingerprint -and $cacheTabFingerprint -ne ''
+                $cacheTabMatch = $allowTargetCache -and $cacheMatches -and $sourceTabTitleMatch -and -not [string]::IsNullOrWhiteSpace($cacheTabFingerprint) -and (Get-NotifyPopupContextFingerprint -Value $tab.Name) -eq $cacheTabFingerprint
                 if ($cacheTabMatch) {
                     $score += 200
                 }
-                $windowCwdMatch = $requiresCwdMatch -and $window.Title.IndexOf($CurrentDirBase, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
-                $cwdKeywordMatch = $requiresCwdMatch -and (($matchedKeywords -contains $CurrentDirBase) -or $windowCwdMatch)
-                if ($hasPreciseSourceTitle -and -not $sourceTabTitleMatch -and -not $cacheTabMatch -and -not $cwdKeywordMatch) {
+                $cwdKeywordMatch = $requiresCwdMatch -and ($matchedKeywords -contains $CurrentDirBase)
+                if ($hasPreciseSourceTitle -and -not $sourceTabTitleMatch) {
                     $score = 0
                 }
-                elseif ($requiresCwdMatch -and -not $sourceTabTitleMatch -and -not $cacheTabMatch -and -not $cwdKeywordMatch) {
+                elseif ($requiresCwdMatch -and -not $cwdKeywordMatch) {
                     $score = 0
                 }
                 $initialTabMatch = [string]::IsNullOrWhiteSpace($CurrentDirBase) -and $null -ne $script:NotifyPopupInitialTarget -and $tab.Name -eq $script:NotifyPopupInitialTarget.TabTitle
@@ -716,11 +723,17 @@ function Invoke-NotifyPopupActivation {
                     continue
                 }
 
+                $eligibleCount += 1
                 $candidate = [pscustomobject]@{ Window = $window; Score = $score; Tab = $tab.Element; TabName = $tab.Name; TabIndex = $tab.Index }
                 if ($null -eq $best -or $candidate.Score -gt $best.Score) {
                     $best = $candidate
                 }
             }
+        }
+
+        if ($eligibleCount -gt 1) {
+            Write-NotifyPopupLog -Message ('popup-focus-ambiguous targetFingerprint={0} sourceTabFingerprint={1} candidateCount={2} bestScore={3} elapsedMs={4}' -f (Get-NotifyPopupContextFingerprint -Value $TargetHost), (Get-NotifyPopupContextFingerprint -Value $SourceTabTitleValue), $eligibleCount, $best.Score, [int]([DateTime]::UtcNow - $startedAt).TotalMilliseconds)
+            return
         }
 
         if ($null -eq $best) {
@@ -748,7 +761,7 @@ function Invoke-NotifyPopupActivation {
         if ($null -ne $best.Tab) {
             if (Select-NotifyPopupTab -TabElement $best.Tab) {
                 Write-NotifyPopupLog -Message ('popup-tab-selected tabFingerprint={0} elapsedMs={1}' -f (Get-NotifyPopupContextFingerprint -Value $best.TabName), [int]([DateTime]::UtcNow - $startedAt).TotalMilliseconds)
-                if (-not [string]::IsNullOrWhiteSpace($CurrentDirBase)) {
+                if ($allowTargetCache -and -not [string]::IsNullOrWhiteSpace($CurrentDirBase)) {
                     Save-NotifyPopupCache -TargetHostValue $TargetHost -CwdBaseValue $CurrentDirBase -WindowTitle $best.Window.Title -TabTitle $best.TabName -TabIndex $best.TabIndex
                 }
             }
@@ -757,7 +770,7 @@ function Invoke-NotifyPopupActivation {
             }
         }
         else {
-            if (-not [string]::IsNullOrWhiteSpace($CurrentDirBase)) {
+            if ($allowTargetCache -and -not [string]::IsNullOrWhiteSpace($CurrentDirBase)) {
                 Save-NotifyPopupCache -TargetHostValue $TargetHost -CwdBaseValue $CurrentDirBase -WindowTitle $best.Window.Title -TabTitle '' -TabIndex -1
             }
         }
