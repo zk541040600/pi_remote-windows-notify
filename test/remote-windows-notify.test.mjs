@@ -29,6 +29,7 @@ const ENV_KEYS = [
 ];
 const savedEnv = new Map(ENV_KEYS.map((key) => [key, process.env[key]]));
 const originalFetch = globalThis.fetch;
+const ASK_USER_PROMPT_EVENT = "rpiv:ask-user:prompt";
 
 function restoreProcessState() {
   for (const key of ENV_KEYS) {
@@ -39,8 +40,10 @@ function restoreProcessState() {
       process.env[key] = value;
     }
   }
+  globalThis.__piRemoteWindowsNotifyPromptUnsubscribe?.();
   delete globalThis.__piRemoteWindowsNotifyActiveToken;
   delete globalThis.__piRemoteWindowsNotifyLifecycleController;
+  delete globalThis.__piRemoteWindowsNotifyPromptUnsubscribe;
   globalThis.fetch = originalFetch;
 }
 
@@ -48,8 +51,10 @@ function clearNotifyEnvironment() {
   for (const key of ENV_KEYS) {
     delete process.env[key];
   }
+  globalThis.__piRemoteWindowsNotifyPromptUnsubscribe?.();
   delete globalThis.__piRemoteWindowsNotifyActiveToken;
   delete globalThis.__piRemoteWindowsNotifyLifecycleController;
+  delete globalThis.__piRemoteWindowsNotifyPromptUnsubscribe;
   globalThis.fetch = originalFetch;
 }
 
@@ -65,12 +70,26 @@ function writeConfig(t, value, raw = false) {
 
 function createFakePi() {
   const handlers = new Map();
+  const eventHandlers = new Map();
   return {
     pi: {
       on(event, handler) {
         const current = handlers.get(event) ?? [];
         current.push(handler);
         handlers.set(event, current);
+      },
+      events: {
+        emit(channel, data) {
+          for (const handler of eventHandlers.get(channel) ?? []) {
+            void handler(data);
+          }
+        },
+        on(channel, handler) {
+          const current = eventHandlers.get(channel) ?? new Set();
+          current.add(handler);
+          eventHandlers.set(channel, current);
+          return () => current.delete(handler);
+        },
       },
     },
     count(event) {
@@ -80,6 +99,12 @@ function createFakePi() {
       for (const handler of handlers.get(event) ?? []) {
         await handler(payload, context);
       }
+    },
+    countEvent(channel) {
+      return eventHandlers.get(channel)?.size ?? 0;
+    },
+    async emitEvent(channel, data) {
+      await Promise.all([...(eventHandlers.get(channel) ?? [])].map((handler) => handler(data)));
     },
   };
 }
@@ -224,6 +249,127 @@ test("agent_end uses live context, sanitizes text, and sends one bounded payload
   assert.doesNotMatch(requests[0].payload.sessionName, /[\u0000-\u001f\u007f]/);
   assert.ok([...requests[0].payload.body].length <= 220);
   assert.doesNotMatch(requests[0].payload.body, /[\uD800-\uDFFF](?![\uDC00-\uDFFF])/u);
+});
+
+test("ask-user prompt sends one targeted notification before turn end", async (t) => {
+  writeConfig(t, {
+    endpoint: "http://127.0.0.1:23118/notify",
+    token: "test-token",
+    messageMode: "dynamic",
+    remoteHostAlias: "my",
+  });
+  const requests = [];
+  globalThis.fetch = async (_endpoint, options) => {
+    requests.push(JSON.parse(options.body));
+    return { ok: true };
+  };
+
+  const runtime = createFakePi();
+  remoteWindowsNotify(runtime.pi);
+  const sessionId = "prompt-session-id";
+  const context = createContext({
+    sessionManager: {
+      getSessionName: () => "prompt-session",
+      getSessionId: () => sessionId,
+    },
+  });
+  await runtime.emit("session_start", { type: "session_start" }, context);
+  const longHeader = `进程\n模型${"😀".repeat(230)}`;
+  await runtime.emitEvent(ASK_USER_PROMPT_EVENT, {
+    questions: [{ header: longHeader, question: "选择进程模型", options: [] }],
+  });
+  await runtime.emitEvent("unrelated:custom-ui", {});
+
+  const expectedKey = createHash("sha256").update(sessionId).digest("hex").slice(0, 12);
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].focusTarget, "my");
+  assert.equal(requests[0].cwdBase, "actual-project");
+  assert.equal(requests[0].sessionName, "prompt-session");
+  assert.match(requests[0].tabTitle, new RegExp(` · #${expectedKey}$`));
+  assert.match(requests[0].body, /^等待回答：进程 模型/);
+  assert.ok([...requests[0].body].length <= 220);
+  assert.doesNotMatch(requests[0].body, /[\u0000-\u001f\u007f]/);
+
+  await runtime.emit("agent_end", { type: "agent_end", messages: [] }, context);
+  assert.equal(requests.length, 2, "the later turn-complete notification remains a separate state");
+});
+
+test("static ask-user notification does not expose question content", async (t) => {
+  writeConfig(t, {
+    endpoint: "http://127.0.0.1:23118/notify",
+    token: "test-token",
+    messageMode: "static",
+    bodyTemplate: "cwd={cwdBase}",
+  });
+  let payload;
+  globalThis.fetch = async (_endpoint, options) => {
+    payload = JSON.parse(options.body);
+    return { ok: true };
+  };
+
+  const runtime = createFakePi();
+  remoteWindowsNotify(runtime.pi);
+  await runtime.emit("session_start", { type: "session_start" }, createContext());
+  await runtime.emitEvent(ASK_USER_PROMPT_EVENT, {
+    questions: [{ header: "secret-header", question: "secret-question", options: [{ label: "secret-option" }] }],
+  });
+
+  assert.equal(payload.body, "Pi 正在等待你的回答 · cwd=actual-project");
+  assert.doesNotMatch(JSON.stringify(payload), /secret-(?:header|question|option)/);
+});
+
+test("ask-user prompt listener is replaced on reload and removed on shutdown", async (t) => {
+  writeConfig(t, {
+    endpoint: "http://127.0.0.1:23118/notify",
+    token: "test-token",
+    messageMode: "dynamic",
+  });
+  let requestCount = 0;
+  let lastBody;
+  globalThis.fetch = async (_endpoint, options) => {
+    requestCount += 1;
+    lastBody = JSON.parse(options.body).body;
+    return { ok: true };
+  };
+
+  const first = createFakePi();
+  remoteWindowsNotify(first.pi);
+  await first.emit("session_start", { type: "session_start" }, createContext());
+  assert.equal(first.countEvent(ASK_USER_PROMPT_EVENT), 1);
+
+  const second = createFakePi();
+  remoteWindowsNotify(second.pi);
+  assert.equal(first.countEvent(ASK_USER_PROMPT_EVENT), 0);
+  await second.emitEvent(ASK_USER_PROMPT_EVENT, { questions: [] });
+  assert.equal(requestCount, 0, "a prompt before session_start has no reliable tab target");
+
+  await second.emit("session_start", { type: "session_start" }, createContext());
+  await second.emitEvent(ASK_USER_PROMPT_EVENT, { questions: [] });
+  assert.equal(requestCount, 1);
+  assert.equal(lastBody, "Pi 正在等待你的回答");
+  await second.emit("session_shutdown", { type: "session_shutdown" }, createContext());
+  assert.equal(second.countEvent(ASK_USER_PROMPT_EVENT), 0);
+  await second.emitEvent(ASK_USER_PROMPT_EVENT, { questions: [] });
+  assert.equal(requestCount, 1);
+});
+
+test("ask-user notification failures stay isolated from the prompt event", async (t) => {
+  writeConfig(t, {
+    endpoint: "http://127.0.0.1:23118/notify",
+    token: "test-token",
+    messageMode: "static",
+  });
+  let requestCount = 0;
+  globalThis.fetch = async () => {
+    requestCount += 1;
+    throw new Error("listener unavailable");
+  };
+
+  const runtime = createFakePi();
+  remoteWindowsNotify(runtime.pi);
+  await runtime.emit("session_start", { type: "session_start" }, createContext());
+  await runtime.emitEvent(ASK_USER_PROMPT_EVENT, { questions: [] });
+  assert.equal(requestCount, 1);
 });
 
 test("session identity makes same-cwd targets stable, distinct, and non-reversible", async (t) => {
@@ -434,4 +580,5 @@ test("worker processes do not register notification handlers", () => {
   remoteWindowsNotify(runtime.pi);
   assert.equal(runtime.count("agent_end"), 0);
   assert.equal(runtime.count("session_shutdown"), 0);
+  assert.equal(runtime.countEvent(ASK_USER_PROMPT_EVENT), 0);
 });

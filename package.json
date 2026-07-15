@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Pi extension that notifies a Windows listener when a remote Linux Pi agent turn ends.",
+  "description": "Pi extension that notifies Windows when remote Pi finishes a turn or waits for an answer.",
   "keywords": [
     "pi-package",
     "pi-extension"

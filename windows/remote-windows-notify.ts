@@ -45,6 +45,7 @@ type ContextSnapshot = {
 const DEFAULT_ENDPOINT = "http://127.0.0.1:23118/notify";
 const DEFAULT_TIMEOUT_MS = 4000;
 const DEFAULT_CONFIG_PATH = join(homedir(), ".pi", "agent", "remote-windows-notify.json");
+const ASK_USER_PROMPT_EVENT = "rpiv:ask-user:prompt";
 const PI_TERMINAL_TITLE = "π";
 const MAX_CANONICAL_TITLE_BYTES = 144;
 const SESSION_KEY_LENGTH = 12;
@@ -57,6 +58,7 @@ const BIDI_CONTROL_PATTERN = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]+/gu
 const globalState = globalThis as {
   __piRemoteWindowsNotifyActiveToken?: symbol;
   __piRemoteWindowsNotifyLifecycleController?: AbortController;
+  __piRemoteWindowsNotifyPromptUnsubscribe?: () => void;
 };
 
 function isTruthy(value: string | undefined): boolean {
@@ -487,42 +489,91 @@ export default function remoteWindowsNotify(pi: ExtensionAPI): void {
 
   const activeToken = Symbol("pi-remote-windows-notify");
   const lifecycleController = new AbortController();
+  globalState.__piRemoteWindowsNotifyPromptUnsubscribe?.();
   globalState.__piRemoteWindowsNotifyLifecycleController?.abort();
   globalState.__piRemoteWindowsNotifyActiveToken = activeToken;
   globalState.__piRemoteWindowsNotifyLifecycleController = lifecycleController;
   const isActiveExtension = () => globalState.__piRemoteWindowsNotifyActiveToken === activeToken;
 
-  let currentExplicitSessionName: string | undefined;
-  let currentDisplaySessionName: string | undefined;
-  let currentSessionKey: string | undefined;
+  let currentSnapshot: ContextSnapshot | undefined;
+
+  const promptUnsubscribe = pi.events.on(ASK_USER_PROMPT_EVENT, async (data) => {
+    const snapshot = currentSnapshot ? { ...currentSnapshot } : undefined;
+    if (!snapshot || !isActiveExtension()) {
+      return;
+    }
+
+    const config = await getRuntimeConfig();
+    if (!isActiveExtension() || lifecycleController.signal.aborted || !config.enabled || !config.token) {
+      return;
+    }
+
+    let promptSummary = "";
+    if (config.messageMode === "dynamic" && data && typeof data === "object") {
+      const questions = (data as { questions?: unknown }).questions;
+      const firstQuestion = Array.isArray(questions) && questions[0] && typeof questions[0] === "object"
+        ? (questions[0] as { header?: unknown; question?: unknown })
+        : undefined;
+      promptSummary = configString(firstQuestion?.header) || configString(firstQuestion?.question);
+    }
+
+    const target = getNotifyTarget(snapshot.cwd, snapshot.explicitSessionName, snapshot.sessionKey);
+    const body = config.messageMode === "dynamic"
+      ? normalizeText(promptSummary ? `等待回答：${promptSummary}` : "Pi 正在等待你的回答", "Pi 正在等待你的回答", 220)
+      : normalizeText(`Pi 正在等待你的回答 · ${renderBody(config.bodyTemplate, snapshot.cwd)}`, "Pi 正在等待你的回答", 220);
+    await notify(
+      config.endpoint,
+      config.token,
+      {
+        title: config.title,
+        body,
+        focusTarget: config.remoteHostAlias || undefined,
+        cwdBase: target.cwdBase,
+        tabTitle: target.tabTitle,
+        sessionName: snapshot.displaySessionName,
+      },
+      config.timeoutMs,
+      lifecycleController.signal,
+    );
+  });
+  globalState.__piRemoteWindowsNotifyPromptUnsubscribe = promptUnsubscribe;
 
   pi.on("session_start", (_event, ctx) => {
     if (!isActiveExtension()) {
       return;
     }
     const snapshot = readContextSnapshot(ctx);
-    currentExplicitSessionName = snapshot.explicitSessionName;
-    currentDisplaySessionName = snapshot.displaySessionName;
-    currentSessionKey = snapshot.sessionKey;
-    setTerminalTitle(getNotifyTarget(snapshot.cwd, currentExplicitSessionName, currentSessionKey).tabTitle, snapshot.mode);
+    currentSnapshot = snapshot;
+    setTerminalTitle(getNotifyTarget(snapshot.cwd, snapshot.explicitSessionName, snapshot.sessionKey).tabTitle, snapshot.mode);
   });
 
   pi.on("session_info_changed", (event, ctx) => {
     if (!isActiveExtension()) {
       return;
     }
-    currentExplicitSessionName = normalizeTabTitlePart(event.name, "") || undefined;
-    currentDisplaySessionName = currentExplicitSessionName;
     const snapshot = readContextSnapshot(ctx);
-    currentSessionKey = snapshot.sessionKey ?? currentSessionKey;
-    setTerminalTitle(getNotifyTarget(snapshot.cwd, currentExplicitSessionName, currentSessionKey).tabTitle, snapshot.mode);
+    const explicitSessionName = normalizeTabTitlePart(event.name, "") || undefined;
+    currentSnapshot = {
+      ...snapshot,
+      explicitSessionName,
+      displaySessionName: explicitSessionName,
+      sessionKey: snapshot.sessionKey ?? currentSnapshot?.sessionKey,
+    };
+    setTerminalTitle(
+      getNotifyTarget(currentSnapshot.cwd, currentSnapshot.explicitSessionName, currentSnapshot.sessionKey).tabTitle,
+      currentSnapshot.mode,
+    );
   });
 
   pi.on("session_shutdown", () => {
+    promptUnsubscribe();
     lifecycleController.abort();
     if (isActiveExtension()) {
       delete globalState.__piRemoteWindowsNotifyActiveToken;
       delete globalState.__piRemoteWindowsNotifyLifecycleController;
+      if (globalState.__piRemoteWindowsNotifyPromptUnsubscribe === promptUnsubscribe) {
+        delete globalState.__piRemoteWindowsNotifyPromptUnsubscribe;
+      }
     }
   });
 
@@ -538,18 +589,22 @@ export default function remoteWindowsNotify(pi: ExtensionAPI): void {
     const messages = Array.isArray((event as { messages?: AgentMessageLike[] }).messages)
       ? ((event as { messages: AgentMessageLike[] }).messages ?? [])
       : [];
-    const snapshot = readContextSnapshot(ctx, messages);
-    const explicitSessionName = snapshot.explicitSessionName ?? currentExplicitSessionName;
-    const sessionName = snapshot.displaySessionName ?? currentDisplaySessionName;
-    const sessionKey = snapshot.sessionKey ?? currentSessionKey;
+    const liveSnapshot = readContextSnapshot(ctx, messages);
+    const snapshot = {
+      ...liveSnapshot,
+      explicitSessionName: liveSnapshot.explicitSessionName ?? currentSnapshot?.explicitSessionName,
+      displaySessionName: liveSnapshot.displaySessionName ?? currentSnapshot?.displaySessionName,
+      sessionKey: liveSnapshot.sessionKey ?? currentSnapshot?.sessionKey,
+    };
+    const explicitSessionName = snapshot.explicitSessionName;
+    const sessionName = snapshot.displaySessionName;
+    const sessionKey = snapshot.sessionKey;
     const target = getNotifyTarget(snapshot.cwd, explicitSessionName, sessionKey);
     const payload = config.messageMode === "static"
       ? { title: config.title, body: renderBody(config.bodyTemplate, snapshot.cwd) }
       : buildDynamicNotification(messages, config, snapshot.cwd);
 
-    currentExplicitSessionName = explicitSessionName;
-    currentDisplaySessionName = sessionName;
-    currentSessionKey = sessionKey;
+    currentSnapshot = snapshot;
     setTerminalTitle(target.tabTitle, snapshot.mode);
     await notify(
       config.endpoint,

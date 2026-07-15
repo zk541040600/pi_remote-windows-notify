@@ -1,6 +1,6 @@
 # Linux side
 
-This side contains the Pi extension that runs on the remote/Linux machine and sends a notification to the Windows listener when a Pi agent turn ends.
+This side contains the Pi extension that runs on the remote/Linux machine and notifies Windows when a Pi turn ends or `rpiv-ask-user-question` waits for an answer.
 
 ## Files
 

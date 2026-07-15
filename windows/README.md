@@ -257,7 +257,7 @@ Template fields:
 
 The default popup background is bundled as `popup-wallpaper.png` and copied into `%USERPROFILE%\.pi-notify\bin` by install/refresh.
 
-Default behavior is `messageMode: dynamic`: the toast title/body are generated from the last prompt, tool names, and final reply. `bodyTemplate` is used as fallback, or when `messageMode` is set to `static`.
+Default behavior is `messageMode: dynamic`: a validated `rpiv-ask-user-question` prompt shows its first header while waiting, and turn-complete notifications use the last prompt, tool names, and final reply. Static mode never includes ask-user question content; it uses a fixed waiting message plus `bodyTemplate` context.
 
 Loopback HTTP/HTTPS endpoints are allowed. Non-loopback HTTP is rejected. A non-loopback HTTPS
 endpoint requires `PI_NOTIFY_ALLOW_NONLOCAL=1`; dynamic prompt/reply content additionally requires

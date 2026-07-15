@@ -8,7 +8,7 @@ See [`windows/README.md`](windows/README.md) for installation, autostart, config
 
 - `linux/` — canonical Pi package entry and example runtime config.
 - `windows/` — PowerShell listener, tunnel/watchdog installers, the byte-identical extension template, and the remote ownership ensure program.
-- `test/` — config/lifecycle and package-vs-standalone ownership regressions.
+- `test/` — config/lifecycle, ask-user prompt, and package-vs-standalone ownership regressions.
 
 ## Linux-side Pi package
 
