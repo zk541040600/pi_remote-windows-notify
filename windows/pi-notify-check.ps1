@@ -126,6 +126,26 @@ if ($commonText -notmatch 'Resolve-NotifyBridgeExecutableValue' -or $commonText 
 if ($commonText -notmatch 'Set-NotifyBridgeActiveConfigPath' -or $commonText -notmatch 'Get-NotifyBridgeDefaultBaseDir' -or $commonText -notmatch 'TunnelStartupDelaySeconds[\s\S]{0,80}-ge 5' -or $commonText -notmatch 'tunnelStartupDelaySeconds[\s\S]{0,80}-ge 5') {
     throw 'NotifyBridge common config must derive instance base from ConfigPath and reject zero tunnel startup delay.'
 }
+$scrollHelperName = 'Set-NotifyBridgeTerminalScrollToBottom'
+if ($commonText -notmatch ('function\s+' + [regex]::Escape($scrollHelperName)) -or
+    $commonText -notmatch 'AutomationIdProperty' -or
+    $commonText -notmatch 'RangeValuePattern' -or
+    $commonText -notmatch 'Current\.Maximum' -or
+    $commonText -notmatch '\.SetValue\(') {
+    throw 'NotifyBridge common must scroll the selected terminal with writable UIAutomation RangeValuePattern maximum.'
+}
+if ([regex]::Matches($brokerText, [regex]::Escape($scrollHelperName)).Count -lt 2 -or
+    [regex]::Matches($brokerText, 'scrolledToBottom').Count -lt 2 -or
+    $popupText -notmatch [regex]::Escape($scrollHelperName) -or
+    $popupText -notmatch 'scrolledToBottom' -or
+    $activateText -notmatch [regex]::Escape($scrollHelperName) -or
+    $activateText -notmatch 'scrolledToBottom') {
+    throw 'Broker cache/scan and both fallback activation paths must scroll selected terminal tabs and log the boolean result.'
+}
+$activationRuntimeText = $commonText + "`n" + $brokerText + "`n" + $popupText + "`n" + $activateText
+if ($activationRuntimeText -match 'SendKeys|SendWait|keybd_event|SendInput') {
+    throw 'Terminal scroll-to-bottom must use UIAutomation and must not inject keyboard input.'
+}
 $customProbeBase = Join-Path ([System.IO.Path]::GetTempPath()) ('pi-notify-configpath-probe-' + [guid]::NewGuid().ToString('N'))
 $customProbeConfig = Join-Path $customProbeBase 'config.json'
 try {

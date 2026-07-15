@@ -760,7 +760,8 @@ function Invoke-NotifyPopupActivation {
 
         if ($null -ne $best.Tab) {
             if (Select-NotifyPopupTab -TabElement $best.Tab) {
-                Write-NotifyPopupLog -Message ('popup-tab-selected tabFingerprint={0} elapsedMs={1}' -f (Get-NotifyPopupContextFingerprint -Value $best.TabName), [int]([DateTime]::UtcNow - $startedAt).TotalMilliseconds)
+                $scrolledToBottom = Set-NotifyBridgeTerminalScrollToBottom -WindowHandle $best.Window.Handle
+                Write-NotifyPopupLog -Message ('popup-tab-selected tabFingerprint={0} elapsedMs={1} scrolledToBottom={2}' -f (Get-NotifyPopupContextFingerprint -Value $best.TabName), [int]([DateTime]::UtcNow - $startedAt).TotalMilliseconds, $scrolledToBottom)
                 if ($allowTargetCache -and -not [string]::IsNullOrWhiteSpace($CurrentDirBase)) {
                     Save-NotifyPopupCache -TargetHostValue $TargetHost -CwdBaseValue $CurrentDirBase -WindowTitle $best.Window.Title -TabTitle $best.TabName -TabIndex $best.TabIndex
                 }

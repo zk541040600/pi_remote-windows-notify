@@ -90,6 +90,50 @@ function Get-NotifyBridgePowerShellExe {
     }
 }
 
+# Move the selected Windows Terminal tab to its latest visible output without injecting input.
+function Set-NotifyBridgeTerminalScrollToBottom {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [IntPtr]$WindowHandle
+    )
+
+    try {
+        Start-Sleep -Milliseconds 40
+        $root = [System.Windows.Automation.AutomationElement]::FromHandle($WindowHandle)
+        if ($null -eq $root) { return $false }
+
+        $controlTypeCondition = New-Object System.Windows.Automation.PropertyCondition(
+            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+            [System.Windows.Automation.ControlType]::ScrollBar
+        )
+        $automationIdCondition = New-Object System.Windows.Automation.PropertyCondition(
+            [System.Windows.Automation.AutomationElement]::AutomationIdProperty,
+            'ScrollBar'
+        )
+        $condition = New-Object System.Windows.Automation.AndCondition(
+            $controlTypeCondition,
+            $automationIdCondition
+        )
+        $scrollBar = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
+        if ($null -eq $scrollBar) { return $false }
+
+        $patternObj = $null
+        if (-not $scrollBar.TryGetCurrentPattern([System.Windows.Automation.RangeValuePattern]::Pattern, [ref]$patternObj)) {
+            return $false
+        }
+
+        $rangeValue = [System.Windows.Automation.RangeValuePattern]$patternObj
+        if ($rangeValue.Current.IsReadOnly) { return $false }
+
+        $rangeValue.SetValue([double]$rangeValue.Current.Maximum)
+        return $true
+    }
+    catch {
+        return $false
+    }
+}
+
 
 function ConvertTo-NotifyBridgeProcessArgument {
     [CmdletBinding()]

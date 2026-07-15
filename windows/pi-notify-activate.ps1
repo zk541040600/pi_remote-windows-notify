@@ -354,7 +354,8 @@ function Focus-NotifyWindow {
 
     if ($best.TabFound -and $null -ne $best.Tab) {
         if (Select-NotifyTab -TabElement $best.Tab) {
-            Write-NotifyActivateLog -Message ('focus-tab-selected tabFingerprint="{0}"' -f (Get-NotifyActivateFingerprint $best.TabName))
+            $scrolledToBottom = Set-NotifyBridgeTerminalScrollToBottom -WindowHandle $best.Window.Handle
+            Write-NotifyActivateLog -Message ('focus-tab-selected tabFingerprint="{0}" scrolledToBottom={1}' -f (Get-NotifyActivateFingerprint $best.TabName), $scrolledToBottom)
             Start-Sleep -Milliseconds 150
             [void][PiNotifyUser32]::SetForegroundWindow($best.Window.Handle)
             return $true

@@ -988,7 +988,8 @@ function Invoke-NotifyBrokerActivation {
         if ($cacheHit) {
             [void][PiNotifyBrokerUser32]::SetForegroundWindow($best.Window.Handle)
             if ($null -ne $best.Tab -and (Select-NotifyBrokerTab -TabElement $best.Tab)) {
-                Write-NotifyBrokerLog -Message ('broker-tab-selected tabFingerprint={0} elapsedMs={1} cacheHit=True cacheSource={2}' -f (Get-NotifyBrokerContextFingerprint -Value $best.TabName), [int]([DateTime]::UtcNow - $startedAt).TotalMilliseconds, $cacheSource)
+                $scrolledToBottom = Set-NotifyBridgeTerminalScrollToBottom -WindowHandle $best.Window.Handle
+                Write-NotifyBrokerLog -Message ('broker-tab-selected tabFingerprint={0} elapsedMs={1} cacheHit=True cacheSource={2} scrolledToBottom={3}' -f (Get-NotifyBrokerContextFingerprint -Value $best.TabName), [int]([DateTime]::UtcNow - $startedAt).TotalMilliseconds, $cacheSource, $scrolledToBottom)
                 Update-NotifyBrokerTabCache -Best $best -TargetFingerprint $TargetFingerprint -SourceTabTitleValue $SourceTabTitleValue
                 return
             }
@@ -1008,7 +1009,8 @@ function Invoke-NotifyBrokerActivation {
 
         if ($null -ne $best.Tab) {
             if (Select-NotifyBrokerTab -TabElement $best.Tab) {
-                Write-NotifyBrokerLog -Message ('broker-tab-selected tabFingerprint={0} elapsedMs={1} cacheHit={2} cacheSource={3}' -f (Get-NotifyBrokerContextFingerprint -Value $best.TabName), [int]([DateTime]::UtcNow - $startedAt).TotalMilliseconds, $cacheHit, $cacheSource)
+                $scrolledToBottom = Set-NotifyBridgeTerminalScrollToBottom -WindowHandle $best.Window.Handle
+                Write-NotifyBrokerLog -Message ('broker-tab-selected tabFingerprint={0} elapsedMs={1} cacheHit={2} cacheSource={3} scrolledToBottom={4}' -f (Get-NotifyBrokerContextFingerprint -Value $best.TabName), [int]([DateTime]::UtcNow - $startedAt).TotalMilliseconds, $cacheHit, $cacheSource, $scrolledToBottom)
                 Update-NotifyBrokerTabCache -Best $best -TargetFingerprint $TargetFingerprint -SourceTabTitleValue $SourceTabTitleValue
             }
             else {
