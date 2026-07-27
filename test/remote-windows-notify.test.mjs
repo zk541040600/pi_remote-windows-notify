@@ -292,6 +292,15 @@ test("ask-user prompt sends one targeted notification before turn end", async (t
 
   await runtime.emit("agent_end", { type: "agent_end", messages: [] }, context);
   assert.equal(requests.length, 2, "the later turn-complete notification remains a separate state");
+
+  // Network failures from waiting notifications must not surface to the prompt event path.
+  let failureCount = 0;
+  globalThis.fetch = async () => {
+    failureCount += 1;
+    throw new Error("listener unavailable");
+  };
+  await runtime.emitEvent(ASK_USER_PROMPT_EVENT, { questions: [{ header: "retry" }] });
+  assert.equal(failureCount, 1);
 });
 
 test("static ask-user notification does not expose question content", async (t) => {
@@ -318,59 +327,6 @@ test("static ask-user notification does not expose question content", async (t) 
   assert.doesNotMatch(JSON.stringify(payload), /secret-(?:header|question|option)/);
 });
 
-test("ask-user prompt listener is replaced on reload and removed on shutdown", async (t) => {
-  writeConfig(t, {
-    endpoint: "http://127.0.0.1:23118/notify",
-    token: "test-token",
-    messageMode: "dynamic",
-  });
-  let requestCount = 0;
-  let lastBody;
-  globalThis.fetch = async (_endpoint, options) => {
-    requestCount += 1;
-    lastBody = JSON.parse(options.body).body;
-    return { ok: true };
-  };
-
-  const first = createFakePi();
-  remoteWindowsNotify(first.pi);
-  await first.emit("session_start", { type: "session_start" }, createContext());
-  assert.equal(first.countEvent(ASK_USER_PROMPT_EVENT), 1);
-
-  const second = createFakePi();
-  remoteWindowsNotify(second.pi);
-  assert.equal(first.countEvent(ASK_USER_PROMPT_EVENT), 0);
-  await second.emitEvent(ASK_USER_PROMPT_EVENT, { questions: [] });
-  assert.equal(requestCount, 0, "a prompt before session_start has no reliable tab target");
-
-  await second.emit("session_start", { type: "session_start" }, createContext());
-  await second.emitEvent(ASK_USER_PROMPT_EVENT, { questions: [] });
-  assert.equal(requestCount, 1);
-  assert.equal(lastBody, "Pi 正在等待你的回答");
-  await second.emit("session_shutdown", { type: "session_shutdown" }, createContext());
-  assert.equal(second.countEvent(ASK_USER_PROMPT_EVENT), 0);
-  await second.emitEvent(ASK_USER_PROMPT_EVENT, { questions: [] });
-  assert.equal(requestCount, 1);
-});
-
-test("ask-user notification failures stay isolated from the prompt event", async (t) => {
-  writeConfig(t, {
-    endpoint: "http://127.0.0.1:23118/notify",
-    token: "test-token",
-    messageMode: "static",
-  });
-  let requestCount = 0;
-  globalThis.fetch = async () => {
-    requestCount += 1;
-    throw new Error("listener unavailable");
-  };
-
-  const runtime = createFakePi();
-  remoteWindowsNotify(runtime.pi);
-  await runtime.emit("session_start", { type: "session_start" }, createContext());
-  await runtime.emitEvent(ASK_USER_PROMPT_EVENT, { questions: [] });
-  assert.equal(requestCount, 1);
-});
 
 test("session identity makes same-cwd targets stable, distinct, and non-reversible", async (t) => {
   writeConfig(t, {
@@ -493,7 +449,56 @@ test("static body expansion is bounded and uses context cwd", async (t) => {
   assert.equal(payload.cwdBase, `${"x".repeat(95)}…`);
 });
 
-test("only the latest loaded instance can notify", async (t) => {
+test("independent runtimes notify with their own session and cwd identity", async (t) => {
+  writeConfig(t, {
+    endpoint: "http://127.0.0.1:23118/notify",
+    token: "test-token",
+    messageMode: "static",
+  });
+  const requests = [];
+  globalThis.fetch = async (_endpoint, options) => {
+    requests.push(JSON.parse(options.body));
+    return { ok: true };
+  };
+
+  const runtimeA = createFakePi();
+  const runtimeB = createFakePi();
+  remoteWindowsNotify(runtimeA.pi);
+  remoteWindowsNotify(runtimeB.pi);
+
+  const sessionA = "session-runtime-a";
+  const sessionB = "session-runtime-b";
+  const keyA = createHash("sha256").update(sessionA).digest("hex").slice(0, 12);
+  const keyB = createHash("sha256").update(sessionB).digest("hex").slice(0, 12);
+  const contextA = createContext({
+    cwd: "/workspace/project-a",
+    sessionManager: {
+      getSessionName: () => "alpha",
+      getSessionId: () => sessionA,
+    },
+  });
+  const contextB = createContext({
+    cwd: "/workspace/project-b",
+    sessionManager: {
+      getSessionName: () => "beta",
+      getSessionId: () => sessionB,
+    },
+  });
+
+  await runtimeA.emit("session_start", { type: "session_start" }, contextA);
+  await runtimeB.emit("session_start", { type: "session_start" }, contextB);
+  await runtimeA.emit("agent_end", { type: "agent_end", messages: [] }, contextA);
+  await runtimeB.emit("agent_end", { type: "agent_end", messages: [] }, contextB);
+
+  assert.equal(requests.length, 2);
+  assert.equal(requests[0].cwdBase, "project-a");
+  assert.equal(requests[1].cwdBase, "project-b");
+  assert.match(requests[0].tabTitle, new RegExp(` · #${keyA}$`));
+  assert.match(requests[1].tabTitle, new RegExp(` · #${keyB}$`));
+  assert.notEqual(requests[0].tabTitle, requests[1].tabTitle);
+});
+
+test("resource-only factory load does not deactivate an active chat runtime", async (t) => {
   writeConfig(t, {
     endpoint: "http://127.0.0.1:23118/notify",
     token: "test-token",
@@ -504,18 +509,74 @@ test("only the latest loaded instance can notify", async (t) => {
     requestCount += 1;
     return { ok: true };
   };
-  const first = createFakePi();
-  const second = createFakePi();
-  remoteWindowsNotify(first.pi);
-  remoteWindowsNotify(second.pi);
 
-  await first.emit("agent_end", { type: "agent_end", messages: [] }, createContext());
-  await second.emit("agent_end", { type: "agent_end", messages: [] }, createContext());
+  const chat = createFakePi();
+  remoteWindowsNotify(chat.pi);
+  await chat.emit("session_start", { type: "session_start" }, createContext({ cwd: "/workspace/chat" }));
+  await chat.emit("agent_end", { type: "agent_end", messages: [] }, createContext({ cwd: "/workspace/chat" }));
   assert.equal(requestCount, 1);
 
-  await first.emit("session_shutdown", { type: "session_shutdown" }, createContext());
-  await second.emit("agent_end", { type: "agent_end", messages: [] }, createContext());
-  assert.equal(requestCount, 2, "stale shutdown must not deactivate the latest instance");
+  // Resource discovery loads the extension factory without a session_start.
+  const resourceOnly = createFakePi();
+  remoteWindowsNotify(resourceOnly.pi);
+  assert.equal(resourceOnly.count("agent_end"), 1);
+  assert.equal(resourceOnly.countEvent(ASK_USER_PROMPT_EVENT), 1);
+
+  await chat.emit("agent_end", { type: "agent_end", messages: [] }, createContext({ cwd: "/workspace/chat" }));
+  assert.equal(requestCount, 2, "chat runtime must keep notifying after a resource-only factory load");
+});
+
+test("runtime shutdown is idempotent and only cleans up its own lifecycle", async (t) => {
+  writeConfig(t, {
+    endpoint: "http://127.0.0.1:23118/notify",
+    token: "test-token",
+    messageMode: "dynamic",
+  });
+  const requests = [];
+  globalThis.fetch = async (_endpoint, options) => {
+    requests.push(JSON.parse(options.body));
+    return { ok: true };
+  };
+
+  const runtimeA = createFakePi();
+  const runtimeB = createFakePi();
+  remoteWindowsNotify(runtimeA.pi);
+  remoteWindowsNotify(runtimeB.pi);
+
+  const contextA = createContext({ cwd: "/workspace/a" });
+  const contextB = createContext({ cwd: "/workspace/b" });
+  await runtimeA.emit("session_start", { type: "session_start" }, contextA);
+  await runtimeB.emit("session_start", { type: "session_start" }, contextB);
+
+  await runtimeA.emitEvent(ASK_USER_PROMPT_EVENT, { questions: [] });
+  await runtimeB.emitEvent(ASK_USER_PROMPT_EVENT, { questions: [] });
+  assert.equal(requests.length, 2, "both live runtimes must receive their own prompt event");
+  assert.deepEqual(requests.map((request) => request.cwdBase), ["a", "b"]);
+
+  await runtimeA.emit("session_shutdown", { type: "session_shutdown" }, contextA);
+  await runtimeA.emit("session_shutdown", { type: "session_shutdown" }, contextA);
+  assert.equal(runtimeA.countEvent(ASK_USER_PROMPT_EVENT), 0);
+  assert.equal(runtimeB.countEvent(ASK_USER_PROMPT_EVENT), 1);
+
+  await runtimeA.emitEvent(ASK_USER_PROMPT_EVENT, { questions: [] });
+  await runtimeB.emitEvent(ASK_USER_PROMPT_EVENT, { questions: [] });
+  assert.equal(requests.length, 3);
+  assert.equal(requests[2].cwdBase, "b");
+
+  await runtimeA.emit("agent_end", { type: "agent_end", messages: [] }, contextA);
+  await runtimeB.emit("agent_end", { type: "agent_end", messages: [] }, contextB);
+  assert.equal(requests.length, 4);
+  assert.equal(requests[3].cwdBase, "b");
+
+  // Host reload contract: after shutdown, a replacement runtime on a new bus can notify again.
+  const reloaded = createFakePi();
+  remoteWindowsNotify(reloaded.pi);
+  await reloaded.emit("session_start", { type: "session_start" }, createContext({ cwd: "/workspace/reloaded" }));
+  await reloaded.emitEvent(ASK_USER_PROMPT_EVENT, { questions: [] });
+  assert.equal(requests.length, 5);
+  assert.equal(requests[4].cwdBase, "reloaded");
+  await reloaded.emit("session_shutdown", { type: "session_shutdown" }, createContext({ cwd: "/workspace/reloaded" }));
+  assert.equal(reloaded.countEvent(ASK_USER_PROMPT_EVENT), 0);
 });
 
 test("session shutdown aborts an in-flight request without surfacing an error", async (t) => {
@@ -545,7 +606,7 @@ test("session shutdown aborts an in-flight request without surfacing an error", 
   assert.equal(observedSignal.aborted, true);
 });
 
-test("loading a replacement instance aborts the previous instance request", async (t) => {
+test("loading a second runtime does not abort the first runtime request", async (t) => {
   writeConfig(t, {
     endpoint: "http://127.0.0.1:23118/notify",
     token: "test-token",
@@ -557,21 +618,30 @@ test("loading a replacement instance aborts the previous instance request", asyn
   });
   let firstSignal;
   globalThis.fetch = async (_endpoint, options) => {
-    firstSignal = options.signal;
-    started();
-    return new Promise((_resolve, reject) => {
-      options.signal.addEventListener("abort", () => reject(new Error("reloaded")), { once: true });
-    });
+    if (!firstSignal) {
+      firstSignal = options.signal;
+      started();
+      return new Promise((_resolve, reject) => {
+        options.signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+      });
+    }
+    return { ok: true };
   };
   const first = createFakePi();
   remoteWindowsNotify(first.pi);
   const pending = first.emit("agent_end", { type: "agent_end", messages: [] }, createContext());
   await fetchStarted;
 
-  const replacement = createFakePi();
-  remoteWindowsNotify(replacement.pi);
+  const second = createFakePi();
+  remoteWindowsNotify(second.pi);
+  assert.equal(firstSignal.aborted, false, "independent runtime load must not abort in-flight requests");
+
+  await second.emit("session_shutdown", { type: "session_shutdown" }, createContext());
+  assert.equal(firstSignal.aborted, false, "shutdown of another runtime must not abort this request");
+
+  await first.emit("session_shutdown", { type: "session_shutdown" }, createContext());
   await pending;
-  assert.equal(firstSignal.aborted, true);
+  assert.equal(firstSignal.aborted, true, "only the owning runtime shutdown aborts its request");
 });
 
 test("worker processes do not register notification handlers", () => {

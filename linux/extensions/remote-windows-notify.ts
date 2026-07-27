@@ -55,11 +55,6 @@ const CSI_SEQUENCE_PATTERN = /(?:\u001b\[|\u009b)[0-?]*[ -/]*[@-~]/gu;
 const ESC_SEQUENCE_PATTERN = /\u001b(?:[ -/]*[@-~])?/gu;
 const TITLE_CONTROL_PATTERN = /[\u0000-\u001f\u007f-\u009f]+/gu;
 const BIDI_CONTROL_PATTERN = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]+/gu;
-const globalState = globalThis as {
-  __piRemoteWindowsNotifyActiveToken?: symbol;
-  __piRemoteWindowsNotifyLifecycleController?: AbortController;
-  __piRemoteWindowsNotifyPromptUnsubscribe?: () => void;
-};
 
 function isTruthy(value: string | undefined): boolean {
   return /^(1|true|yes|on)$/i.test((value ?? "").trim());
@@ -487,24 +482,22 @@ export default function remoteWindowsNotify(pi: ExtensionAPI): void {
     return;
   }
 
-  const activeToken = Symbol("pi-remote-windows-notify");
+  // Lifecycle state is owned by this factory invocation/runtime only.
+  // Pi Web can load multiple independent runtimes (and resource-only factories)
+  // in one Node process; they must not cancel or deactivate each other.
   const lifecycleController = new AbortController();
-  globalState.__piRemoteWindowsNotifyPromptUnsubscribe?.();
-  globalState.__piRemoteWindowsNotifyLifecycleController?.abort();
-  globalState.__piRemoteWindowsNotifyActiveToken = activeToken;
-  globalState.__piRemoteWindowsNotifyLifecycleController = lifecycleController;
-  const isActiveExtension = () => globalState.__piRemoteWindowsNotifyActiveToken === activeToken;
+  const isAlive = () => !lifecycleController.signal.aborted;
 
   let currentSnapshot: ContextSnapshot | undefined;
 
   const promptUnsubscribe = pi.events.on(ASK_USER_PROMPT_EVENT, async (data) => {
     const snapshot = currentSnapshot ? { ...currentSnapshot } : undefined;
-    if (!snapshot || !isActiveExtension()) {
+    if (!snapshot || !isAlive()) {
       return;
     }
 
     const config = await getRuntimeConfig();
-    if (!isActiveExtension() || lifecycleController.signal.aborted || !config.enabled || !config.token) {
+    if (!isAlive() || !config.enabled || !config.token) {
       return;
     }
 
@@ -536,10 +529,9 @@ export default function remoteWindowsNotify(pi: ExtensionAPI): void {
       lifecycleController.signal,
     );
   });
-  globalState.__piRemoteWindowsNotifyPromptUnsubscribe = promptUnsubscribe;
 
   pi.on("session_start", (_event, ctx) => {
-    if (!isActiveExtension()) {
+    if (!isAlive()) {
       return;
     }
     const snapshot = readContextSnapshot(ctx);
@@ -548,7 +540,7 @@ export default function remoteWindowsNotify(pi: ExtensionAPI): void {
   });
 
   pi.on("session_info_changed", (event, ctx) => {
-    if (!isActiveExtension()) {
+    if (!isAlive()) {
       return;
     }
     const snapshot = readContextSnapshot(ctx);
@@ -566,23 +558,17 @@ export default function remoteWindowsNotify(pi: ExtensionAPI): void {
   });
 
   pi.on("session_shutdown", () => {
+    // Idempotent: only cleans this runtime's listener and in-flight request.
     promptUnsubscribe();
     lifecycleController.abort();
-    if (isActiveExtension()) {
-      delete globalState.__piRemoteWindowsNotifyActiveToken;
-      delete globalState.__piRemoteWindowsNotifyLifecycleController;
-      if (globalState.__piRemoteWindowsNotifyPromptUnsubscribe === promptUnsubscribe) {
-        delete globalState.__piRemoteWindowsNotifyPromptUnsubscribe;
-      }
-    }
   });
 
   pi.on("agent_end", async (event, ctx) => {
-    if (shouldSkipNotificationForThisProcess() || !isActiveExtension()) {
+    if (shouldSkipNotificationForThisProcess() || !isAlive()) {
       return;
     }
     const config = await getRuntimeConfig();
-    if (!isActiveExtension() || lifecycleController.signal.aborted || !config.enabled || !config.token) {
+    if (!isAlive() || !config.enabled || !config.token) {
       return;
     }
 
