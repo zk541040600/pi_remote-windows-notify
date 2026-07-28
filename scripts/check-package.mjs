@@ -58,6 +58,7 @@ const runtimeConsumers = [
 ];
 for (const relative of runtimeConsumers) {
   requirePattern(read(relative), /['"]pi-notify-ensure\.mjs['"]/, `${relative} must distribute pi-notify-ensure.mjs`);
+  requirePattern(read(relative), /['"]pi-notify-qq-sender\.ps1['"]/, `${relative} must distribute pi-notify-qq-sender.ps1`);
 }
 
 const linuxAutostart = read("windows/install-linux-autostart.ps1");
@@ -79,6 +80,39 @@ forbidPattern(
 const windowsCheck = read("windows/pi-notify-check.ps1");
 requirePattern(windowsCheck, /pi-notify-ensure\.mjs["']?\s+--check/, "Windows check must invoke read-only ownership verification");
 requirePattern(windowsCheck, /__piRemoteWindowsNotifyActiveToken/, "Windows check must require the active-token lifecycle marker");
+requirePattern(windowsCheck, /pi-notify-qq-sender\.ps1/, "Windows check must cover the QQ worker runtime file");
+
+const common = read("windows/NotifyBridge.Common.ps1");
+for (const field of ["qqNotifyEnabled", "qqNodeExecutable", "qqSenderScript", "qqSendTimeoutSeconds", "qqMaxConcurrent"]) {
+  requirePattern(common, new RegExp(`\\b${field}\\b`), `NotifyBridge config must include ${field}`);
+}
+requirePattern(common, /finalQqNotifyEnabled[\s\S]*?else \{\s*\$false\s*\}/, "QQ notifications must default to disabled");
+forbidPattern(common, /qq(?:Account|Openid|Token|Secret|Recipient|Receiver)/i, "NotifyBridge config must not own QQ identity or credentials");
+
+const listener = read("windows/notify-listener.ps1");
+const noTargetIndex = listener.lastIndexOf("-Body 'no-target'");
+const dedupIndex = listener.lastIndexOf("-Body 'dedup'");
+const desktopIndex = listener.lastIndexOf("Show-Toast -Title $title");
+const qqIndex = listener.lastIndexOf("Start-NotifyQqDispatch -Title $title -Body $body");
+const okIndex = listener.lastIndexOf("-Body 'ok'");
+assert.ok(noTargetIndex >= 0 && noTargetIndex < dedupIndex && dedupIndex < desktopIndex && desktopIndex < qqIndex && qqIndex < okIndex, "QQ dispatch must occur once after target/dedupe/desktop gates and before the unchanged ok response");
+assert.equal((listener.match(/^\s*Start-NotifyQqDispatch -Title \$title -Body \$body\s*$/gm) ?? []).length, 1, "the accepted listener path must start exactly one QQ worker");
+requirePattern(listener, /qq-send-drop reason=capacity/, "listener must enforce a QQ worker concurrency limit");
+requirePattern(listener, /SetAccessRuleProtection\(\$true, \$false\)/, "listener must protect its QQ pending directory");
+
+const windowsReadme = read("windows/README.md");
+requirePattern(windowsReadme, /qqNotifyEnabled`? \(default `false`\)/, "Windows README must document QQ as default-disabled");
+requirePattern(windowsReadme, /--dry-run/, "Windows README must require dry-run or fake-sender validation before real QQ sends");
+requirePattern(windowsReadme, /qq-sender\.log/, "Windows README must document redacted QQ sender log evidence");
+forbidPattern(windowsReadme, /qq(?:Account|Openid|Token|Secret|Recipient|Receiver)/i, "Windows README must not document QQ identity or credentials as bridge-owned config");
+
+const qqWorker = read("windows/pi-notify-qq-sender.ps1");
+requirePattern(qqWorker, /WaitForExit\(\$timeoutSeconds \* 1000\)/, "QQ worker must bound the Node process timeout");
+requirePattern(qqWorker, /\$process\.Kill\(\)/, "QQ worker must terminate Node on timeout");
+requirePattern(qqWorker, /RedirectStandardOutput = \$true[\s\S]*RedirectStandardError = \$true/, "QQ worker must capture and discard sender output");
+requirePattern(qqWorker, /finally \{[\s\S]*Remove-Item -LiteralPath \$TextFile/, "QQ worker must always clean its message file");
+forbidPattern(qqWorker, /\b(?:retry|Start-Sleep)\b/i, "QQ worker must not retry");
+forbidPattern(qqWorker, /Write-NotifyQqSenderLog[^\r\n]*(?:stdout|stderr|senderScript|TextFile)/i, "QQ worker logs must not expose sender output, paths, or message files");
 
 const broker = read("windows/pi-notify-broker.ps1");
 forbidPattern(broker, /\bAdd-Content\b/, "broker logging must not use PowerShell Add-Content");

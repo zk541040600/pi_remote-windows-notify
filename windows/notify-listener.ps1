@@ -5,7 +5,8 @@ param(
     [string]$Token,
     [string]$ConfigPath,
     [string]$AppId = "Pi Remote",
-    [switch]$Once
+    [switch]$Once,
+    [string]$TestDesktopSinkPath
 )
 
 Set-StrictMode -Version Latest
@@ -35,6 +36,13 @@ $script:NotifyBrokerScript = Join-Path $PSScriptRoot 'pi-notify-broker.ps1'
 $script:NotifyPowerShellExe = Get-NotifyBridgePowerShellExe
 $script:NotifyListenerLogPath = Join-Path (Get-NotifyBridgeLogDir) 'listener.log'
 $script:NotifyRecentNotifications = @()
+$script:NotifyQqWorkers = New-Object System.Collections.ArrayList
+$script:NotifyQqWorkerScript = Join-Path $PSScriptRoot 'pi-notify-qq-sender.ps1'
+$script:NotifyQqPendingDir = Join-Path (Get-NotifyBridgeBaseDir) 'qq-pending'
+$script:NotifyQqEnabled = [bool]$config.QqNotifyEnabled
+$script:NotifyQqSenderScript = [string]$config.QqSenderScript
+$script:NotifyQqMaxConcurrent = [Math]::Max(1, [Math]::Min(8, [int]$config.QqMaxConcurrent))
+$script:NotifyQqTimeoutSeconds = [Math]::Max(1, [Math]::Min(120, [int]$config.QqSendTimeoutSeconds))
 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $script:NotifyListenerLogPath) | Out-Null
 Clear-NotifyBridgePopupArtifacts -MaxAgeMinutes 10
 
@@ -46,6 +54,155 @@ function Write-NotifyListenerLog {
 
     $line = ('[{0}] {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'), $Message)
     Add-Content -LiteralPath $script:NotifyListenerLogPath -Value $line -Encoding UTF8
+}
+
+# Normalize one display field before it crosses into the QQ sender boundary.
+function ConvertTo-NotifyQqTextPart {
+    param(
+        [string]$Value,
+        [Parameter(Mandatory = $true)]
+        [int]$MaxLength
+    )
+
+    $normalized = [regex]::Replace([string]$Value, '[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\s]+', ' ').Trim()
+    if ($normalized.Length -le $MaxLength) {
+        return $normalized
+    }
+    return $normalized.Substring(0, $MaxLength).TrimEnd()
+}
+
+# Prepare the instance-local private pending directory and remove abandoned message files.
+function Initialize-NotifyQqPendingDirectory {
+    if (-not (Test-Path -LiteralPath $script:NotifyQqPendingDir)) {
+        if (-not $script:NotifyQqEnabled) {
+            return $true
+        }
+        New-Item -ItemType Directory -Force -Path $script:NotifyQqPendingDir | Out-Null
+    }
+
+    try {
+        $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+        $security = [System.Security.AccessControl.DirectorySecurity]::new()
+        $security.SetAccessRuleProtection($true, $false)
+        $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+            $identity,
+            [System.Security.AccessControl.FileSystemRights]::FullControl,
+            [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit',
+            [System.Security.AccessControl.PropagationFlags]::None,
+            [System.Security.AccessControl.AccessControlType]::Allow
+        )
+        $security.AddAccessRule($rule)
+        [System.IO.Directory]::SetAccessControl($script:NotifyQqPendingDir, $security)
+    }
+    catch {
+        Write-NotifyListenerLog -Message ('qq-pending-unavailable reason={0}' -f $_.Exception.GetType().Name)
+        return $false
+    }
+
+    $cutoff = (Get-Date).AddMinutes(-[Math]::Max(10, [Math]::Ceiling($script:NotifyQqTimeoutSeconds * 3 / 60)))
+    $removed = 0
+    foreach ($item in @(Get-ChildItem -LiteralPath $script:NotifyQqPendingDir -Filter '*.txt' -File -ErrorAction SilentlyContinue)) {
+        if ($item.LastWriteTime -ge $cutoff) {
+            continue
+        }
+        try {
+            Remove-Item -LiteralPath $item.FullName -Force -ErrorAction Stop
+            $removed += 1
+        }
+        catch {
+            Write-NotifyListenerLog -Message ('qq-pending-cleanup-failed reason={0}' -f $_.Exception.GetType().Name)
+        }
+    }
+    if ($removed -gt 0) {
+        Write-NotifyListenerLog -Message ('qq-pending-cleaned count={0}' -f $removed)
+    }
+    return $true
+}
+
+# Drop completed process handles before enforcing the listener-local worker limit.
+function Clear-NotifyQqCompletedWorkers {
+    for ($index = $script:NotifyQqWorkers.Count - 1; $index -ge 0; $index--) {
+        $worker = $script:NotifyQqWorkers[$index]
+        $remove = $false
+        try { $remove = $worker.HasExited } catch { $remove = $true }
+        if (-not $remove) {
+            continue
+        }
+        try { $worker.Dispose() } catch {}
+        $script:NotifyQqWorkers.RemoveAt($index)
+    }
+}
+
+# Launch one bounded best-effort QQ worker without exposing notification content on the command line.
+function Start-NotifyQqDispatch {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Title,
+        [Parameter(Mandatory = $true)]
+        [string]$Body
+    )
+
+    if (-not $script:NotifyQqEnabled) {
+        return
+    }
+    if (-not (Test-Path -LiteralPath $script:NotifyQqWorkerScript -PathType Leaf)) {
+        Write-NotifyListenerLog -Message 'qq-send-unavailable reason=worker'
+        return
+    }
+    if ([string]::IsNullOrWhiteSpace($script:NotifyQqSenderScript) -or -not (Test-Path -LiteralPath $script:NotifyQqSenderScript -PathType Leaf)) {
+        Write-NotifyListenerLog -Message 'qq-send-unavailable reason=sender'
+        return
+    }
+    if (-not (Test-Path -LiteralPath $script:NotifyQqPendingDir -PathType Container)) {
+        Write-NotifyListenerLog -Message 'qq-send-unavailable reason=pending-directory'
+        return
+    }
+
+    Clear-NotifyQqCompletedWorkers
+    if ($script:NotifyQqWorkers.Count -ge $script:NotifyQqMaxConcurrent) {
+        Write-NotifyListenerLog -Message ('qq-send-drop reason=capacity active={0} limit={1}' -f $script:NotifyQqWorkers.Count, $script:NotifyQqMaxConcurrent)
+        return
+    }
+
+    $textFile = Join-Path $script:NotifyQqPendingDir ('qq-{0}.txt' -f [Guid]::NewGuid().ToString('N'))
+    try {
+        $qqTitle = ConvertTo-NotifyQqTextPart -Value $Title -MaxLength 80
+        $qqBody = ConvertTo-NotifyQqTextPart -Value $Body -MaxLength 220
+        $qqText = if ([string]::IsNullOrWhiteSpace($qqBody)) { $qqTitle } else { $qqTitle + [System.Environment]::NewLine + $qqBody }
+        [System.IO.File]::WriteAllText($textFile, $qqText, [System.Text.UTF8Encoding]::new($false))
+
+        $workerArgs = Join-NotifyBridgeProcessArguments @(
+            '-NoProfile',
+            '-WindowStyle', 'Hidden',
+            '-ExecutionPolicy', 'Bypass',
+            '-File', $script:NotifyQqWorkerScript,
+            '-ConfigPath', $ConfigPath,
+            '-TextFile', $textFile
+        )
+        $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+        $startInfo.FileName = $script:NotifyPowerShellExe
+        $startInfo.Arguments = $workerArgs
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $true
+        $worker = [System.Diagnostics.Process]::Start($startInfo)
+        if ($null -eq $worker) {
+            throw 'QQ worker process did not start.'
+        }
+        [void]$script:NotifyQqWorkers.Add($worker)
+        Write-NotifyListenerLog -Message ('qq-send-started active={0} limit={1}' -f $script:NotifyQqWorkers.Count, $script:NotifyQqMaxConcurrent)
+    }
+    catch {
+        Remove-Item -LiteralPath $textFile -Force -ErrorAction SilentlyContinue
+        Write-NotifyListenerLog -Message ('qq-send-error reason={0}' -f $_.Exception.GetType().Name)
+    }
+}
+
+$qqPendingReady = Initialize-NotifyQqPendingDirectory
+if ($script:NotifyQqEnabled) {
+    Write-NotifyListenerLog -Message ('qq-notify-start enabled=True ready={0} limit={1} timeoutSeconds={2}' -f $qqPendingReady, $script:NotifyQqMaxConcurrent, $script:NotifyQqTimeoutSeconds)
+}
+else {
+    Write-NotifyListenerLog -Message 'qq-notify-start enabled=False'
 }
 
 function Write-HttpResponse {
@@ -676,6 +833,13 @@ function Show-Toast {
         [string]$LaunchUri
     )
 
+    if (-not [string]::IsNullOrWhiteSpace($TestDesktopSinkPath)) {
+        $sinkPath = [System.IO.Path]::GetFullPath($TestDesktopSinkPath)
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $sinkPath) | Out-Null
+        [System.IO.File]::AppendAllText($sinkPath, ('desktop-shown' + [System.Environment]::NewLine), [System.Text.UTF8Encoding]::new($false))
+        return
+    }
+
     $focusTarget = if ([string]::IsNullOrWhiteSpace($FocusTarget)) { [string]$config.RemoteHostAlias } else { [string]$FocusTarget }
     $cwdBase = if ([string]::IsNullOrWhiteSpace($CwdBase)) { '' } else { [string]$CwdBase }
     $tabTitle = if ([string]::IsNullOrWhiteSpace($TabTitle)) { '' } else { [string]$TabTitle }
@@ -829,6 +993,12 @@ try {
             Write-NotifyListenerLog -Message ('notify targetFingerprint="{0}" hasCwd={1} hasTab={2}' -f (Get-NotifyPopupTargetFingerprint -TargetKey $focusTarget), (-not [string]::IsNullOrWhiteSpace($cwdBase)), (-not [string]::IsNullOrWhiteSpace($tabTitle)))
             Show-Toast -Title $title -Body $body -ToastAppId $AppId -FocusTarget $focusTarget -CwdBase $cwdBase -TabTitle $tabTitle -SessionName $sessionName -LaunchUri $launchUri
             $notified = $true
+            try {
+                Start-NotifyQqDispatch -Title $title -Body $body
+            }
+            catch {
+                Write-NotifyListenerLog -Message ('qq-send-error reason={0}' -f $_.Exception.GetType().Name)
+            }
             Write-HttpResponse -Stream $stream -StatusCode 200 -Reason 'OK' -Body 'ok'
         }
         catch {

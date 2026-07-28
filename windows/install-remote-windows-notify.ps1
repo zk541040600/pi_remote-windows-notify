@@ -39,6 +39,7 @@ $runtimeFiles = @(
     'NotifyBridge.Process.ps1',
     'NotifyBridge.Remote.ps1',
     'notify-listener.ps1',
+    'pi-notify-qq-sender.ps1',
     'pi-notify-listener-runner.ps1',
     'pi-notify-restart-listener.ps1',
     'pi-notify-popup.ps1',

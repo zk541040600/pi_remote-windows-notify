@@ -8,6 +8,7 @@ This folder implements a reliable **Windows local notification bridge** for runn
 - `NotifyBridge.Process.ps1` — shared detached-start and instance-owned process helpers
 - `NotifyBridge.Remote.ps1` — shared remote path, SSH probe, and in-memory upload helpers
 - `notify-listener.ps1` — Windows local HTTP listener that shows toast notifications
+- `pi-notify-qq-sender.ps1` — optional bounded QQ mirror worker invoked only by the accepted listener path
 - `pi-notify-broker.ps1` — long-lived low-latency WinForms broker for popup-focus mode (loopback HTTP on port 23119)
 - `pi-notify-popup.ps1` — fallback per-notification popup process used when the broker is unavailable or disabled
 - `pi-notify-reverse-tunnel.ps1` — persistent reverse SSH tunnel with auto-reconnect
@@ -32,6 +33,7 @@ Windows local machine
   pi-notify-reverse-tunnel.ps1
         ^
         | persistent ssh -R reverse tunnel
+    -> optional QQ mirror: pi-notify-qq-sender.ps1 starts the existing local sender with a temp text file
         |
 Remote host my
   Pi extension POST http://127.0.0.1:23118/notify
@@ -210,12 +212,19 @@ Important keys:
 
 Broker keys (auto-upgraded with safe defaults when missing):
 
+  "qqNotifyEnabled": false,
+  "qqNodeExecutable": "node.exe",
+  "qqSenderScript": "",
+  "qqSendTimeoutSeconds": 20,
+  "qqMaxConcurrent": 2,
 - `brokerEnabled` (default `true`) — when `true`, `popup-focus` mode prefers the long-lived broker; when `false`, the listener uses the old per-notification `pi-notify-popup.ps1` process path.
 - `brokerPort` (default `23119`) — loopback-only HTTP port for the broker. The broker binds only `127.0.0.1` and is never exposed through the SSH tunnel.
 - `brokerStartupTimeoutMs` (default `700`) — bounded wait when the listener starts the broker on first use.
 - `brokerRequestTimeoutMs` (default `700`) — bounded timeout for listener-to-broker `/popup` posts; on failure the listener falls back to the popup process path.
 
 Remote config also supports:
+QQ mirror keys are non-sensitive and default to disabled. Keep QQ account, recipient, token, secret, and OpenClaw configuration outside this bridge config.
+
 
 ```json
 {
@@ -223,6 +232,18 @@ Remote config also supports:
   "title": "Pi",
   "bodyTemplate": "host: {host} | cwd: {cwdBase}",
   "remoteHostAlias": "my"
+QQ mirror keys (auto-upgraded with safe defaults when missing):
+
+- `qqNotifyEnabled` (default `false`) — opt-in only. Install, refresh, and restart keep it disabled unless you explicitly set it.
+- `qqNodeExecutable` (default `node.exe`) — Node executable name or path used by the local worker.
+- `qqSenderScript` (default empty) — path to the existing local QQ sender script, for example the Jira Watch sender that accepts `--text-file`.
+- `qqSendTimeoutSeconds` (default `20`, capped at `120`) — one-shot sender timeout. Timeout kills the direct Node child and does not retry.
+- `qqMaxConcurrent` (default `2`, capped at `8`) — maximum live QQ workers. When the limit is reached the QQ branch is dropped, not queued.
+
+QQ delivery runs only after token authentication, display text normalization, target validation, the existing five-second dedupe gate, and desktop notification dispatch. `no-target` and `dedup` responses do not start QQ. The QQ text is built only from the final title and body, stored in `%USERPROFILE%\.pi-notify\qq-pending` or the current instance `qq-pending` directory, and passed as a UTF-8 temp file; route keys, session IDs, window handles, tokens, account IDs, and receiver IDs are not included.
+
+Before enabling real QQ sends, validate with a fake sender or the existing sender's `--dry-run`, then get explicit approval for a real smoke because it will notify the configured recipient. Structured evidence is written to `logs\listener.log` and `logs\qq-sender.log` as statuses such as `qq-send-ok`, `qq-send-failed exitCode=<n>`, `qq-send-timeout`, `qq-send-unavailable reason=<kind>`, or `qq-send-drop reason=capacity`; logs must not contain message text, sender stdout/stderr, account/recipient identifiers, or credentials. To roll back QQ only, set `qqNotifyEnabled` to `false` and restart the listener; desktop notifications do not require code rollback.
+
 }
 ```
 

@@ -122,6 +122,7 @@ $filesToCopy = @(
     'NotifyBridge.Process.ps1',
     'NotifyBridge.Remote.ps1',
     'notify-listener.ps1',
+    'pi-notify-qq-sender.ps1',
     'pi-notify-reverse-tunnel.ps1',
     'pi-notify-activate.ps1',
     'pi-notify-hotkey.ps1',

@@ -101,6 +101,7 @@ $restartText = [string]$sourceText['pi-notify-restart-listener.ps1']
 $remoteInstallText = [string]$sourceText['install-remote-windows-notify.ps1']
 $watchdogText = [string]$sourceText['pi-notify-watchdog.ps1']
 $listenerText = [string]$sourceText['notify-listener.ps1']
+$qqSenderText = [string]$sourceText['pi-notify-qq-sender.ps1']
 $hotkeyText = [string]$sourceText['pi-notify-hotkey.ps1']
 $activateText = [string]$sourceText['pi-notify-activate.ps1']
 $setModeText = [string]$sourceText['set-notify-mode.ps1']
@@ -112,6 +113,9 @@ $autostartAllText = [string]$sourceText['install-autostart-all.ps1']
 $checkText = [string]$sourceText['pi-notify-check.ps1']
 if ($commonText -notmatch 'brokerEnabled' -or $commonText -notmatch 'brokerPort' -or $commonText -notmatch 'brokerStartupTimeoutMs' -or $commonText -notmatch 'brokerRequestTimeoutMs' -or $commonText -notmatch 'BrokerHealthUrl' -or $commonText -notmatch 'BrokerPopupUrl' -or $commonText -notmatch 'BrokerCloseUrl') {
     throw 'NotifyBridge config must persist stable broker defaults (brokerEnabled, brokerPort, brokerStartupTimeoutMs, brokerRequestTimeoutMs) and expose broker URLs.'
+}
+if ($commonText -notmatch 'qqNotifyEnabled' -or $commonText -notmatch 'qqNodeExecutable' -or $commonText -notmatch 'qqSenderScript' -or $commonText -notmatch 'qqSendTimeoutSeconds' -or $commonText -notmatch 'qqMaxConcurrent' -or $commonText -notmatch 'finalQqNotifyEnabled[\s\S]{0,300}else\s*\{\s*\$false' -or $commonText -match 'qq(Account|Openid|Token|Secret|Recipient|Receiver)') {
+    throw 'NotifyBridge config must keep flat bounded QQ runtime fields, default disabled, and own no QQ identity or credentials.'
 }
 $hasPs5TokenRng = ($commonText -match 'RandomNumberGenerator\]::Create\(\)' -and $commonText -match '\.GetBytes\(\$buffer\)')
 $hasModernTokenRng = ($commonText -match 'RandomNumberGenerator\]::Fill')
@@ -155,6 +159,9 @@ try {
     $probeConfig = Ensure-NotifyBridgeConfig -ConfigPath $customProbeConfig -Port 23119 -SshExecutable 'ssh.exe' -RemoteHostAlias 'probe' -TunnelStartupDelaySeconds 0
     if ((Get-NotifyBridgeBaseDir) -ne $customProbeBase -or (Get-NotifyBridgeBinDir) -ne (Join-Path $customProbeBase 'bin') -or (Get-NotifyBridgeLogDir) -ne (Join-Path $customProbeBase 'logs') -or [int]$probeConfig.TunnelStartupDelaySeconds -lt 5 -or [int]$probeConfig.PopupTimeoutSeconds -ne 1800) {
         throw 'ConfigPath probe failed.'
+    }
+    if ([bool]$probeConfig.QqNotifyEnabled -or [string]$probeConfig.QqNodeExecutable -ne 'node.exe' -or -not [string]::IsNullOrWhiteSpace([string]$probeConfig.QqSenderScript) -or [int]$probeConfig.QqSendTimeoutSeconds -ne 20 -or [int]$probeConfig.QqMaxConcurrent -ne 2) {
+        throw 'QQ config defaults must remain disabled and bounded.'
     }
     $reloadProbeConfig = Ensure-NotifyBridgeConfig -ConfigPath $customProbeConfig
     $reloadRaw = Get-Content -LiteralPath $customProbeConfig -Raw | ConvertFrom-Json
@@ -306,6 +313,49 @@ $deadFunctionPattern = 'function\s+(Protect-NotifyBrokerLiveValue|Get-NotifyBrok
 foreach ($name in @('pi-notify-broker.ps1', 'pi-notify-popup.ps1', 'notify-listener.ps1')) {
     if ([string]$sourceText[$name] -match $deadFunctionPattern) {
         throw ('Dead runtime helper remains in {0}: {1}' -f $name, $Matches[1])
+    }
+}
+
+# Broker script assertions: syntax is covered by [1/10]; here we assert privacy,
+# runtime-file coverage, and config defaults.
+if (-not (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'pi-notify-broker.ps1'))) {
+    throw 'pi-notify-broker.ps1 must exist for low-latency broker path.'
+}
+if ($brokerText -notmatch 'System.Net.IPAddress\]::Loopback' -or $brokerText -notmatch '/health' -or $brokerText -notmatch '/popup' -or $brokerText -notmatch '/close') {
+    throw 'Broker must bind loopback only and expose /health, /popup, /close endpoints.'
+}
+if ($brokerText -notmatch 'broker.pid' -or $brokerText -notmatch 'broker.log' -or $brokerText -notmatch 'Global\\PiNotifyBroker_') {
+    throw 'Broker must write broker.pid/broker.log and use a singleton mutex.'
+}
+if ($brokerText -notmatch 'popup-live\.' -or $brokerText -notmatch 'brokerManaged\s*=\s*\$true' -or $brokerText -match 'protected(Host|Cwd|Tab)\s*=') {
+    throw 'Broker-managed live-state files must avoid target-context DPAPI work; broker /activate-oldest and /close use in-memory popup state and popupId.'
+}
+# Privacy: broker logs must not include raw notification content or target context
+$badBrokerLogPattern = ('broker-popup-start ' + 'title=') + '|' + ('broker-popup-start ' + 'body=') + '|' + ('broker-shown ' + 'title=') + '|' + 'sourceTabTitle="' + '|' + 'cwdBase="' + '|' + 'sessionName="' + '|' + 'windowTitle="' + '|' + 'tabName="' + '|' + 'broker-action activate host=' + '|' + 'broker-cache host="' + '|' + 'broker-keywords "'
+if ($brokerText -match $badBrokerLogPattern) {
+    throw 'Broker logs must not persist notification title/body text or raw target context.'
+}
+# QQ worker assertions cover one-shot process ownership, timeout, cleanup, and redacted logs.
+if (-not (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'pi-notify-qq-sender.ps1'))) {
+    throw 'pi-notify-qq-sender.ps1 must exist for optional QQ delivery.'
+}
+if ($qqSenderText -notmatch '''--text-file'', \$TextFile' -or $qqSenderText -notmatch 'WaitForExit\(\$timeoutSeconds \* 1000\)' -or $qqSenderText -notmatch '\$process\.Kill\(\)' -or $qqSenderText -notmatch 'RedirectStandardOutput = \$true' -or $qqSenderText -notmatch 'RedirectStandardError = \$true' -or $qqSenderText -notmatch 'qq-send-ok' -or $qqSenderText -notmatch 'qq-send-failed exitCode=' -or $qqSenderText -notmatch 'qq-send-timeout' -or $qqSenderText -notmatch 'qq-send-unavailable reason=' -or $qqSenderText -notmatch 'finally\s*\{[\s\S]*Remove-Item -LiteralPath \$TextFile') {
+    throw 'QQ worker must invoke one bounded Node sender, redact outcomes, and clean the message file in finally.'
+}
+if ($qqSenderText -match '\b(retry|Start-Sleep)\b' -or $qqSenderText -match 'Write-NotifyQqSenderLog[^\r\n]*(stdout|stderr|senderScript|TextFile)' -or $qqSenderText -match '\b(account|openid|recipient|receiver|clientSecret)\b') {
+    throw 'QQ worker must not retry or log sender output, message paths, recipient identity, or credentials.'
+}
+$qqNoTargetIndex = $listenerText.LastIndexOf("-Body 'no-target'")
+$qqDedupIndex = $listenerText.LastIndexOf("-Body 'dedup'")
+$qqDesktopIndex = $listenerText.LastIndexOf('Show-Toast -Title $title')
+$qqDispatchIndex = $listenerText.LastIndexOf('Start-NotifyQqDispatch -Title $title -Body $body')
+$qqOkIndex = $listenerText.LastIndexOf("-Body 'ok'")
+if ($qqNoTargetIndex -lt 0 -or $qqNoTargetIndex -ge $qqDedupIndex -or $qqDedupIndex -ge $qqDesktopIndex -or $qqDesktopIndex -ge $qqDispatchIndex -or $qqDispatchIndex -ge $qqOkIndex -or ([regex]::Matches($listenerText, '(?m)^\s*Start-NotifyQqDispatch -Title \$title -Body \$body\s*$')).Count -ne 1 -or $listenerText -notmatch 'qq-send-drop reason=capacity' -or $listenerText -notmatch 'SetAccessRuleProtection\(\$true, \$false\)') {
+    throw 'Listener QQ dispatch must run once after target/dedupe/desktop gates with private bounded worker resources.'
+}
+foreach ($runtimeText in @($refreshText, $windowsInstallText, $restartText, $remoteInstallText)) {
+    if ($runtimeText -notmatch "'pi-notify-qq-sender.ps1'") {
+        throw 'QQ worker must be included in every Windows runtime sync path.'
     }
 }
 
@@ -535,7 +585,7 @@ if ($refreshText -match 'origin master' -or $refreshText -notmatch 'rev-parse --
 if ($refreshText -notmatch '\$runtimeFiles' -or $refreshText -notmatch 'GetFullPath\(\$source\)' -or $refreshText -notmatch 'GetFullPath\(\$destination\)') {
     throw 'Refresh runtime sync must use a runtime file list with same-path skip so it works from the runtime bin.'
 }
-foreach ($requiredRuntimeName in @('NotifyBridge.Process.ps1', 'NotifyBridge.Remote.ps1', 'pi-notify-ensure.mjs', 'remote-windows-notify.ts', 'popup-wallpaper.png', 'install-remote-windows-notify.ps1', 'install-linux-autostart.ps1', 'install-windows-autostart.ps1', 'install-autostart-all.ps1', 'pi-notify-check.ps1', 'pi-notify-hotkey.ps1', 'pi-notify-broker.ps1')) {
+foreach ($requiredRuntimeName in @('NotifyBridge.Process.ps1', 'NotifyBridge.Remote.ps1', 'pi-notify-ensure.mjs', 'remote-windows-notify.ts', 'popup-wallpaper.png', 'install-remote-windows-notify.ps1', 'install-linux-autostart.ps1', 'install-windows-autostart.ps1', 'install-autostart-all.ps1', 'pi-notify-check.ps1', 'pi-notify-hotkey.ps1', 'pi-notify-broker.ps1', 'pi-notify-qq-sender.ps1')) {
     if ($refreshText -notmatch [regex]::Escape($requiredRuntimeName) -or $autostartAllText -match 'unused-never-match') {
         throw ('Refresh runtime sync must copy required file: {0}' -f $requiredRuntimeName)
     }
@@ -545,7 +595,7 @@ foreach ($requiredRuntimeName in @('NotifyBridge.Process.ps1', 'NotifyBridge.Rem
 }
 $runtimeBin = Join-Path $runtimeBaseDir 'bin'
 if (Test-Path -LiteralPath $runtimeBin) {
-    foreach ($requiredRuntimeName in @('NotifyBridge.Process.ps1', 'NotifyBridge.Remote.ps1', 'pi-notify-ensure.mjs', 'remote-windows-notify.ts', 'popup-wallpaper.png', 'install-remote-windows-notify.ps1', 'install-linux-autostart.ps1', 'install-windows-autostart.ps1', 'install-autostart-all.ps1', 'pi-notify-check.ps1', 'pi-notify-hotkey.ps1', 'pi-notify-broker.ps1')) {
+    foreach ($requiredRuntimeName in @('NotifyBridge.Process.ps1', 'NotifyBridge.Remote.ps1', 'pi-notify-ensure.mjs', 'remote-windows-notify.ts', 'popup-wallpaper.png', 'install-remote-windows-notify.ps1', 'install-linux-autostart.ps1', 'install-windows-autostart.ps1', 'install-autostart-all.ps1', 'pi-notify-check.ps1', 'pi-notify-hotkey.ps1', 'pi-notify-broker.ps1', 'pi-notify-qq-sender.ps1')) {
         if (-not (Test-Path -LiteralPath (Join-Path $runtimeBin $requiredRuntimeName))) {
             throw ('Runtime bin is missing required file: {0}' -f $requiredRuntimeName)
         }
@@ -643,13 +693,28 @@ if (Test-Path -LiteralPath $popupLogDir) {
     if ($stalePopupArtifacts.Count -gt 0 -or $popupArtifacts.Count -gt 8) {
         throw ('Stale or excessive popup artifacts remain: count={0} stale={1}' -f $popupArtifacts.Count, $stalePopupArtifacts.Count)
     }
-    foreach ($logName in @('listener.log', 'popup.log', 'activate.log', 'broker.log')) {
+    foreach ($logName in @('listener.log', 'popup.log', 'activate.log', 'broker.log', 'qq-sender.log')) {
         $logPath = Join-Path $popupLogDir $logName
         if (-not (Test-Path -LiteralPath $logPath)) { continue }
         $logText = [System.IO.File]::ReadAllText($logPath, [System.Text.UTF8Encoding]::new($false))
         $badRuntimeNotificationLogPattern = ('notify ' + 'title=') + '|' + ('system-toast ' + 'title=') + '|' + ('notify-drop missing-target-metadata ' + 'title=') + '|' + ('popup-launch ' + 'title=') + '|' + ('popup-start ' + 'title=') + '|' + ('popup-' + 'action .*' + 'tit' + 'le=') + '|' + 'sourceTabTitle="' + '|' + 'cwdBase="' + '|' + 'sessionName="' + '|' + 'windowTitle="' + '|' + 'tabTitle="' + '|' + 'keywords="' + '|' + 'popup-window title="' + '|' + 'popup-tab .*name="' + '|' + 'popup-action activate host=' + '|' + 'popup-cache host="' + '|' + 'activate-target host=' + '|' + 'activate-focus-miss .*host=' + '|' + 'notify-dedup .*focusTarget=' + '|' + 'notify focusTarget='
         if ($logText -match $badRuntimeNotificationLogPattern) {
             throw ('Notification content or raw target context remains in runtime log: {0}' -f $logName)
+        }
+    }
+    $qqPendingDir = Join-Path (Split-Path -Parent $configPath) 'qq-pending'
+    if (Test-Path -LiteralPath $qqPendingDir) {
+        $staleQqFiles = @(Get-ChildItem -LiteralPath $qqPendingDir -Filter '*.txt' -File -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -lt (Get-Date).AddMinutes(-10) })
+        if ($staleQqFiles.Count -gt 0) {
+            throw ('Stale QQ message files remain: count={0}' -f $staleQqFiles.Count)
+        }
+    }
+    $qqSenderLog = Join-Path $popupLogDir 'qq-sender.log'
+    if (Test-Path -LiteralPath $qqSenderLog) {
+        foreach ($line in @(Get-Content -LiteralPath $qqSenderLog -Tail 200)) {
+            if ($line -notmatch '^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}\] qq-send-(ok|timeout|skip reason=disabled|failed exitCode=-?\d+|unavailable reason=[A-Za-z0-9_.-]+|error reason=[A-Za-z0-9_.-]+|cleanup-failed reason=[A-Za-z0-9_.-]+)$') {
+                throw 'QQ sender log contains an unstructured or potentially sensitive line.'
+            }
         }
     }
 }

@@ -684,7 +684,12 @@ function Ensure-NotifyBridgeConfig {
         [bool]$BrokerEnabled,
         [int]$BrokerPort,
         [int]$BrokerStartupTimeoutMs,
-        [int]$BrokerRequestTimeoutMs
+        [int]$BrokerRequestTimeoutMs,
+        [bool]$QqNotifyEnabled,
+        [string]$QqNodeExecutable,
+        [string]$QqSenderScript,
+        [int]$QqSendTimeoutSeconds,
+        [int]$QqMaxConcurrent
     )
 
     $resolvedPath = Set-NotifyBridgeActiveConfigPath -ConfigPath $ConfigPath
@@ -894,6 +899,56 @@ function Ensure-NotifyBridgeConfig {
         700
     }
 
+    $finalQqNotifyEnabled = if ($PSBoundParameters.ContainsKey('QqNotifyEnabled')) {
+        [bool]$QqNotifyEnabled
+    }
+    elseif ($existing.ContainsKey('qqNotifyEnabled')) {
+        ConvertTo-NotifyBridgeBoolean -Value $existing['qqNotifyEnabled'] -Default $false
+    }
+    else {
+        $false
+    }
+
+    $finalQqNodeExecutable = if ($PSBoundParameters.ContainsKey('QqNodeExecutable') -and -not [string]::IsNullOrWhiteSpace($QqNodeExecutable)) {
+        Resolve-NotifyBridgeExecutableValue -Value $QqNodeExecutable
+    }
+    elseif ($existing.ContainsKey('qqNodeExecutable') -and -not [string]::IsNullOrWhiteSpace([string]$existing['qqNodeExecutable'])) {
+        Resolve-NotifyBridgeExecutableValue -Value ([string]$existing['qqNodeExecutable'])
+    }
+    else {
+        'node.exe'
+    }
+
+    $finalQqSenderScript = if ($PSBoundParameters.ContainsKey('QqSenderScript') -and -not [string]::IsNullOrWhiteSpace($QqSenderScript)) {
+        $QqSenderScript.Trim()
+    }
+    elseif ($existing.ContainsKey('qqSenderScript') -and -not [string]::IsNullOrWhiteSpace([string]$existing['qqSenderScript'])) {
+        ([string]$existing['qqSenderScript']).Trim()
+    }
+    else {
+        ''
+    }
+
+    $finalQqSendTimeoutSeconds = if ($PSBoundParameters.ContainsKey('QqSendTimeoutSeconds') -and $QqSendTimeoutSeconds -ge 1) {
+        [Math]::Min(120, $QqSendTimeoutSeconds)
+    }
+    elseif ($existing.ContainsKey('qqSendTimeoutSeconds') -and [int]$existing['qqSendTimeoutSeconds'] -ge 1) {
+        [Math]::Min(120, [int]$existing['qqSendTimeoutSeconds'])
+    }
+    else {
+        20
+    }
+
+    $finalQqMaxConcurrent = if ($PSBoundParameters.ContainsKey('QqMaxConcurrent') -and $QqMaxConcurrent -ge 1) {
+        [Math]::Min(8, $QqMaxConcurrent)
+    }
+    elseif ($existing.ContainsKey('qqMaxConcurrent') -and [int]$existing['qqMaxConcurrent'] -ge 1) {
+        [Math]::Min(8, [int]$existing['qqMaxConcurrent'])
+    }
+    else {
+        2
+    }
+
     $config = @{
         listenHost                = $finalHost
         port                      = $finalPort
@@ -916,7 +971,17 @@ function Ensure-NotifyBridgeConfig {
         brokerPort                 = $finalBrokerPort
         brokerStartupTimeoutMs     = $finalBrokerStartupTimeoutMs
         brokerRequestTimeoutMs     = $finalBrokerRequestTimeoutMs
-        updatedAtUtc              = [DateTime]::UtcNow.ToString('o')
+        qqNotifyEnabled            = $finalQqNotifyEnabled
+        qqNodeExecutable           = $finalQqNodeExecutable
+        qqSenderScript             = $finalQqSenderScript
+        qqSendTimeoutSeconds       = $finalQqSendTimeoutSeconds
+        qqMaxConcurrent            = $finalQqMaxConcurrent
+        updatedAtUtc               = [DateTime]::UtcNow.ToString('o')
+    }
+    foreach ($key in $existing.Keys) {
+        if (-not $config.ContainsKey($key)) {
+            $config[$key] = $existing[$key]
+        }
     }
 
     $savedPath = Save-NotifyBridgeConfig -ConfigPath $resolvedPath -Config $config
@@ -944,6 +1009,11 @@ function Ensure-NotifyBridgeConfig {
         BrokerPort                 = $config.brokerPort
         BrokerStartupTimeoutMs     = $config.brokerStartupTimeoutMs
         BrokerRequestTimeoutMs     = $config.brokerRequestTimeoutMs
+        QqNotifyEnabled            = $config.qqNotifyEnabled
+        QqNodeExecutable           = $config.qqNodeExecutable
+        QqSenderScript             = $config.qqSenderScript
+        QqSendTimeoutSeconds       = $config.qqSendTimeoutSeconds
+        QqMaxConcurrent            = $config.qqMaxConcurrent
         BrokerUrl                  = ('http://127.0.0.1:{0}' -f $config.brokerPort)
         BrokerHealthUrl            = ('http://127.0.0.1:{0}/health' -f $config.brokerPort)
         BrokerPopupUrl             = ('http://127.0.0.1:{0}/popup' -f $config.brokerPort)
