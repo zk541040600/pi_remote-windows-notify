@@ -91,6 +91,16 @@ Browser extensions register owners over Native Messaging but cannot receive dupl
 
 Queues are bounded (`MaxPendingActivations` / `MaxPendingPerAdapter`). Adapter disconnect, deadline expiry, owner page change, or wrong-adapter poll/result all fail closed (no retarget, no redelivery).
 
+### Native Messaging wake frames (MV3 idle)
+
+After caller-origin allowlist validation, the `--native` relay emits bounded unsolicited `type=wake` frames on stdout (~`NativeWakeIntervalMs` = 1s). Purpose: inbound Native Messaging traffic wakes the Chrome/Edge MV3 service worker so `poll-activation` can run while the worker would otherwise be idle (JS `setTimeout` alone is not reliable for the 5s activation deadline). Rules:
+
+- Wake frames contain only `protocolVersion`, `type`, `seq` — never session/URL/routing/token/user content.
+- Never accepted as inbound route traffic; never forwarded to the daemon; not in `AllowedMessageTypes`.
+- All stdout writes (responses, rejects, wakes) are serialized so 32-bit framing cannot interleave.
+- Wake loop cancels/awaits on stdin EOF, cancellation, or stdout failure (no orphan task).
+- Disallowed callers get a single reject frame and no wake task.
+
 ## Scope note
 
 This directory is self-contained. PowerShell listener integration, browser extension, and PiWebDesktop adapter live outside `windows/route-host/` and are separate slices.

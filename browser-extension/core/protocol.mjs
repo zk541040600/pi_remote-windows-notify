@@ -30,6 +30,17 @@ export const MAX_POLL_INTERVAL_MS = 10_000;
 /** Bound concurrent in-flight poll+activate work (single-flight). */
 export const POLL_SINGLE_FLIGHT = true;
 
+/**
+ * Host→extension unsolicited wake interval (ms). Native Messaging inbound traffic
+ * wakes the MV3 worker so poll-activation can run while idle. Matches Route Host
+ * ProtocolConstants.NativeWakeIntervalMs. Must stay well under the 5s activation
+ * deadline without excessive traffic.
+ */
+export const DEFAULT_WAKE_INTERVAL_MS = 1_000;
+
+/** Throttle wake-driven lease/heartbeat maintenance (ms). */
+export const WAKE_MAINTENANCE_INTERVAL_MS = 15_000;
+
 export const MessageTypes = Object.freeze({
   Health: 'health',
   RegisterAdapter: 'register-adapter',
@@ -44,6 +55,8 @@ export const MessageTypes = Object.freeze({
   ActivationStatus: 'activation-status',
   Ping: 'ping',
   Result: 'result',
+  /** Internal host→browser keep-alive only; never forwarded as a route command. */
+  Wake: 'wake',
 });
 
 export const RouteResults = Object.freeze({

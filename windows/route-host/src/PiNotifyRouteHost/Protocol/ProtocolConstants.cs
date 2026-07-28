@@ -66,6 +66,14 @@ public static class ProtocolConstants
     /// <summary>Default poll wait budget for --client --wait-ms when omitted but wait requested (ms).</summary>
     public const int DefaultClientWaitMs = 5_000;
 
+    /// <summary>
+    /// Unsolicited host→extension wake interval for Native Messaging (ms).
+    /// Inbound frames wake the MV3 service worker so poll-activation can run while idle.
+    /// Chosen to guarantee multiple poll opportunities inside DefaultClientWaitMs (5s)
+    /// without high traffic; must never carry session/URL/routing material.
+    /// </summary>
+    public const int NativeWakeIntervalMs = 1_000;
+
     /// <summary>Max length for opaque string fields (keys, ids, fingerprints).</summary>
     public const int MaxOpaqueFieldLength = 128;
 
@@ -120,6 +128,12 @@ public static class MessageTypes
     public const string ActivationStatus = "activation-status";
     public const string Ping = "ping";
     public const string Result = "result";
+
+    /// <summary>
+    /// Internal host→browser keep-alive only. Never accepted from callers, never forwarded
+    /// to the daemon, and must not carry session/URL/routing/token fields.
+    /// </summary>
+    public const string Wake = "wake";
 }
 
 public static class RouteResults

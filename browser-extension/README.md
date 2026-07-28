@@ -15,6 +15,7 @@ Shared Manifest V3 extension core for **exact** Pi Web notification activation.
   2. `ok` / `no-pending` → no-op
   3. `ready` → convert to activate command (`activationRequestId`, `notificationId`, `snapshotId`, owner/page/instance/routing/pageFingerprint/deadline)
   4. Focus window+tab, re-read URL → `activate-result` with **`activationRequestId`** so daemon `activation-status` reaches a final result
+- **Host wake frames** (MV3 idle fix): after caller-origin allowlist validation, the Native Messaging relay emits bounded unsolicited `{type:"wake", protocolVersion, seq}` frames (~1s). Only that exact schema/version with a positive integer sequence is actionable; polluted frames fail closed. A valid wake runs the existing single-flight `ActivationPoller.tick()` (no second activation path, timeout extension, or validation bypass). Lease maintenance is throttled and refreshes only owners whose current tab URL still proves the same route; normal wakes do not write logs or extension storage. Wake frames carry no session/URL/routing/token content and are never forwarded to the daemon.
 - Activate validation: match frozen `pageKey` + `routingKey` + origin, focus window+tab, re-read URL → `session-url-confirmed` or `stale`
 - **No** `webRequest`, `debugger`, required `<all_urls>`, or page-script injection
 - Logs never include raw session IDs or full URLs

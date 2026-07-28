@@ -11,4 +11,5 @@ export * from './owner-registry.mjs';
 export * from './activate.mjs';
 export * from './native-port.mjs';
 export * from './activation-poller.mjs';
+export * from './wake.mjs';
 export * from './config.mjs';

@@ -20,6 +20,13 @@ import { OwnerRegistry } from '../core/owner-registry.mjs';
 import { NativePortClient } from '../core/native-port.mjs';
 import { handleActivateCommand, parseActivateCommand } from '../core/activate.mjs';
 import { ActivationPoller } from '../core/activation-poller.mjs';
+import {
+  isWakeMessage,
+  dispatchWakeToPoller,
+  refreshLiveOwnerLeases,
+  shouldRunWakeMaintenance,
+  validateWakeMessage,
+} from '../core/wake.mjs';
 import { createSafeLogger } from '../core/safe-log.mjs';
 import {
   loadConfig,
@@ -56,6 +63,12 @@ let heartbeatTimer = null;
 let adapterKey = '';
 /** @type {string} */
 let profileKey = '';
+/** Last wake-driven lease maintenance timestamp (ms). */
+let lastWakeMaintenanceMs = 0;
+/** Last invalid-wake warning timestamp; malformed host traffic must not flood logs. */
+let lastInvalidWakeLogMs = Number.NEGATIVE_INFINITY;
+/** Shared lease refresh promise prevents interval/wake overlap. */
+let leaseRefreshPromise = null;
 
 const chromeApi = globalThis.chrome;
 
@@ -194,36 +207,90 @@ async function enumerateTabs() {
   });
 }
 
+/**
+ * Refresh adapter + owner leases. Shared by the interval heartbeat and wake-driven
+ * maintenance so MV3 idle does not let leases expire while the native host stays up.
+ * @param {{ source?: string }} [opts]
+ */
+async function refreshLeases(opts = {}) {
+  if (!registry || !native?.isConnected) return;
+  if (leaseRefreshPromise) return leaseRefreshPromise;
+
+  const activeRegistry = registry;
+  const source = opts.source || 'heartbeat';
+  leaseRefreshPromise = (async () => {
+    // Activation has priority; the next bounded wake/interval will retry maintenance.
+    if (activationPoller?.isInFlight) return;
+
+    await activeRegistry.heartbeat();
+    await refreshLiveOwnerLeases({
+      registry: activeRegistry,
+      tabsGet: (tabId) => browserFocusApi().tabsGet(tabId),
+      shouldContinue: () => registry === activeRegistry && Boolean(native?.isConnected),
+    });
+  })()
+    .catch((err) => {
+      log.warn('heartbeat-failed', {
+        reason: err?.message || 'error',
+        source,
+      });
+    })
+    .finally(() => {
+      leaseRefreshPromise = null;
+    });
+
+  return leaseRefreshPromise;
+}
+
 function startHeartbeat() {
   if (heartbeatTimer != null) {
     clearInterval(heartbeatTimer);
   }
-  heartbeatTimer = setInterval(async () => {
-    if (!registry || !native?.isConnected) return;
-    // Do not overlap with an in-flight poll/activate cycle (single-flight coordination).
-    if (activationPoller?.isInFlight) {
-      log.debug?.('heartbeat-skipped', { reason: 'poll-in-flight' });
-      return;
-    }
-    try {
-      await registry.heartbeat();
-      // Refresh owner leases by re-registering known tabs lightly.
-      for (const owner of registry.listOwners()) {
-        try {
-          const tab = await browserFocusApi().tabsGet(owner.tabId);
-          await registry.observeTab({
-            tabId: owner.tabId,
-            windowId: tab?.windowId ?? owner.windowId,
-            url: tab?.url,
-          });
-        } catch {
-          await registry.removeTab(owner.tabId);
-        }
-      }
-    } catch (err) {
-      log.warn('heartbeat-failed', { reason: err?.message || 'error' });
-    }
+  heartbeatTimer = setInterval(() => {
+    refreshLeases({ source: 'interval' }).catch(() => {});
   }, 15_000);
+}
+
+/**
+ * Handle a host wake frame: force one existing ActivationPoller tick through the
+ * single-flight gate. Does not create a second activation path or bypass validation.
+ * Optionally runs bounded lease maintenance so owner/adapter leases stay fresh while
+ * wakes keep the worker active.
+ * @param {unknown} raw
+ * @param {{ now?: () => number }} [opts]
+ * @returns {Promise<{ action: string, result?: string, reason?: string } | null>}
+ */
+export async function handleWakeMessage(raw, opts = {}) {
+  if (!isWakeMessage(raw)) return null;
+
+  const now = (opts.now ?? Date.now)();
+  const check = validateWakeMessage(raw);
+  if (!check.ok) {
+    if (now - lastInvalidWakeLogMs >= 60_000) {
+      lastInvalidWakeLogMs = now;
+      log.warn('wake-frame-invalid', { reason: check.reason });
+    }
+    return { action: 'skipped', reason: 'invalid-wake' };
+  }
+
+  const runMaintenance = shouldRunWakeMaintenance({
+    lastMaintenanceMs: lastWakeMaintenanceMs,
+    nowMs: now,
+  });
+  if (runMaintenance) lastWakeMaintenanceMs = now;
+
+  // Poll first so lease work cannot consume the bounded activation deadline. The poller
+  // remains the only activation path and enforces its existing single-flight gate.
+  try {
+    const out = await dispatchWakeToPoller(raw, ensureActivationPoller(), {
+      validate: false,
+    });
+    if (runMaintenance) await refreshLeases({ source: 'wake' });
+    return out;
+  } catch (err) {
+    log.warn('wake-poll-tick-error', { reason: err?.message || 'error' });
+    return { action: 'error', reason: err?.message || 'error' };
+  }
 }
 
 function ensureActivationPoller() {
@@ -301,6 +368,13 @@ function connectNative() {
 async function onNativeMessage(raw) {
   if (!raw || typeof raw !== 'object') return;
   const msg = /** @type {Record<string, unknown>} */ (raw);
+
+  // Unsolicited host wake: inbound Native Messaging traffic wakes this MV3 worker.
+  // Force one existing poller tick; do not treat wake as a route command.
+  if (isWakeMessage(msg)) {
+    await handleWakeMessage(msg);
+    return;
+  }
 
   if (msg.type === MessageTypes.Activate || msg.type === 'activate') {
     await onActivate(msg);
@@ -496,9 +570,20 @@ export const __test = {
   get activationPoller() {
     return activationPoller;
   },
+  get lastWakeMaintenanceMs() {
+    return lastWakeMaintenanceMs;
+  },
+  set lastWakeMaintenanceMs(v) {
+    lastWakeMaintenanceMs = v;
+  },
   rebuildRegistryFromConfig,
   enumerateTabs,
   onActivate,
+  onNativeMessage,
   ensureActivationPoller,
+  handleWakeMessage,
+  isWakeMessage,
+  refreshLeases,
   RouteResults,
+  MessageTypes,
 };

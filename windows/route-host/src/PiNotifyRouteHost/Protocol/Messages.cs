@@ -245,6 +245,35 @@ public sealed class RouteResponse
     }
 }
 
+/// <summary>
+/// Host→browser unsolicited wake frame. Versioned, no session/URL/routing/token/user content.
+/// Never accepted as an inbound route command and never forwarded to the daemon.
+/// </summary>
+public sealed class WakeMessage
+{
+    [JsonPropertyName("protocolVersion")]
+    public int ProtocolVersion { get; set; } = ProtocolConstants.ProtocolVersion;
+
+    [JsonPropertyName("type")]
+    public string Type { get; set; } = MessageTypes.Wake;
+
+    /// <summary>Monotonic wake sequence for diagnostics only (not a request id).</summary>
+    [JsonPropertyName("seq")]
+    public long Seq { get; set; }
+
+    public static WakeMessage Create(long seq) => new()
+    {
+        ProtocolVersion = ProtocolConstants.ProtocolVersion,
+        Type = MessageTypes.Wake,
+        Seq = seq,
+    };
+
+    public byte[] ToUtf8Bytes()
+    {
+        return JsonSerializer.SerializeToUtf8Bytes(this, JsonDefaults.Options);
+    }
+}
+
 /// <summary>Command delivered to a live adapter for activation (via poll-activation).</summary>
 public sealed class ActivateCommand
 {
