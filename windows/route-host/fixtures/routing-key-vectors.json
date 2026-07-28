@@ -1,0 +1,33 @@
+{
+  "algorithm": "SHA-256",
+  "domain": "pi-web-route-v1",
+  "format": "lowercase-hex",
+  "description": "routingKey = SHA-256(domain || 0x00 || instanceKey || 0x00 || rawSessionId)",
+  "vectors": [
+    {
+      "id": "basic-uuid-session",
+      "instanceKey": "11111111-2222-3333-4444-555555555555",
+      "rawSessionId": "session-alpha-example",
+      "routingKey": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "note": "placeholder-overwritten-by-test-compute; see test for authoritative digest"
+    },
+    {
+      "id": "empty-not-allowed",
+      "instanceKey": "",
+      "rawSessionId": "x",
+      "expectError": true
+    },
+    {
+      "id": "different-session-different-key",
+      "instanceKey": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+      "rawSessionId": "sess-one",
+      "routingKeyPeerSession": "sess-two"
+    },
+    {
+      "id": "different-instance-different-key",
+      "instanceKey": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+      "instanceKeyPeer": "ffffffff-0000-1111-2222-333333333333",
+      "rawSessionId": "same-session-id"
+    }
+  ]
+}

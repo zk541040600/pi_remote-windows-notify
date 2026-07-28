@@ -1,0 +1,12 @@
+{
+  "name": "pi-notify-browser-extension",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Shared Chrome/Edge MV3 extension for Pi Web exact notification routing.",
+  "scripts": {
+    "build": "node scripts/gen-icons.mjs && node scripts/build.mjs",
+    "test": "node --test test/*.test.mjs",
+    "gen-icons": "node scripts/gen-icons.mjs"
+  }
+}

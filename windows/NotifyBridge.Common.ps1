@@ -949,6 +949,14 @@ function Ensure-NotifyBridgeConfig {
         2
     }
 
+    $finalRouteHostExe = ''
+    if ($existing.ContainsKey('routeHostExe') -and -not [string]::IsNullOrWhiteSpace([string]$existing['routeHostExe'])) {
+        $finalRouteHostExe = [string]$existing['routeHostExe']
+    }
+    elseif ($existing.ContainsKey('RouteHostExe') -and -not [string]::IsNullOrWhiteSpace([string]$existing['RouteHostExe'])) {
+        $finalRouteHostExe = [string]$existing['RouteHostExe']
+    }
+
     $config = @{
         listenHost                = $finalHost
         port                      = $finalPort
@@ -983,6 +991,9 @@ function Ensure-NotifyBridgeConfig {
             $config[$key] = $existing[$key]
         }
     }
+    if (-not [string]::IsNullOrWhiteSpace($finalRouteHostExe)) {
+        $config['routeHostExe'] = $finalRouteHostExe
+    }
 
     $savedPath = Save-NotifyBridgeConfig -ConfigPath $resolvedPath -Config $config
 
@@ -1014,9 +1025,606 @@ function Ensure-NotifyBridgeConfig {
         QqSenderScript             = $config.qqSenderScript
         QqSendTimeoutSeconds       = $config.qqSendTimeoutSeconds
         QqMaxConcurrent            = $config.qqMaxConcurrent
+        RouteHostExe               = $finalRouteHostExe
         BrokerUrl                  = ('http://127.0.0.1:{0}' -f $config.brokerPort)
         BrokerHealthUrl            = ('http://127.0.0.1:{0}/health' -f $config.brokerPort)
         BrokerPopupUrl             = ('http://127.0.0.1:{0}/popup' -f $config.brokerPort)
         BrokerCloseUrl             = ('http://127.0.0.1:{0}/close' -f $config.brokerPort)
+    }
+}
+
+# --- Exact-route helpers (PiNotifyRouteHost client) ---------------------------------
+
+if (-not (Get-Variable -Name NotifyRouteHostClientMock -Scope Script -ErrorAction SilentlyContinue)) {
+    $script:NotifyRouteHostClientMock = $null
+}
+
+function Get-NotifyRouteFingerprint {
+    [CmdletBinding()]
+    param([string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return '' }
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $hash = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes([string]$Value))
+        return ([System.BitConverter]::ToString($hash).Replace('-', '').ToLowerInvariant().Substring(0, 16))
+    }
+    finally {
+        $sha.Dispose()
+    }
+}
+
+function Get-NotifyUnixTimeMilliseconds {
+    [CmdletBinding()]
+    param()
+
+    return [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+}
+
+function Get-NotifyRouteHostExe {
+    [CmdletBinding()]
+    param($Config = $null)
+
+    if (-not [string]::IsNullOrWhiteSpace($env:PI_NOTIFY_ROUTE_HOST_EXE)) {
+        return $env:PI_NOTIFY_ROUTE_HOST_EXE.Trim()
+    }
+    if ($null -ne $Config) {
+        if ($Config -is [hashtable]) {
+            if ($Config.ContainsKey('routeHostExe') -and -not [string]::IsNullOrWhiteSpace([string]$Config['routeHostExe'])) {
+                return [string]$Config['routeHostExe']
+            }
+            if ($Config.ContainsKey('RouteHostExe') -and -not [string]::IsNullOrWhiteSpace([string]$Config['RouteHostExe'])) {
+                return [string]$Config['RouteHostExe']
+            }
+        }
+        elseif ($Config.PSObject -and $Config.PSObject.Properties['RouteHostExe'] -and -not [string]::IsNullOrWhiteSpace([string]$Config.RouteHostExe)) {
+            return [string]$Config.RouteHostExe
+        }
+        elseif ($Config.PSObject -and $Config.PSObject.Properties['routeHostExe'] -and -not [string]::IsNullOrWhiteSpace([string]$Config.routeHostExe)) {
+            return [string]$Config.routeHostExe
+        }
+    }
+    $localApp = $env:LOCALAPPDATA
+    if ([string]::IsNullOrWhiteSpace($localApp)) {
+        $localApp = [System.IO.Path]::Combine((Get-NotifyBridgeDefaultBaseDir), '..')
+    }
+    return [System.IO.Path]::Combine($localApp, 'PiNotifyRouteHost', 'PiNotifyRouteHost.exe')
+}
+
+function Test-NotifyRouteUuid {
+    [CmdletBinding()]
+    param([string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
+    return ($Value -match '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')
+}
+
+function Test-NotifyRouteHexKey {
+    [CmdletBinding()]
+    param(
+        [string]$Value,
+        [int]$Length = 64
+    )
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
+    if ($Value.Length -ne $Length) { return $false }
+    return ($Value -match '^[0-9a-fA-F]+$')
+}
+
+function Get-NotifyPayloadStringField {
+    [CmdletBinding()]
+    param(
+        $Payload,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+    if ($null -eq $Payload) { return '' }
+    if (-not $Payload.PSObject.Properties[$Name]) { return '' }
+    $text = [string]$Payload.$Name
+    if ([string]::IsNullOrWhiteSpace($text)) { return '' }
+    return $text.Trim()
+}
+
+<#
+.SYNOPSIS
+  Validate optional exact-route fields from a notify payload.
+.OUTPUTS
+  PSCustomObject with:
+    HasAnyRouteField, IsValidPiWebExact, OriginKind, NotificationId, NotificationKind,
+    InstanceKey, RoutingKey, RouteVersion, InvalidReason
+#>
+function Resolve-NotifyExactRouteMetadata {
+    [CmdletBinding()]
+    param($Payload)
+
+    $routeVersionRaw = Get-NotifyPayloadStringField -Payload $Payload -Name 'routeVersion'
+    $notificationId = Get-NotifyPayloadStringField -Payload $Payload -Name 'notificationId'
+    $notificationKind = Get-NotifyPayloadStringField -Payload $Payload -Name 'notificationKind'
+    $originKind = Get-NotifyPayloadStringField -Payload $Payload -Name 'originKind'
+    $instanceKey = Get-NotifyPayloadStringField -Payload $Payload -Name 'instanceKey'
+    $routingKey = Get-NotifyPayloadStringField -Payload $Payload -Name 'routingKey'
+
+    # Also accept numeric routeVersion from JSON
+    if ([string]::IsNullOrWhiteSpace($routeVersionRaw) -and $null -ne $Payload -and $Payload.PSObject.Properties['routeVersion']) {
+        try { $routeVersionRaw = [string]$Payload.routeVersion } catch { $routeVersionRaw = '' }
+    }
+
+    $hasAny = -not (
+        [string]::IsNullOrWhiteSpace($routeVersionRaw) -and
+        [string]::IsNullOrWhiteSpace($notificationId) -and
+        [string]::IsNullOrWhiteSpace($notificationKind) -and
+        [string]::IsNullOrWhiteSpace($originKind) -and
+        [string]::IsNullOrWhiteSpace($instanceKey) -and
+        [string]::IsNullOrWhiteSpace($routingKey)
+    )
+
+    $result = [pscustomobject]@{
+        HasAnyRouteField   = $hasAny
+        IsValidPiWebExact  = $false
+        OriginKind         = $originKind
+        NotificationId     = $notificationId
+        NotificationKind   = $notificationKind
+        InstanceKey        = $instanceKey
+        RoutingKey         = $routingKey
+        RouteVersion       = $routeVersionRaw
+        InvalidReason      = ''
+    }
+
+    if (-not $hasAny) {
+        return $result
+    }
+
+    $routeVersion = 0
+    if (-not [int]::TryParse($routeVersionRaw, [ref]$routeVersion) -or $routeVersion -ne 1) {
+        $result.InvalidReason = 'route-version'
+        return $result
+    }
+    $result.RouteVersion = '1'
+
+    if (-not [string]::IsNullOrWhiteSpace($notificationKind) -and $notificationKind -notin @('ask-user', 'turn-complete')) {
+        $result.InvalidReason = 'notification-kind'
+        return $result
+    }
+
+    if ($originKind -eq 'terminal') {
+        # Terminal may carry notificationId for logging; not an exact web route.
+        if (-not [string]::IsNullOrWhiteSpace($notificationId) -and -not (Test-NotifyRouteUuid -Value $notificationId)) {
+            $result.InvalidReason = 'notification-id'
+        }
+        return $result
+    }
+
+    if ($originKind -ne 'pi-web') {
+        $result.InvalidReason = 'origin-kind'
+        return $result
+    }
+
+    if (-not (Test-NotifyRouteUuid -Value $notificationId)) {
+        $result.InvalidReason = 'notification-id'
+        return $result
+    }
+    if ($instanceKey.Length -lt 8 -or $instanceKey.Length -gt 128 -or $instanceKey -notmatch '^[A-Za-z0-9._+-]+$') {
+        $result.InvalidReason = 'instance-key'
+        return $result
+    }
+    if (-not (Test-NotifyRouteHexKey -Value $routingKey -Length 64)) {
+        $result.InvalidReason = 'routing-key'
+        return $result
+    }
+
+    $result.IsValidPiWebExact = $true
+    return $result
+}
+
+function New-NotifyRouteRequestEnvelope {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Type,
+        [hashtable]$Fields = @{},
+        [int]$TtlMs = 5000
+    )
+
+    $now = Get-NotifyUnixTimeMilliseconds
+    $ttl = [Math]::Max(1000, [Math]::Min(30000, $TtlMs))
+    $envelope = [ordered]@{
+        protocolVersion = 1
+        type            = $Type
+        requestId       = [Guid]::NewGuid().ToString('N')
+        issuedAtMs      = $now
+        expiresAtMs     = ($now + $ttl)
+    }
+    foreach ($key in $Fields.Keys) {
+        if ($null -eq $Fields[$key]) { continue }
+        $envelope[$key] = $Fields[$key]
+    }
+    return $envelope
+}
+
+<#
+.SYNOPSIS
+  Invoke PiNotifyRouteHost.exe --client with a JSON request.
+  Uses a temp file; never logs full keys. Returns structured result.
+#>
+function Invoke-NotifyRouteHostClient {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Request,
+
+        [int]$WaitMs = 0,
+        [int]$TimeoutMs = 8000,
+        $Config = $null,
+        [string]$ExePath = '',
+        [int]$RetryAttempt = 0
+    )
+
+    $typeName = if ($Request.ContainsKey('type')) { [string]$Request['type'] } else { '' }
+    $typeFp = Get-NotifyRouteFingerprint -Value $typeName
+
+    if ($script:NotifyRouteHostClientMock -is [scriptblock]) {
+        return & $script:NotifyRouteHostClientMock $Request $WaitMs
+    }
+
+    $exe = if (-not [string]::IsNullOrWhiteSpace($ExePath)) { $ExePath.Trim() } else { Get-NotifyRouteHostExe -Config $Config }
+    if ([string]::IsNullOrWhiteSpace($exe) -or -not (Test-Path -LiteralPath $exe)) {
+        return [pscustomobject]@{
+            Available           = $false
+            ExitCode            = -1
+            Result              = 'adapter-unavailable'
+            Reason              = 'route-host-missing'
+            SnapshotId          = ''
+            ActivationRequestId = ''
+            RawLength           = 0
+            TypeFingerprint     = $typeFp
+        }
+    }
+
+    $tempPath = $null
+    try {
+        $json = ($Request | ConvertTo-Json -Depth 6 -Compress)
+        if ([string]::IsNullOrWhiteSpace($json)) {
+            return [pscustomobject]@{
+                Available           = $false
+                ExitCode            = -1
+                Result              = 'rejected'
+                Reason              = 'empty-request'
+                SnapshotId          = ''
+                ActivationRequestId = ''
+                RawLength           = 0
+                TypeFingerprint     = $typeFp
+            }
+        }
+        $jsonBytes = [System.Text.Encoding]::UTF8.GetByteCount($json)
+        if ($jsonBytes -gt (32 * 1024)) {
+            return [pscustomobject]@{
+                Available           = $false
+                ExitCode            = -1
+                Result              = 'oversized'
+                Reason              = 'oversized'
+                SnapshotId          = ''
+                ActivationRequestId = ''
+                RawLength           = $jsonBytes
+                TypeFingerprint     = $typeFp
+            }
+        }
+
+        $tempPath = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), ('pi-notify-route-{0}.json' -f [Guid]::NewGuid().ToString('N')))
+        [System.IO.File]::WriteAllText($tempPath, $json, [System.Text.UTF8Encoding]::new($false))
+
+        $argList = @('--client', '--json', $tempPath)
+        if ($WaitMs -gt 0) {
+            $argList += @('--wait-ms', ([string][int]$WaitMs))
+        }
+
+        $psi = [System.Diagnostics.ProcessStartInfo]::new()
+        $psi.FileName = $exe
+        $psi.UseShellExecute = $false
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $psi.CreateNoWindow = $true
+        # ArgumentList is not on all PS versions; build Arguments carefully with quoting
+        $quoted = foreach ($a in $argList) {
+            if ($a -match '[\s"]') { '"' + ($a -replace '"', '\"') + '"' } else { $a }
+        }
+        $psi.Arguments = [string]::Join(' ', $quoted)
+
+        $proc = [System.Diagnostics.Process]::Start($psi)
+        # Prefer async reads before WaitForExit to avoid stdout/stderr pipe deadlocks on Windows PowerShell 5.1.
+        $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
+        $stderrTask = $proc.StandardError.ReadToEndAsync()
+        $exited = $proc.WaitForExit([Math]::Max(200, $TimeoutMs))
+        if (-not $exited) {
+            try { $proc.Kill() } catch {}
+            try { $proc.WaitForExit(2000) } catch {}
+            return [pscustomobject]@{
+                Available           = $true
+                ExitCode            = -1
+                Result              = 'timeout'
+                Reason              = 'client-timeout'
+                SnapshotId          = ''
+                ActivationRequestId = ''
+                RawLength           = 0
+                TypeFingerprint     = $typeFp
+            }
+        }
+        $stdout = ''
+        try {
+            if ($stdoutTask.IsCompleted) {
+                $stdout = [string]$stdoutTask.Result
+            }
+            else {
+                $stdout = [string]$stdoutTask.GetAwaiter().GetResult()
+            }
+        }
+        catch {
+            try { $stdout = $proc.StandardOutput.ReadToEnd() } catch { $stdout = '' }
+        }
+        $stderr = ''
+        try {
+            if ($stderrTask.IsCompleted) { $stderr = [string]$stderrTask.Result }
+            else { $stderr = [string]$stderrTask.GetAwaiter().GetResult() }
+        }
+        catch {
+            $stderr = ''
+        }
+
+        $result = 'rejected'
+        $reason = 'malformed-response'
+        $snapshotId = ''
+        $activationRequestId = ''
+        $rawLen = if ($null -eq $stdout) { 0 } else { $stdout.Length }
+
+        if (-not [string]::IsNullOrWhiteSpace($stdout)) {
+            $line = ($stdout -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Last 1)
+            try {
+                $parsed = $line | ConvertFrom-Json
+                if ($parsed.PSObject.Properties['result'] -and -not [string]::IsNullOrWhiteSpace([string]$parsed.result)) {
+                    $result = ([string]$parsed.result).Trim()
+                }
+                if ($parsed.PSObject.Properties['reason'] -and -not [string]::IsNullOrWhiteSpace([string]$parsed.reason)) {
+                    $reason = ([string]$parsed.reason).Trim()
+                }
+                elseif ($result -ne 'rejected') {
+                    $reason = ''
+                }
+                if ($parsed.PSObject.Properties['snapshotId'] -and -not [string]::IsNullOrWhiteSpace([string]$parsed.snapshotId)) {
+                    $snapshotId = ([string]$parsed.snapshotId).Trim()
+                }
+                if ($parsed.PSObject.Properties['activationRequestId'] -and -not [string]::IsNullOrWhiteSpace([string]$parsed.activationRequestId)) {
+                    $activationRequestId = ([string]$parsed.activationRequestId).Trim()
+                }
+            }
+            catch {
+                $result = 'rejected'
+                $reason = 'malformed-response'
+            }
+        }
+        else {
+            if ([int]$proc.ExitCode -ne 0 -and $RetryAttempt -lt 2) {
+                Start-Sleep -Milliseconds (50 * ($RetryAttempt + 1))
+                return Invoke-NotifyRouteHostClient `
+                    -Request $Request `
+                    -WaitMs $WaitMs `
+                    -TimeoutMs $TimeoutMs `
+                    -Config $Config `
+                    -ExePath $ExePath `
+                    -RetryAttempt ($RetryAttempt + 1)
+            }
+            $result = 'adapter-unavailable'
+            $failureKind = ''
+            if (-not [string]::IsNullOrWhiteSpace($stderr)) {
+                $failureMatch = [regex]::Match($stderr, '(?:^|\s)reason=([A-Za-z0-9_.-]+)')
+                if ($failureMatch.Success) {
+                    $failureKind = $failureMatch.Groups[1].Value
+                }
+            }
+            $reason = if ([string]::IsNullOrWhiteSpace($failureKind)) { 'empty-response' } else { 'client-' + $failureKind }
+        }
+
+        return [pscustomobject]@{
+            Available           = $true
+            ExitCode            = [int]$proc.ExitCode
+            Result              = $result
+            Reason              = $reason
+            SnapshotId          = $snapshotId
+            ActivationRequestId = $activationRequestId
+            RawLength           = $rawLen
+            TypeFingerprint     = $typeFp
+        }
+    }
+    catch {
+        return [pscustomobject]@{
+            Available           = $false
+            ExitCode            = -1
+            Result              = 'adapter-unavailable'
+            Reason              = 'client-error'
+            SnapshotId          = ''
+            ActivationRequestId = ''
+            RawLength           = 0
+            TypeFingerprint     = $typeFp
+        }
+    }
+    finally {
+        if (-not [string]::IsNullOrWhiteSpace($tempPath)) {
+            try { Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue } catch {}
+        }
+    }
+}
+
+function Get-NotifyRouteFreezeDecision {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        $ClientResult,
+        [string]$NotificationId = ''
+    )
+
+    # Pi Web exact routing never falls back across origins. Any non-ready result fails closed.
+    $resultName = if ($null -ne $ClientResult -and $ClientResult.PSObject.Properties['Result']) { [string]$ClientResult.Result } else { '' }
+    $snapshotId = if ($null -ne $ClientResult -and $ClientResult.PSObject.Properties['SnapshotId']) { [string]$ClientResult.SnapshotId } else { '' }
+    $available = if ($null -ne $ClientResult -and $ClientResult.PSObject.Properties['Available']) { [bool]$ClientResult.Available } else { $false }
+    $reason = if ($null -ne $ClientResult -and $ClientResult.PSObject.Properties['Reason']) { [string]$ClientResult.Reason } else { '' }
+
+    if (-not $available -or $resultName -in @('adapter-unavailable') -or $reason -in @('route-host-missing', 'client-error', 'empty-response')) {
+        return [pscustomobject]@{
+            Decision       = 'fail-closed'
+            OriginKind     = 'pi-web'
+            NotificationId = $NotificationId
+            SnapshotId     = ''
+            Result         = if ($resultName) { $resultName } else { 'adapter-unavailable' }
+            Reason         = if ($reason) { $reason } else { 'adapter-unavailable' }
+        }
+    }
+
+    if ($resultName -eq 'ready' -and -not [string]::IsNullOrWhiteSpace($snapshotId)) {
+        return [pscustomobject]@{
+            Decision       = 'exact-ready'
+            OriginKind     = 'pi-web'
+            NotificationId = $NotificationId
+            SnapshotId     = $snapshotId
+            Result         = 'ready'
+            Reason         = $reason
+        }
+    }
+
+    if ($resultName -in @('miss', 'adapter-unavailable', 'owner-unresolved')) {
+        return [pscustomobject]@{
+            Decision       = 'fail-closed'
+            OriginKind     = 'pi-web'
+            NotificationId = $NotificationId
+            SnapshotId     = ''
+            Result         = $resultName
+            Reason         = $reason
+        }
+    }
+
+    # ambiguous/stale/replay/expired/protocol-mismatch/timeout/select-failed/foreground-denied/malformed
+    return [pscustomobject]@{
+        Decision       = 'fail-closed'
+        OriginKind     = 'pi-web'
+        NotificationId = $NotificationId
+        SnapshotId     = ''
+        Result         = if ($resultName) { $resultName } else { 'rejected' }
+        Reason         = $reason
+    }
+}
+
+function Get-NotifyRouteActivateDecision {
+    [CmdletBinding()]
+    param(
+        [string]$OriginKind,
+        [string]$NotificationId,
+        [string]$SnapshotId,
+        $ClientResult = $null
+    )
+
+    $origin = if ([string]::IsNullOrWhiteSpace($OriginKind)) { '' } else { $OriginKind.Trim() }
+    if ($origin -ne 'pi-web') {
+        return [pscustomobject]@{
+            Decision = 'terminal'
+            Result   = ''
+            Reason   = ''
+        }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($NotificationId) -or [string]::IsNullOrWhiteSpace($SnapshotId)) {
+        return [pscustomobject]@{
+            Decision = 'fail-closed'
+            Result   = 'owner-unresolved'
+            Reason   = 'missing-snapshot'
+        }
+    }
+
+    if ($null -eq $ClientResult) {
+        return [pscustomobject]@{
+            Decision = 'fail-closed'
+            Result   = 'adapter-unavailable'
+            Reason   = 'no-client-result'
+        }
+    }
+
+    $resultName = if ($ClientResult.PSObject.Properties['Result']) { [string]$ClientResult.Result } else { '' }
+    $reason = if ($ClientResult.PSObject.Properties['Reason']) { [string]$ClientResult.Reason } else { '' }
+    $available = if ($ClientResult.PSObject.Properties['Available']) { [bool]$ClientResult.Available } else { $false }
+
+    if (-not $available -or $resultName -eq 'adapter-unavailable' -or $reason -in @('route-host-missing', 'client-error', 'empty-response')) {
+        return [pscustomobject]@{
+            Decision = 'fail-closed'
+            Result   = if ($resultName) { $resultName } else { 'adapter-unavailable' }
+            Reason   = if ($reason) { $reason } else { 'adapter-unavailable' }
+        }
+    }
+
+    if ($resultName -in @('session-url-confirmed', 'session-confirmed', 'already-active')) {
+        return [pscustomobject]@{
+            Decision = 'handled'
+            Result   = $resultName
+            Reason   = $reason
+        }
+    }
+
+    if ($resultName -in @('miss', 'adapter-unavailable', 'owner-unresolved')) {
+        return [pscustomobject]@{
+            Decision = 'fail-closed'
+            Result   = $resultName
+            Reason   = $reason
+        }
+    }
+
+    return [pscustomobject]@{
+        Decision = 'fail-closed'
+        Result   = if ($resultName) { $resultName } else { 'rejected' }
+        Reason   = if ($reason) { $reason } else { 'activate-failed' }
+    }
+}
+
+function Invoke-NotifyExactRouteFreeze {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$NotificationId,
+        [string]$NotificationKind = '',
+        [Parameter(Mandatory = $true)][string]$InstanceKey,
+        [Parameter(Mandatory = $true)][string]$RoutingKey,
+        $Config = $null,
+        [int]$TimeoutMs = 5000
+    )
+
+    $fields = @{
+        notificationId = $NotificationId
+        instanceKey    = $InstanceKey
+        routingKey     = $RoutingKey
+    }
+    if (-not [string]::IsNullOrWhiteSpace($NotificationKind)) {
+        $fields['notificationKind'] = $NotificationKind
+    }
+    $envelope = New-NotifyRouteRequestEnvelope -Type 'freeze' -Fields $fields -TtlMs 5000
+    $request = @{}
+    foreach ($k in $envelope.Keys) { $request[$k] = $envelope[$k] }
+
+    $clientResult = Invoke-NotifyRouteHostClient -Request $request -WaitMs 0 -TimeoutMs $TimeoutMs -Config $Config
+    return Get-NotifyRouteFreezeDecision -ClientResult $clientResult -NotificationId $NotificationId
+}
+
+function Invoke-NotifyExactRouteActivate {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$NotificationId,
+        [Parameter(Mandatory = $true)][string]$SnapshotId,
+        $Config = $null,
+        [int]$WaitMs = 5000,
+        [int]$TimeoutMs = 8000
+    )
+
+    $now = Get-NotifyUnixTimeMilliseconds
+    $fields = @{
+        notificationId = $NotificationId
+        snapshotId     = $SnapshotId
+        deadlineMs     = ($now + [Math]::Max(500, $WaitMs))
+    }
+    $envelope = New-NotifyRouteRequestEnvelope -Type 'activate' -Fields $fields -TtlMs ([Math]::Max(5000, $WaitMs + 1000))
+    $request = @{}
+    foreach ($k in $envelope.Keys) { $request[$k] = $envelope[$k] }
+
+    $clientResult = Invoke-NotifyRouteHostClient -Request $request -WaitMs $WaitMs -TimeoutMs $TimeoutMs -Config $Config
+    return [pscustomobject]@{
+        ClientResult = $clientResult
+        Decision     = (Get-NotifyRouteActivateDecision -OriginKind 'pi-web' -NotificationId $NotificationId -SnapshotId $SnapshotId -ClientResult $clientResult)
     }
 }

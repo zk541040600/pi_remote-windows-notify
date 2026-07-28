@@ -205,6 +205,29 @@ else {
     Write-NotifyListenerLog -Message 'qq-notify-start enabled=False'
 }
 
+function Start-NotifyRouteHostDaemon {
+    try {
+        $routeHostExe = Get-NotifyRouteHostExe -Config $config
+        if ([string]::IsNullOrWhiteSpace($routeHostExe) -or -not (Test-Path -LiteralPath $routeHostExe)) {
+            Write-NotifyListenerLog -Message 'route-host-start-skip missing-executable'
+            return
+        }
+
+        $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+        $startInfo.FileName = $routeHostExe
+        $startInfo.Arguments = '--daemon'
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $true
+        $routeProcess = [System.Diagnostics.Process]::Start($startInfo)
+        Write-NotifyListenerLog -Message ('route-host-start-request pid={0}' -f $routeProcess.Id)
+    }
+    catch {
+        Write-NotifyListenerLog -Message ('route-host-start-error reason={0}' -f $_.Exception.GetType().Name)
+    }
+}
+
+Start-NotifyRouteHostDaemon
+
 function Write-HttpResponse {
     param(
         [Parameter(Mandatory = $true)]
@@ -399,7 +422,10 @@ function Save-NotifyToastActivationState {
         [string]$ActivationId,
         [string]$FocusTarget,
         [string]$CwdBase,
-        [string]$TabTitle
+        [string]$TabTitle,
+        [string]$OriginKind = '',
+        [string]$NotificationId = '',
+        [string]$SnapshotId = ''
     )
 
     try {
@@ -410,6 +436,16 @@ function Save-NotifyToastActivationState {
             protectedCwd   = Protect-NotifyActivationValue -Value $CwdBase
             protectedTab   = Protect-NotifyActivationValue -Value $TabTitle
             expiresAtTicks = [DateTime]::UtcNow.AddMinutes(10).Ticks
+        }
+        # Exact-route handles only: never store raw session/instance/routing keys.
+        if (-not [string]::IsNullOrWhiteSpace($OriginKind)) {
+            $payload['originKind'] = $OriginKind
+        }
+        if (-not [string]::IsNullOrWhiteSpace($NotificationId)) {
+            $payload['protectedNotificationId'] = Protect-NotifyActivationValue -Value $NotificationId
+        }
+        if (-not [string]::IsNullOrWhiteSpace($SnapshotId)) {
+            $payload['protectedSnapshotId'] = Protect-NotifyActivationValue -Value $SnapshotId
         }
         $writtenPaths = @()
         foreach ($logDir in $logDirs) {
@@ -659,10 +695,13 @@ function Send-NotifyBrokerPopup {
         [Parameter(Mandatory = $true)][string]$TargetFingerprint,
         [int]$StackIndex,
         [int]$TimeoutSeconds,
-        [string]$PopupPlacement
+        [string]$PopupPlacement,
+        [string]$OriginKind = '',
+        [string]$NotificationId = '',
+        [string]$SnapshotId = ''
     )
 
-    $payload = @{
+    $payloadTable = @{
         title = $Title
         body = $Body
         focusTarget = $FocusTarget
@@ -673,7 +712,11 @@ function Send-NotifyBrokerPopup {
         stackIndex = $StackIndex
         timeoutSeconds = $TimeoutSeconds
         popupPlacement = $PopupPlacement
-    } | ConvertTo-Json -Depth 4 -Compress
+    }
+    if (-not [string]::IsNullOrWhiteSpace($OriginKind)) { $payloadTable['originKind'] = $OriginKind }
+    if (-not [string]::IsNullOrWhiteSpace($NotificationId)) { $payloadTable['notificationId'] = $NotificationId }
+    if (-not [string]::IsNullOrWhiteSpace($SnapshotId)) { $payloadTable['snapshotId'] = $SnapshotId }
+    $payload = $payloadTable | ConvertTo-Json -Depth 4 -Compress
     $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($payload)
 
     $timeoutMs = [Math]::Max(300, [int]$config.BrokerRequestTimeoutMs)
@@ -740,7 +783,10 @@ function Invoke-NotifyBrokerPopup {
         [Parameter(Mandatory = $true)][string]$TargetFingerprint,
         [int]$StackIndex,
         [int]$TimeoutSeconds,
-        [string]$PopupPlacement
+        [string]$PopupPlacement,
+        [string]$OriginKind = '',
+        [string]$NotificationId = '',
+        [string]$SnapshotId = ''
     )
 
     $brokerEnabled = $false
@@ -768,13 +814,13 @@ function Invoke-NotifyBrokerPopup {
         return $false
     }
 
-    $sent = Send-NotifyBrokerPopup -Title $Title -Body $Body -FocusTarget $FocusTarget -CwdBase $CwdBase -TabTitle $TabTitle -SessionName $SessionName -TargetFingerprint $TargetFingerprint -StackIndex $StackIndex -TimeoutSeconds $TimeoutSeconds -PopupPlacement $PopupPlacement
+    $sent = Send-NotifyBrokerPopup -Title $Title -Body $Body -FocusTarget $FocusTarget -CwdBase $CwdBase -TabTitle $TabTitle -SessionName $SessionName -TargetFingerprint $TargetFingerprint -StackIndex $StackIndex -TimeoutSeconds $TimeoutSeconds -PopupPlacement $PopupPlacement -OriginKind $OriginKind -NotificationId $NotificationId -SnapshotId $SnapshotId
     if (-not $sent) {
         Write-NotifyListenerLog -Message 'broker-post-failed fallback=popup-process'
         return $false
     }
 
-    Write-NotifyListenerLog -Message ('broker-popup-sent targetFingerprint={0} slot={1} timeout={2}' -f $TargetFingerprint, $StackIndex, $TimeoutSeconds)
+    Write-NotifyListenerLog -Message ('broker-popup-sent targetFingerprint={0} slot={1} timeout={2} originKind={3} notificationFp={4} snapshotFp={5}' -f $TargetFingerprint, $StackIndex, $TimeoutSeconds, $(if ([string]::IsNullOrWhiteSpace($OriginKind)) { 'none' } else { $OriginKind }), (Get-NotifyRouteFingerprint -Value $NotificationId), (Get-NotifyRouteFingerprint -Value $SnapshotId))
     return $true
 }
 
@@ -788,7 +834,10 @@ function Start-NotifyPopupProcess {
         [string]$SessionName,
         [Parameter(Mandatory = $true)][string]$TargetFingerprint,
         [int]$StackIndex,
-        [int]$TimeoutSeconds
+        [int]$TimeoutSeconds,
+        [string]$OriginKind = '',
+        [string]$NotificationId = '',
+        [string]$SnapshotId = ''
     )
 
     Clear-NotifyBridgePopupArtifacts -Aggressive
@@ -814,8 +863,17 @@ function Start-NotifyPopupProcess {
     $popupStartInfo.EnvironmentVariables['PI_NOTIFY_CWD_BASE'] = [string]$CwdBase
     $popupStartInfo.EnvironmentVariables['PI_NOTIFY_TAB_TITLE'] = [string]$TabTitle
     $popupStartInfo.EnvironmentVariables['PI_NOTIFY_SESSION_NAME'] = [string]$SessionName
+    if (-not [string]::IsNullOrWhiteSpace($OriginKind)) {
+        $popupStartInfo.EnvironmentVariables['PI_NOTIFY_ORIGIN_KIND'] = [string]$OriginKind
+    }
+    if (-not [string]::IsNullOrWhiteSpace($NotificationId)) {
+        $popupStartInfo.EnvironmentVariables['PI_NOTIFY_NOTIFICATION_ID'] = [string]$NotificationId
+    }
+    if (-not [string]::IsNullOrWhiteSpace($SnapshotId)) {
+        $popupStartInfo.EnvironmentVariables['PI_NOTIFY_SNAPSHOT_ID'] = [string]$SnapshotId
+    }
     $popupProcess = [System.Diagnostics.Process]::Start($popupStartInfo)
-    Write-NotifyListenerLog -Message ('popup-pid {0} slot={1} targetFingerprint="{2}"' -f $popupProcess.Id, $StackIndex, $TargetFingerprint)
+    Write-NotifyListenerLog -Message ('popup-pid {0} slot={1} targetFingerprint="{2}" originKind={3} notificationFp={4} snapshotFp={5}' -f $popupProcess.Id, $StackIndex, $TargetFingerprint, $(if ([string]::IsNullOrWhiteSpace($OriginKind)) { 'none' } else { $OriginKind }), (Get-NotifyRouteFingerprint -Value $NotificationId), (Get-NotifyRouteFingerprint -Value $SnapshotId))
 }
 
 function Show-Toast {
@@ -830,7 +888,10 @@ function Show-Toast {
         [string]$CwdBase,
         [string]$TabTitle,
         [string]$SessionName,
-        [string]$LaunchUri
+        [string]$LaunchUri,
+        [string]$OriginKind = '',
+        [string]$NotificationId = '',
+        [string]$SnapshotId = ''
     )
 
     if (-not [string]::IsNullOrWhiteSpace($TestDesktopSinkPath)) {
@@ -844,12 +905,15 @@ function Show-Toast {
     $cwdBase = if ([string]::IsNullOrWhiteSpace($CwdBase)) { '' } else { [string]$CwdBase }
     $tabTitle = if ([string]::IsNullOrWhiteSpace($TabTitle)) { '' } else { [string]$TabTitle }
     $sessionName = if ([string]::IsNullOrWhiteSpace($SessionName)) { '' } else { [string]$SessionName }
+    $originKind = if ([string]::IsNullOrWhiteSpace($OriginKind)) { '' } else { [string]$OriginKind }
+    $notificationId = if ([string]::IsNullOrWhiteSpace($NotificationId)) { '' } else { [string]$NotificationId }
+    $snapshotId = if ([string]::IsNullOrWhiteSpace($SnapshotId)) { '' } else { [string]$SnapshotId }
 
     if ($DisplayMode -eq 'popup-focus' -and (Test-Path -LiteralPath $script:NotifyPopupScript)) {
         $targetKey = Get-NotifyPopupTargetKey -TargetHost $focusTarget -CwdBase $cwdBase -TabTitle $tabTitle
         $targetFingerprint = Get-NotifyPopupTargetFingerprint -TargetKey $targetKey
 
-        $brokerSent = Invoke-NotifyBrokerPopup -Title $Title -Body $Body -FocusTarget $focusTarget -CwdBase $cwdBase -TabTitle $tabTitle -SessionName $sessionName -TargetFingerprint $targetFingerprint -StackIndex -1 -TimeoutSeconds $PopupTimeoutSeconds -PopupPlacement ([string]$config.PopupPlacement)
+        $brokerSent = Invoke-NotifyBrokerPopup -Title $Title -Body $Body -FocusTarget $focusTarget -CwdBase $cwdBase -TabTitle $tabTitle -SessionName $sessionName -TargetFingerprint $targetFingerprint -StackIndex -1 -TimeoutSeconds $PopupTimeoutSeconds -PopupPlacement ([string]$config.PopupPlacement) -OriginKind $originKind -NotificationId $notificationId -SnapshotId $snapshotId
         if ($brokerSent) {
             return
         }
@@ -857,8 +921,8 @@ function Show-Toast {
         $stackIndex = Get-NotifyPopupStackPlan -TargetKey $targetKey
         Clear-NotifyBridgePopupArtifacts -Aggressive
 
-        Write-NotifyListenerLog -Message ('popup-launch targetFingerprint={0} slot={1} timeout={2} source=fallback' -f $targetFingerprint, $stackIndex, $PopupTimeoutSeconds)
-        Start-NotifyPopupProcess -Title $Title -Body $Body -FocusTarget $focusTarget -CwdBase $cwdBase -TabTitle $tabTitle -SessionName $sessionName -TargetFingerprint $targetFingerprint -StackIndex $stackIndex -TimeoutSeconds $PopupTimeoutSeconds
+        Write-NotifyListenerLog -Message ('popup-launch targetFingerprint={0} slot={1} timeout={2} source=fallback originKind={3}' -f $targetFingerprint, $stackIndex, $PopupTimeoutSeconds, $(if ([string]::IsNullOrWhiteSpace($originKind)) { 'none' } else { $originKind }))
+        Start-NotifyPopupProcess -Title $Title -Body $Body -FocusTarget $focusTarget -CwdBase $cwdBase -TabTitle $tabTitle -SessionName $sessionName -TargetFingerprint $targetFingerprint -StackIndex $stackIndex -TimeoutSeconds $PopupTimeoutSeconds -OriginKind $originKind -NotificationId $notificationId -SnapshotId $snapshotId
         return
     }
 
@@ -872,12 +936,12 @@ function Show-Toast {
     $texts.Item(1).AppendChild($xml.CreateTextNode($Body)) | Out-Null
 
     $activationId = [Guid]::NewGuid().ToString('N')
-    $activationPaths = @(Save-NotifyToastActivationState -ActivationId $activationId -FocusTarget $focusTarget -CwdBase $cwdBase -TabTitle $tabTitle)
+    $activationPaths = @(Save-NotifyToastActivationState -ActivationId $activationId -FocusTarget $focusTarget -CwdBase $cwdBase -TabTitle $tabTitle -OriginKind $originKind -NotificationId $notificationId -SnapshotId $snapshotId)
     $safeLaunchUri = Get-NotifyBridgeActivationUri -ActivationId $activationId
     $xml.DocumentElement.SetAttribute('launch', $safeLaunchUri)
     $xml.DocumentElement.SetAttribute('activationType', 'protocol')
 
-    Write-NotifyListenerLog -Message ('system-toast activationId={0} hasCwd={1} hasTab={2}' -f $activationId, (-not [string]::IsNullOrWhiteSpace($cwdBase)), (-not [string]::IsNullOrWhiteSpace($tabTitle)))
+    Write-NotifyListenerLog -Message ('system-toast activationId={0} hasCwd={1} hasTab={2} originKind={3} notificationFp={4} snapshotFp={5}' -f $activationId, (-not [string]::IsNullOrWhiteSpace($cwdBase)), (-not [string]::IsNullOrWhiteSpace($tabTitle)), $(if ([string]::IsNullOrWhiteSpace($originKind)) { 'none' } else { $originKind }), (Get-NotifyRouteFingerprint -Value $notificationId), (Get-NotifyRouteFingerprint -Value $snapshotId))
     $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
     $toast.ExpirationTime = [DateTimeOffset]::Now.AddMinutes(5)
     # Windows PowerShell 5.1 cannot reliably subscribe to WinRT toast events.
@@ -978,7 +1042,46 @@ try {
             }
             if ($cwdBase.Trim() -match '^\{[^}]+\}$') { $cwdBase = '' }
             if ($tabTitle.Trim() -match '^\{[^}]+\}$') { $tabTitle = '' }
-            if ($DisplayMode -eq 'popup-focus' -and [string]::IsNullOrWhiteSpace($cwdBase) -and [string]::IsNullOrWhiteSpace($tabTitle)) {
+
+            # Optional exact-route metadata (additive). Valid pi-web freezes immediately; only
+            # notificationId + snapshotId + originKind are retained for click paths.
+            $routeMeta = Resolve-NotifyExactRouteMetadata -Payload $payload
+            $routeOriginKind = ''
+            $routeNotificationId = ''
+            $routeSnapshotId = ''
+            $suppressTerminalFallback = $false
+            if ($routeMeta.HasAnyRouteField) {
+                if ($routeMeta.IsValidPiWebExact) {
+                    Write-NotifyListenerLog -Message ('notify-received originKind=pi-web notificationFp={0} instanceFp={1} routingFp={2} kind={3}' -f (Get-NotifyRouteFingerprint -Value $routeMeta.NotificationId), (Get-NotifyRouteFingerprint -Value $routeMeta.InstanceKey), (Get-NotifyRouteFingerprint -Value $routeMeta.RoutingKey), $(if ([string]::IsNullOrWhiteSpace($routeMeta.NotificationKind)) { 'none' } else { $routeMeta.NotificationKind }))
+                    $freezeDecision = Invoke-NotifyExactRouteFreeze -NotificationId $routeMeta.NotificationId -NotificationKind $routeMeta.NotificationKind -InstanceKey $routeMeta.InstanceKey -RoutingKey $routeMeta.RoutingKey -Config $config
+                    Write-NotifyListenerLog -Message ('route-freeze decision={0} result={1} reason={2} notificationFp={3} snapshotFp={4}' -f $freezeDecision.Decision, $freezeDecision.Result, $(if ([string]::IsNullOrWhiteSpace($freezeDecision.Reason)) { 'none' } else { $freezeDecision.Reason }), (Get-NotifyRouteFingerprint -Value $routeMeta.NotificationId), (Get-NotifyRouteFingerprint -Value $freezeDecision.SnapshotId))
+                    if ($freezeDecision.Decision -eq 'exact-ready') {
+                        $routeOriginKind = 'pi-web'
+                        $routeNotificationId = $routeMeta.NotificationId
+                        $routeSnapshotId = $freezeDecision.SnapshotId
+                    }
+                    else {
+                        # Preserve the declared origin so every Pi Web route failure is a click no-op.
+                        $routeOriginKind = 'pi-web'
+                        $routeNotificationId = $routeMeta.NotificationId
+                        $routeSnapshotId = ''
+                        $suppressTerminalFallback = $true
+                        Write-NotifyListenerLog -Message ('route-freeze-fail-closed result={0} reason={1} notificationFp={2}' -f $freezeDecision.Result, $(if ([string]::IsNullOrWhiteSpace($freezeDecision.Reason)) { 'none' } else { $freezeDecision.Reason }), (Get-NotifyRouteFingerprint -Value $routeMeta.NotificationId))
+                    }
+                }
+                elseif (-not [string]::IsNullOrWhiteSpace($routeMeta.InvalidReason)) {
+                    Write-NotifyListenerLog -Message ('route-metadata-invalid reason={0}' -f $routeMeta.InvalidReason)
+                    if ($routeMeta.OriginKind -ne 'terminal') {
+                        # Unknown or malformed Web route metadata must not be reinterpreted as Terminal.
+                        $routeOriginKind = 'pi-web'
+                        $routeNotificationId = ''
+                        $routeSnapshotId = ''
+                        $suppressTerminalFallback = $true
+                    }
+                }
+            }
+
+            if ($DisplayMode -eq 'popup-focus' -and [string]::IsNullOrWhiteSpace($cwdBase) -and [string]::IsNullOrWhiteSpace($tabTitle) -and [string]::IsNullOrWhiteSpace($routeSnapshotId) -and -not $suppressTerminalFallback) {
                 Write-NotifyListenerLog -Message ('notify-drop missing-target-metadata targetFingerprint="{0}"' -f (Get-NotifyPopupTargetFingerprint -TargetKey $focusTarget))
                 Write-HttpResponse -Stream $stream -StatusCode 200 -Reason 'OK' -Body 'no-target'
                 continue
@@ -990,8 +1093,8 @@ try {
 
             $launchUri = Get-NotifyBridgeActivationUri -ActivationId ([Guid]::NewGuid().ToString('N'))
 
-            Write-NotifyListenerLog -Message ('notify targetFingerprint="{0}" hasCwd={1} hasTab={2}' -f (Get-NotifyPopupTargetFingerprint -TargetKey $focusTarget), (-not [string]::IsNullOrWhiteSpace($cwdBase)), (-not [string]::IsNullOrWhiteSpace($tabTitle)))
-            Show-Toast -Title $title -Body $body -ToastAppId $AppId -FocusTarget $focusTarget -CwdBase $cwdBase -TabTitle $tabTitle -SessionName $sessionName -LaunchUri $launchUri
+            Write-NotifyListenerLog -Message ('notify targetFingerprint="{0}" hasCwd={1} hasTab={2} originKind={3} notificationFp={4} snapshotFp={5}' -f (Get-NotifyPopupTargetFingerprint -TargetKey $focusTarget), (-not [string]::IsNullOrWhiteSpace($cwdBase)), (-not [string]::IsNullOrWhiteSpace($tabTitle)), $(if ([string]::IsNullOrWhiteSpace($routeOriginKind)) { 'none' } else { $routeOriginKind }), (Get-NotifyRouteFingerprint -Value $routeNotificationId), (Get-NotifyRouteFingerprint -Value $routeSnapshotId))
+            Show-Toast -Title $title -Body $body -ToastAppId $AppId -FocusTarget $focusTarget -CwdBase $cwdBase -TabTitle $tabTitle -SessionName $sessionName -LaunchUri $launchUri -OriginKind $routeOriginKind -NotificationId $routeNotificationId -SnapshotId $routeSnapshotId
             $notified = $true
             try {
                 Start-NotifyQqDispatch -Title $title -Body $body

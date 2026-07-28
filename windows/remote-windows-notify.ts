@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { hostname, homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
@@ -14,6 +14,10 @@ type NotifyConfigFile = {
   bodyTemplate?: string;
   messageMode?: "dynamic" | "static";
   remoteHostAlias?: string;
+  /** Explicit origin override. Only "pi-web" enables Web exact routing for RPC. */
+  originKind?: string;
+  /** Pi Web instance UUID (opaque). Required with originKind=pi-web for Web exact fields. */
+  instanceKey?: string;
 };
 
 type RuntimeConfig = {
@@ -25,6 +29,10 @@ type RuntimeConfig = {
   bodyTemplate: string;
   messageMode: "dynamic" | "static";
   remoteHostAlias: string;
+  /** True only when config/env explicitly set originKind=pi-web. */
+  piWebOriginConfigured: boolean;
+  /** Validated opaque instance key, or empty when absent/invalid. */
+  instanceKey: string;
 };
 
 type AgentMessageLike = {
@@ -40,7 +48,33 @@ type ContextSnapshot = {
   explicitSessionName?: string;
   displaySessionName?: string;
   sessionKey?: string;
+  /**
+   * Process-local only: used to compute routingKey at notify time.
+   * Never include in notification payload, logs, or toast state.
+   */
+  rawSessionId?: string;
 };
+
+type NotificationKind = "ask-user" | "turn-complete";
+type OriginKind = "terminal" | "pi-web";
+
+type NotifyRouteFields = {
+  routeVersion: 1;
+  notificationId: string;
+  notificationKind: NotificationKind;
+  originKind: OriginKind;
+  instanceKey?: string;
+  routingKey?: string;
+};
+
+type NotifyPayload = {
+  title: string;
+  body: string;
+  focusTarget?: string;
+  cwdBase?: string;
+  tabTitle?: string;
+  sessionName?: string;
+} & NotifyRouteFields;
 
 const DEFAULT_ENDPOINT = "http://127.0.0.1:23118/notify";
 const DEFAULT_TIMEOUT_MS = 4000;
@@ -49,6 +83,11 @@ const ASK_USER_PROMPT_EVENT = "rpiv:ask-user:prompt";
 const PI_TERMINAL_TITLE = "π";
 const MAX_CANONICAL_TITLE_BYTES = 144;
 const SESSION_KEY_LENGTH = 12;
+const ROUTE_VERSION = 1 as const;
+const ROUTING_KEY_DOMAIN = "pi-web-route-v1";
+const INSTANCE_KEY_MIN_LENGTH = 8;
+const INSTANCE_KEY_MAX_LENGTH = 128;
+const INSTANCE_KEY_PATTERN = /^[A-Za-z0-9._+-]+$/;
 const OSC_SEQUENCE_PATTERN = /(?:\u001b\]|\u009d)[\s\S]*?(?:\u0007|\u001b\\|\u009c|$)/gu;
 const TERMINAL_STRING_PATTERN = /(?:\u001b[P^_X]|\u0090|\u0098|\u009e|\u009f)[\s\S]*?(?:\u001b\\|\u009c|$)/gu;
 const CSI_SEQUENCE_PATTERN = /(?:\u001b\[|\u009b)[0-?]*[ -/]*[@-~]/gu;
@@ -95,16 +134,62 @@ function truncateUtf8(value: string, maxBytes: number): string {
   return `${prefix.trimEnd()}${ellipsis}`;
 }
 
-function readSessionKey(ctx: unknown): string | undefined {
+/**
+ * routingKey = SHA-256("pi-web-route-v1\0" + instanceKey + "\0" + rawSessionId) as full lowercase hex.
+ * Does not accept empty inputs; callers must fail-closed before invoking.
+ */
+export function computePiWebRoutingKey(instanceKey: string, rawSessionId: string): string {
+  if (typeof instanceKey !== "string" || !instanceKey.trim()) {
+    throw new Error("instanceKey is required");
+  }
+  if (typeof rawSessionId !== "string" || !rawSessionId.trim()) {
+    throw new Error("rawSessionId is required");
+  }
+  return createHash("sha256")
+    .update(ROUTING_KEY_DOMAIN)
+    .update("\0")
+    .update(instanceKey)
+    .update("\0")
+    .update(rawSessionId)
+    .digest("hex");
+}
+
+function normalizeInstanceKey(value: unknown): string {
+  const key = configString(value);
+  if (
+    key.length < INSTANCE_KEY_MIN_LENGTH ||
+    key.length > INSTANCE_KEY_MAX_LENGTH ||
+    !INSTANCE_KEY_PATTERN.test(key)
+  ) {
+    return "";
+  }
+  return key;
+}
+
+function isExplicitPiWebOriginKind(value: unknown): boolean {
+  return configString(value).toLowerCase() === "pi-web";
+}
+
+function isPiWebHostProcess(): boolean {
+  // agegr Pi Web exports this marker when launched with its supported --no-open mode.
+  // File-level pi-web routing remains scoped to that host; unrelated RPC processes stay terminal.
+  return isTruthy(process.env.PI_WEB_NO_OPEN);
+}
+
+function readSessionIdentity(ctx: unknown): { rawSessionId?: string; sessionKey?: string } {
   try {
     const manager = (ctx as { sessionManager?: { getSessionId?: () => unknown } })?.sessionManager;
     const sessionId = manager?.getSessionId?.();
     if (typeof sessionId !== "string" || !sessionId.trim()) {
-      return undefined;
+      return {};
     }
-    return createHash("sha256").update(sessionId).digest("hex").slice(0, SESSION_KEY_LENGTH);
+    const rawSessionId = sessionId;
+    return {
+      rawSessionId,
+      sessionKey: createHash("sha256").update(rawSessionId).digest("hex").slice(0, SESSION_KEY_LENGTH),
+    };
   } catch {
-    return undefined;
+    return {};
   }
 }
 
@@ -185,7 +270,15 @@ function readContextSnapshot(ctx: unknown, messages: AgentMessageLike[] = []): C
 
   const displaySessionName =
     explicitSessionName || normalizeText(findTextForRole(messages, "user", false), "", 96) || undefined;
-  return { cwd, mode, explicitSessionName, displaySessionName, sessionKey: readSessionKey(ctx) };
+  const identity = readSessionIdentity(ctx);
+  return {
+    cwd,
+    mode,
+    explicitSessionName,
+    displaySessionName,
+    sessionKey: identity.sessionKey,
+    rawSessionId: identity.rawSessionId,
+  };
 }
 
 function collectToolInfo(messages: AgentMessageLike[]): {
@@ -236,11 +329,12 @@ function buildDynamicNotification(
   messages: AgentMessageLike[],
   config: RuntimeConfig,
   cwd: string,
+  explicitSessionName?: string,
 ): { title: string; body: string } {
   const userPrompt = normalizeText(findTextForRole(messages, "user", true), "", 72);
   const assistantText = normalizeText(findTextForRole(messages, "assistant", true), "", 120);
   const { toolNames, hasToolError, hasTrailingToolError } = collectToolInfo(messages);
-  const title = normalizeText(userPrompt || assistantText || config.title, "Pi", 72);
+  const title = normalizeText(explicitSessionName || userPrompt || assistantText || config.title, "Pi", 72);
   const hasUnresolvedError = hasTrailingToolError || (hasToolError && assistantTextSignalsProblem(assistantText));
   const status = hasUnresolvedError ? "有报错，等你看" : toolNames.length > 0 ? "已完成，等你确认" : "已回复，等你输入";
   const bodyParts = [status];
@@ -278,6 +372,8 @@ function isConfigShapeValid(file: NotifyConfigFile): boolean {
   if (file.bodyTemplate !== undefined && typeof file.bodyTemplate !== "string") return false;
   if (file.messageMode !== undefined && file.messageMode !== "dynamic" && file.messageMode !== "static") return false;
   if (file.remoteHostAlias !== undefined && typeof file.remoteHostAlias !== "string") return false;
+  if (file.originKind !== undefined && typeof file.originKind !== "string") return false;
+  if (file.instanceKey !== undefined && typeof file.instanceKey !== "string") return false;
   return true;
 }
 
@@ -368,6 +464,11 @@ export async function getRuntimeConfig(): Promise<RuntimeConfig> {
     ? Math.max(1000, Math.min(timeoutRaw, 15000))
     : DEFAULT_TIMEOUT_MS;
 
+  const environmentOriginKind = configString(process.env.PI_NOTIFY_ORIGIN_KIND);
+  const fileOriginKind = configString(file.originKind);
+  const instanceKey =
+    normalizeInstanceKey(process.env.PI_NOTIFY_INSTANCE_KEY) || normalizeInstanceKey(file.instanceKey);
+
   return {
     enabled: file.enabled !== false && !isTruthy(process.env.PI_NOTIFY_DISABLED) && endpointPolicy.allowed,
     endpoint,
@@ -381,7 +482,51 @@ export async function getRuntimeConfig(): Promise<RuntimeConfig> {
     ),
     messageMode: endpointPolicy.messageMode,
     remoteHostAlias: normalizeText(process.env.PI_NOTIFY_REMOTE_ALIAS || file.remoteHostAlias, "", 64),
+    piWebOriginConfigured:
+      isExplicitPiWebOriginKind(environmentOriginKind) ||
+      (isExplicitPiWebOriginKind(fileOriginKind) && isPiWebHostProcess()),
+    instanceKey,
   };
+}
+
+/**
+ * Build additive route metadata for a notification.
+ * TUI is always terminal. Pi-web exact fields require explicit config + valid instanceKey + raw session.
+ * Missing/invalid Web metadata fails closed: originKind stays terminal and Web fields are omitted.
+ */
+export function buildNotifyRouteFields(
+  mode: string | undefined,
+  config: Pick<RuntimeConfig, "piWebOriginConfigured" | "instanceKey">,
+  rawSessionId: string | undefined,
+  notificationKind: NotificationKind,
+): NotifyRouteFields {
+  const base: NotifyRouteFields = {
+    routeVersion: ROUTE_VERSION,
+    notificationId: randomUUID(),
+    notificationKind,
+    originKind: "terminal",
+  };
+
+  // TUI is always terminal — never treat it as Pi Web even if Web config is present.
+  if (mode === "tui") {
+    return base;
+  }
+
+  if (!config.piWebOriginConfigured || !config.instanceKey || !rawSessionId?.trim()) {
+    return base;
+  }
+
+  try {
+    const routingKey = computePiWebRoutingKey(config.instanceKey, rawSessionId);
+    return {
+      ...base,
+      originKind: "pi-web",
+      instanceKey: config.instanceKey,
+      routingKey,
+    };
+  } catch {
+    return base;
+  }
 }
 
 function shouldSkipNotificationForThisProcess(): boolean {
@@ -446,7 +591,7 @@ function setTerminalTitle(title: string, mode?: string): void {
 async function notify(
   endpoint: string,
   token: string,
-  payload: { title: string; body: string; focusTarget?: string; cwdBase?: string; tabTitle?: string; sessionName?: string },
+  payload: NotifyPayload,
   timeoutMs: number,
   lifecycleSignal: AbortSignal,
 ): Promise<void> {
@@ -514,6 +659,7 @@ export default function remoteWindowsNotify(pi: ExtensionAPI): void {
     const body = config.messageMode === "dynamic"
       ? normalizeText(promptSummary ? `等待回答：${promptSummary}` : "Pi 正在等待你的回答", "Pi 正在等待你的回答", 220)
       : normalizeText(`Pi 正在等待你的回答 · ${renderBody(config.bodyTemplate, snapshot.cwd)}`, "Pi 正在等待你的回答", 220);
+    const route = buildNotifyRouteFields(snapshot.mode, config, snapshot.rawSessionId, "ask-user");
     await notify(
       config.endpoint,
       config.token,
@@ -524,6 +670,7 @@ export default function remoteWindowsNotify(pi: ExtensionAPI): void {
         cwdBase: target.cwdBase,
         tabTitle: target.tabTitle,
         sessionName: snapshot.displaySessionName,
+        ...route,
       },
       config.timeoutMs,
       lifecycleController.signal,
@@ -550,6 +697,7 @@ export default function remoteWindowsNotify(pi: ExtensionAPI): void {
       explicitSessionName,
       displaySessionName: explicitSessionName,
       sessionKey: snapshot.sessionKey ?? currentSnapshot?.sessionKey,
+      rawSessionId: snapshot.rawSessionId ?? currentSnapshot?.rawSessionId,
     };
     setTerminalTitle(
       getNotifyTarget(currentSnapshot.cwd, currentSnapshot.explicitSessionName, currentSnapshot.sessionKey).tabTitle,
@@ -581,6 +729,7 @@ export default function remoteWindowsNotify(pi: ExtensionAPI): void {
       explicitSessionName: liveSnapshot.explicitSessionName ?? currentSnapshot?.explicitSessionName,
       displaySessionName: liveSnapshot.displaySessionName ?? currentSnapshot?.displaySessionName,
       sessionKey: liveSnapshot.sessionKey ?? currentSnapshot?.sessionKey,
+      rawSessionId: liveSnapshot.rawSessionId ?? currentSnapshot?.rawSessionId,
     };
     const explicitSessionName = snapshot.explicitSessionName;
     const sessionName = snapshot.displaySessionName;
@@ -588,7 +737,8 @@ export default function remoteWindowsNotify(pi: ExtensionAPI): void {
     const target = getNotifyTarget(snapshot.cwd, explicitSessionName, sessionKey);
     const payload = config.messageMode === "static"
       ? { title: config.title, body: renderBody(config.bodyTemplate, snapshot.cwd) }
-      : buildDynamicNotification(messages, config, snapshot.cwd);
+      : buildDynamicNotification(messages, config, snapshot.cwd, explicitSessionName);
+    const route = buildNotifyRouteFields(snapshot.mode, config, snapshot.rawSessionId, "turn-complete");
 
     currentSnapshot = snapshot;
     setTerminalTitle(target.tabTitle, snapshot.mode);
@@ -601,6 +751,7 @@ export default function remoteWindowsNotify(pi: ExtensionAPI): void {
         cwdBase: target.cwdBase,
         tabTitle: target.tabTitle,
         sessionName,
+        ...route,
       },
       config.timeoutMs,
       lifecycleController.signal,

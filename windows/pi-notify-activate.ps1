@@ -137,10 +137,16 @@ function Resolve-NotifyActivationState {
         $expiresAtTicks = [int64]0
         if ($payload.PSObject.Properties['expiresAtTicks']) { [int64]::TryParse([string]$payload.expiresAtTicks, [ref]$expiresAtTicks) | Out-Null }
         if ($expiresAtTicks -le [DateTime]::UtcNow.Ticks) { return $null }
+        $originKind = if ($payload.PSObject.Properties['originKind'] -and -not [string]::IsNullOrWhiteSpace([string]$payload.originKind)) { ([string]$payload.originKind).Trim() } else { '' }
+        $notificationId = if ($payload.PSObject.Properties['protectedNotificationId'] -and -not [string]::IsNullOrWhiteSpace([string]$payload.protectedNotificationId)) { Unprotect-NotifyActivationValue -Value ([string]$payload.protectedNotificationId) } else { '' }
+        $snapshotId = if ($payload.PSObject.Properties['protectedSnapshotId'] -and -not [string]::IsNullOrWhiteSpace([string]$payload.protectedSnapshotId)) { Unprotect-NotifyActivationValue -Value ([string]$payload.protectedSnapshotId) } else { '' }
         return [pscustomobject]@{
-            FocusTarget = if ($payload.PSObject.Properties['protectedHost']) { Unprotect-NotifyActivationValue -Value ([string]$payload.protectedHost) } else { '' }
-            CwdBase     = if ($payload.PSObject.Properties['protectedCwd']) { Unprotect-NotifyActivationValue -Value ([string]$payload.protectedCwd) } else { '' }
-            TabTitle    = if ($payload.PSObject.Properties['protectedTab']) { Unprotect-NotifyActivationValue -Value ([string]$payload.protectedTab) } else { '' }
+            FocusTarget    = if ($payload.PSObject.Properties['protectedHost']) { Unprotect-NotifyActivationValue -Value ([string]$payload.protectedHost) } else { '' }
+            CwdBase        = if ($payload.PSObject.Properties['protectedCwd']) { Unprotect-NotifyActivationValue -Value ([string]$payload.protectedCwd) } else { '' }
+            TabTitle       = if ($payload.PSObject.Properties['protectedTab']) { Unprotect-NotifyActivationValue -Value ([string]$payload.protectedTab) } else { '' }
+            OriginKind     = $originKind
+            NotificationId = $notificationId
+            SnapshotId     = $snapshotId
         }
     }
     catch {
@@ -371,6 +377,9 @@ Write-NotifyActivateLog -Message ('activate-start hasUri={0}' -f (-not [string]:
 $targetHost = $config.RemoteHostAlias
 $cwdBase = ''
 $tabTitle = ''
+$originKind = ''
+$notificationId = ''
+$snapshotId = ''
 if (-not [string]::IsNullOrWhiteSpace($Uri)) {
     try {
         $parsedUri = [Uri]$Uri
@@ -380,6 +389,9 @@ if (-not [string]::IsNullOrWhiteSpace($Uri)) {
             if (-not [string]::IsNullOrWhiteSpace($state.FocusTarget)) { $targetHost = ([string]$state.FocusTarget).Trim() }
             if (-not [string]::IsNullOrWhiteSpace($state.CwdBase)) { $cwdBase = ([string]$state.CwdBase).Trim() }
             if (-not [string]::IsNullOrWhiteSpace($state.TabTitle)) { $tabTitle = ([string]$state.TabTitle).Trim() }
+            if ($state.PSObject.Properties['OriginKind'] -and -not [string]::IsNullOrWhiteSpace([string]$state.OriginKind)) { $originKind = ([string]$state.OriginKind).Trim() }
+            if ($state.PSObject.Properties['NotificationId'] -and -not [string]::IsNullOrWhiteSpace([string]$state.NotificationId)) { $notificationId = ([string]$state.NotificationId).Trim() }
+            if ($state.PSObject.Properties['SnapshotId'] -and -not [string]::IsNullOrWhiteSpace([string]$state.SnapshotId)) { $snapshotId = ([string]$state.SnapshotId).Trim() }
         }
         else {
             $hostValue = Get-NotifyQueryValue -ParsedUri $parsedUri -Name 'host'
@@ -397,6 +409,29 @@ if (-not [string]::IsNullOrWhiteSpace($Uri)) {
 if (-not [string]::IsNullOrWhiteSpace($env:PI_NOTIFY_FOCUS_TARGET)) { $targetHost = $env:PI_NOTIFY_FOCUS_TARGET.Trim() }
 if (-not [string]::IsNullOrWhiteSpace($env:PI_NOTIFY_CWD_BASE)) { $cwdBase = $env:PI_NOTIFY_CWD_BASE.Trim() }
 if (-not [string]::IsNullOrWhiteSpace($env:PI_NOTIFY_TAB_TITLE)) { $tabTitle = $env:PI_NOTIFY_TAB_TITLE.Trim() }
+if (-not [string]::IsNullOrWhiteSpace($env:PI_NOTIFY_ORIGIN_KIND)) { $originKind = $env:PI_NOTIFY_ORIGIN_KIND.Trim() }
+if (-not [string]::IsNullOrWhiteSpace($env:PI_NOTIFY_NOTIFICATION_ID)) { $notificationId = $env:PI_NOTIFY_NOTIFICATION_ID.Trim() }
+if (-not [string]::IsNullOrWhiteSpace($env:PI_NOTIFY_SNAPSHOT_ID)) { $snapshotId = $env:PI_NOTIFY_SNAPSHOT_ID.Trim() }
+
+if ($originKind -eq 'pi-web') {
+    Write-NotifyActivateLog -Message ('activate-route originKind=pi-web notificationFp={0} snapshotFp={1}' -f (Get-NotifyRouteFingerprint -Value $notificationId), (Get-NotifyRouteFingerprint -Value $snapshotId))
+    if ([string]::IsNullOrWhiteSpace($notificationId) -or [string]::IsNullOrWhiteSpace($snapshotId)) {
+        Write-NotifyActivateLog -Message ('activate-route fail-closed result=owner-unresolved reason=missing-snapshot notificationFp={0}' -f (Get-NotifyRouteFingerprint -Value $notificationId))
+        exit 1
+    }
+    $activateOutcome = Invoke-NotifyExactRouteActivate -NotificationId $notificationId -SnapshotId $snapshotId -Config $config -WaitMs 5000 -TimeoutMs 8000
+    $decision = $activateOutcome.Decision
+    Write-NotifyActivateLog -Message ('activate-route decision={0} result={1} reason={2} notificationFp={3} snapshotFp={4}' -f $decision.Decision, $decision.Result, $(if ([string]::IsNullOrWhiteSpace($decision.Reason)) { 'none' } else { $decision.Reason }), (Get-NotifyRouteFingerprint -Value $notificationId), (Get-NotifyRouteFingerprint -Value $snapshotId))
+    if ($decision.Decision -eq 'handled') {
+        Write-NotifyActivateLog -Message 'activate-route-success'
+        exit 0
+    }
+    if ($decision.Decision -eq 'fail-closed') {
+        Write-NotifyActivateLog -Message ('activate-route-fail-closed result={0}' -f $decision.Result)
+        exit 1
+    }
+    Write-NotifyActivateLog -Message ('activate-route-downgrade result={0} reason={1}' -f $decision.Result, $(if ([string]::IsNullOrWhiteSpace($decision.Reason)) { 'none' } else { $decision.Reason }))
+}
 
 $requiredText = if (-not [string]::IsNullOrWhiteSpace($tabTitle)) { $tabTitle } else { $cwdBase }
 $keywords = @($tabTitle, $cwdBase, $targetHost) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }

@@ -21,6 +21,9 @@ This folder implements a reliable **Windows local notification bridge** for runn
 - `install-autostart-all.ps1` — one-shot installer for both Windows + Linux autostart
 - `remote-windows-notify.ts` — Pi extension template installed on the remote host
 - `pi-notify-ensure.mjs` — atomic package/standalone ownership, config restore, and read-only drift check on the remote host
+- `route-host/` — .NET current-user exact-route daemon, client, and Chromium Native Messaging relay
+- `test-route.ps1` — Windows PowerShell 5.1 route metadata and fail-closed decision regression
+- `../browser-extension/` — shared opt-in Chrome/Edge Manifest V3 route adapter
 
 ## Architecture
 
@@ -30,16 +33,21 @@ Windows local machine
     -> popup-focus mode: POST to pi-notify-broker.ps1 :23119 (loopback only)
        -> long-lived WinForms process shows popup cards without per-notification startup
     -> broker unavailable/post fails: fallback to pi-notify-popup.ps1 process
+    -> optional QQ mirror: pi-notify-qq-sender.ps1 starts the existing local sender with a temp text file
   pi-notify-reverse-tunnel.ps1
         ^
         | persistent ssh -R reverse tunnel
-    -> optional QQ mirror: pi-notify-qq-sender.ps1 starts the existing local sender with a temp text file
         |
 Remote host my
   Pi extension POST http://127.0.0.1:23118/notify
+
+Optional Pi Web exact route
+  notify-listener -> PiNotifyRouteHost current-user named pipe
+    -> PiWebDesktop adapter
+    -> Chrome/Edge adapter through Native Messaging (only after explicit load/config)
 ```
 
-The broker binds only `127.0.0.1` and is never exposed through the SSH tunnel. The listener remains the single public entry point and continues to authenticate every request.
+The broker binds only `127.0.0.1` and is never exposed through the SSH tunnel. The listener remains the single public entry point and continues to authenticate every request. Route Host does not replace Terminal matching: `originKind=terminal` keeps the existing canonical-title path, while a declared `originKind=pi-web` is either exact or a fail-closed no-op.
 
 ## First-time remote install
 
@@ -204,34 +212,26 @@ Important keys:
   "brokerPort": 23119,
   "brokerStartupTimeoutMs": 700,
   "brokerRequestTimeoutMs": 700,
+  "qqNotifyEnabled": false,
+  "qqNodeExecutable": "node.exe",
+  "qqSenderScript": "",
+  "qqSendTimeoutSeconds": 20,
+  "qqMaxConcurrent": 2,
   "token": "..."
 }
 ```
 
 `tunnelStartupDelaySeconds` is normalized to at least 5 seconds to avoid startup races between listener, tunnel, and watchdog.
 
+QQ mirror keys are non-sensitive and default to disabled. Keep QQ account, recipient, token, secret, and OpenClaw configuration outside this bridge config.
+
 Broker keys (auto-upgraded with safe defaults when missing):
 
-  "qqNotifyEnabled": false,
-  "qqNodeExecutable": "node.exe",
-  "qqSenderScript": "",
-  "qqSendTimeoutSeconds": 20,
-  "qqMaxConcurrent": 2,
 - `brokerEnabled` (default `true`) — when `true`, `popup-focus` mode prefers the long-lived broker; when `false`, the listener uses the old per-notification `pi-notify-popup.ps1` process path.
 - `brokerPort` (default `23119`) — loopback-only HTTP port for the broker. The broker binds only `127.0.0.1` and is never exposed through the SSH tunnel.
 - `brokerStartupTimeoutMs` (default `700`) — bounded wait when the listener starts the broker on first use.
 - `brokerRequestTimeoutMs` (default `700`) — bounded timeout for listener-to-broker `/popup` posts; on failure the listener falls back to the popup process path.
 
-Remote config also supports:
-QQ mirror keys are non-sensitive and default to disabled. Keep QQ account, recipient, token, secret, and OpenClaw configuration outside this bridge config.
-
-
-```json
-{
-  "messageMode": "dynamic",
-  "title": "Pi",
-  "bodyTemplate": "host: {host} | cwd: {cwdBase}",
-  "remoteHostAlias": "my"
 QQ mirror keys (auto-upgraded with safe defaults when missing):
 
 - `qqNotifyEnabled` (default `false`) — opt-in only. Install, refresh, and restart keep it disabled unless you explicitly set it.
@@ -244,8 +244,20 @@ QQ delivery runs only after token authentication, display text normalization, ta
 
 Before enabling real QQ sends, validate with a fake sender or the existing sender's `--dry-run`, then get explicit approval for a real smoke because it will notify the configured recipient. Structured evidence is written to `logs\listener.log` and `logs\qq-sender.log` as statuses such as `qq-send-ok`, `qq-send-failed exitCode=<n>`, `qq-send-timeout`, `qq-send-unavailable reason=<kind>`, or `qq-send-drop reason=capacity`; logs must not contain message text, sender stdout/stderr, account/recipient identifiers, or credentials. To roll back QQ only, set `qqNotifyEnabled` to `false` and restart the listener; desktop notifications do not require code rollback.
 
+Remote config also supports:
+
+```json
+{
+  "messageMode": "dynamic",
+  "title": "Pi",
+  "bodyTemplate": "host: {host} | cwd: {cwdBase}",
+  "remoteHostAlias": "my",
+  "originKind": "pi-web",
+  "instanceKey": "11111111-2222-3333-4444-555555555555"
 }
 ```
+
+Only set `originKind=pi-web` for the Pi Web service instance. `instanceKey` is an opaque instance identifier shared with the trusted Windows adapters; do not reuse it for a different Pi Web data root/service. TUI sessions remain `terminal` even when the same config file contains the Pi Web fields.
 
 Notification payloads may include:
 
@@ -305,6 +317,72 @@ Switch modes:
 powershell.exe -ExecutionPolicy Bypass -File .\scripts\pi-notify\set-notify-mode.ps1 -Mode system-toast
 powershell.exe -ExecutionPolicy Bypass -File .\scripts\pi-notify\set-notify-mode.ps1 -Mode popup-focus -PopupPlacement cursor
 ```
+
+## Optional Pi Web exact routing
+
+Exact routing is additive. A Pi Web notification freezes the unique live owner at receive time; clicking later revalidates that same owner and reports `session-url-confirmed`. Zero owners, multiple owners, stale pages, an unavailable adapter/Route Host, malformed metadata, or a failed foreground operation are no-ops. They never fall back to Terminal scanning, browser-title matching, a recent window, or a new tab.
+
+### Build and install Route Host
+
+```powershell
+cd .\windows\route-host
+dotnet test .\PiNotifyRouteHost.sln -c Release
+dotnet publish .\src\PiNotifyRouteHost\PiNotifyRouteHost.csproj `
+  -c Release -r win-x64 --self-contained true -o .\publish
+.\install.ps1 -PublishDir .\publish -ExtensionId jfjmmpbnenmophffljembfmkpppohocj
+```
+
+The installer writes only current-user locations: `%LOCALAPPDATA%\PiNotifyRouteHost`, the HKCU Chrome/Edge Native Messaging host keys, and the HKCU `Run\PiNotifyRouteHost` launcher. Rerun the same publish/install commands to upgrade. Back up the prior install directory before replacement when rollback evidence is required.
+
+### PiWebDesktop adapter
+
+Use the tracked source under `tools\pi-web-desktop`; do not retain only a hand-copied executable. Put the same `instanceKey` in `%LOCALAPPDATA%\PiWebDesktop\route-config.json`, build, verify, then replace the installed executable from the verified `output\PiWebDesktop-win-x64` artifact:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\build.ps1
+powershell -ExecutionPolicy Bypass -File .\verify.ps1
+```
+
+The desktop app registers only after a successful trusted-origin WebView2 navigation containing `?session=`. It heartbeats its adapter/owner lease and uses the existing window restore/focus path; it does not navigate notifications to an arbitrary URL or create a second window.
+
+### Chrome and Edge adapters
+
+```bash
+cd browser-extension
+npm test
+npm run build
+```
+
+Loading is deliberately manual: open `chrome://extensions` or `edge://extensions`, enable Developer mode, load the corresponding `build/<browser>` directory, then configure the trusted Pi Web origin and matching `instanceKey` in extension options. Native-host registry keys alone do not install or activate an extension. Validate Chrome and Edge separately; do not claim either browser supported until its unpacked extension has been loaded and the end-to-end unique/ambiguous/stale matrix has passed.
+
+### Verify and recover
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\windows\test-route.ps1
+powershell -ExecutionPolicy Bypass -File .\windows\pi-notify-check.ps1
+powershell -ExecutionPolicy Bypass -File .\windows\route-host\install.ps1 `
+  -PublishDir .\windows\route-host\publish -ExtensionId jfjmmpbnenmophffljembfmkpppohocj
+```
+
+Useful structured evidence is in `%USERPROFILE%\.pi-notify\logs\listener.log`, `broker.log`, and the Route Host daemon stdout/stderr files under `%LOCALAPPDATA%\PiNotifyRouteHost`. PiWebDesktop emits route diagnostics only through its debug listener; the final adapter acknowledgement is recorded by the broker. Logs contain only fingerprints/reasons, not raw session IDs, full Pi Web URLs, tokens, or routing keys.
+
+Recovery order: confirm Route Host is running, confirm the Desktop/browser adapter is connected, confirm the page URL still has the intended `?session=`, then generate a new notification. Route Host restart invalidates old snapshots by design; it must not resurrect stale tab/window handles. If a notification froze as `miss` or `ambiguous`, opening/closing a page later does not retarget that old notification.
+
+### Disable or uninstall
+
+For a reversible disable, set the Desktop `route-config.json` `enabled` field to `false`, unload the browser extension, and leave `originKind=pi-web` configured; Pi Web notification clicks then remain fail-closed.
+
+To remove Route Host after backing up the install directory:
+
+```powershell
+Stop-Process -Name PiNotifyRouteHost -Force -ErrorAction SilentlyContinue
+Remove-Item 'HKCU:\Software\Google\Chrome\NativeMessagingHosts\io.pi.notify.route' -Recurse -Force -ErrorAction SilentlyContinue
+Remove-Item 'HKCU:\Software\Microsoft\Edge\NativeMessagingHosts\io.pi.notify.route' -Recurse -Force -ErrorAction SilentlyContinue
+Remove-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name PiNotifyRouteHost -ErrorAction SilentlyContinue
+Remove-Item "$env:LOCALAPPDATA\PiNotifyRouteHost" -Recurse -Force
+```
+
+Do not delete browser profile data, Pi session files, or PiWebDesktop WebView data as part of route removal.
 
 ## Troubleshooting
 

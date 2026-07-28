@@ -109,6 +109,9 @@ if ([string]::IsNullOrWhiteSpace($FocusTarget) -and -not [string]::IsNullOrWhite
 if ([string]::IsNullOrWhiteSpace($CwdBase) -and -not [string]::IsNullOrWhiteSpace($env:PI_NOTIFY_CWD_BASE)) { $CwdBase = $env:PI_NOTIFY_CWD_BASE }
 if ([string]::IsNullOrWhiteSpace($SourceTabTitle) -and -not [string]::IsNullOrWhiteSpace($env:PI_NOTIFY_TAB_TITLE)) { $SourceTabTitle = $env:PI_NOTIFY_TAB_TITLE }
 if ([string]::IsNullOrWhiteSpace($SessionName) -and -not [string]::IsNullOrWhiteSpace($env:PI_NOTIFY_SESSION_NAME)) { $SessionName = $env:PI_NOTIFY_SESSION_NAME }
+$OriginKind = if (-not [string]::IsNullOrWhiteSpace($env:PI_NOTIFY_ORIGIN_KIND)) { $env:PI_NOTIFY_ORIGIN_KIND.Trim() } else { '' }
+$NotificationId = if (-not [string]::IsNullOrWhiteSpace($env:PI_NOTIFY_NOTIFICATION_ID)) { $env:PI_NOTIFY_NOTIFICATION_ID.Trim() } else { '' }
+$SnapshotId = if (-not [string]::IsNullOrWhiteSpace($env:PI_NOTIFY_SNAPSHOT_ID)) { $env:PI_NOTIFY_SNAPSHOT_ID.Trim() } else { '' }
 $script:NotifyPopupLogPath = Join-Path (Get-NotifyBridgeLogDir) 'popup.log'
 $script:NotifyPopupCachePath = Join-Path (Get-NotifyBridgeLogDir) 'popup-cache.json'
 $popupWallpaperPath = if ($config.PSObject.Properties['PopupWallpaperPath']) { [string]$config.PopupWallpaperPath } else { '' }
@@ -335,7 +338,8 @@ $SessionName = if ([string]::IsNullOrWhiteSpace($SessionName)) { '' } else { $Se
 
 if (([string]$CwdBase).Trim() -match '^\{[^}]+\}$') { $CwdBase = '' }
 if (([string]$SourceTabTitle).Trim() -match '^\{[^}]+\}$') { $SourceTabTitle = '' }
-if ([string]::IsNullOrWhiteSpace($CwdBase) -and [string]::IsNullOrWhiteSpace($SourceTabTitle)) {
+$hasExactRoute = ($OriginKind -eq 'pi-web') -and (-not [string]::IsNullOrWhiteSpace($NotificationId))
+if ([string]::IsNullOrWhiteSpace($CwdBase) -and [string]::IsNullOrWhiteSpace($SourceTabTitle) -and -not $hasExactRoute) {
     Write-NotifyPopupLog -Message ('popup-drop missing-target-metadata targetFingerprint={0}' -f (Get-NotifyPopupContextFingerprint -Value $FocusTarget))
     exit 0
 }
@@ -614,7 +618,10 @@ function Invoke-NotifyPopupActivation {
     param(
         [string]$TargetHost,
         [string]$CurrentDirBase,
-        [string]$SourceTabTitleValue
+        [string]$SourceTabTitleValue,
+        [string]$OriginKind = '',
+        [string]$NotificationId = '',
+        [string]$SnapshotId = ''
     )
 
     try {
@@ -622,7 +629,25 @@ function Invoke-NotifyPopupActivation {
         $requiresCwdMatch = -not [string]::IsNullOrWhiteSpace($CurrentDirBase)
         $hasPreciseSourceTitle = -not [string]::IsNullOrWhiteSpace($SourceTabTitleValue)
         $allowTargetCache = Test-NotifyPopupSessionTaggedTitle -Value $SourceTabTitleValue
-        Write-NotifyPopupLog -Message ('popup-activate targetFingerprint={0} cwdFingerprint={1} sourceTabFingerprint={2}' -f (Get-NotifyPopupContextFingerprint -Value $TargetHost), (Get-NotifyPopupContextFingerprint -Value $CurrentDirBase), (Get-NotifyPopupContextFingerprint -Value $SourceTabTitleValue))
+        Write-NotifyPopupLog -Message ('popup-activate targetFingerprint={0} cwdFingerprint={1} sourceTabFingerprint={2} originKind={3} notificationFp={4} snapshotFp={5}' -f (Get-NotifyPopupContextFingerprint -Value $TargetHost), (Get-NotifyPopupContextFingerprint -Value $CurrentDirBase), (Get-NotifyPopupContextFingerprint -Value $SourceTabTitleValue), $(if ([string]::IsNullOrWhiteSpace($OriginKind)) { 'none' } else { $OriginKind }), (Get-NotifyRouteFingerprint -Value $NotificationId), (Get-NotifyRouteFingerprint -Value $SnapshotId))
+
+        if ($OriginKind -eq 'pi-web') {
+            if ([string]::IsNullOrWhiteSpace($NotificationId) -or [string]::IsNullOrWhiteSpace($SnapshotId)) {
+                Write-NotifyPopupLog -Message ('popup-route-activate fail-closed result=owner-unresolved reason=missing-snapshot notificationFp={0} elapsedMs={1}' -f (Get-NotifyRouteFingerprint -Value $NotificationId), [int]([DateTime]::UtcNow - $startedAt).TotalMilliseconds)
+                return
+            }
+            $activateOutcome = Invoke-NotifyExactRouteActivate -NotificationId $NotificationId -SnapshotId $SnapshotId -Config $config -WaitMs 5000 -TimeoutMs 8000
+            $decision = $activateOutcome.Decision
+            Write-NotifyPopupLog -Message ('popup-route-activate decision={0} result={1} reason={2} notificationFp={3} snapshotFp={4} elapsedMs={5}' -f $decision.Decision, $decision.Result, $(if ([string]::IsNullOrWhiteSpace($decision.Reason)) { 'none' } else { $decision.Reason }), (Get-NotifyRouteFingerprint -Value $NotificationId), (Get-NotifyRouteFingerprint -Value $SnapshotId), [int]([DateTime]::UtcNow - $startedAt).TotalMilliseconds)
+            if ($decision.Decision -eq 'handled') {
+                return
+            }
+            if ($decision.Decision -eq 'fail-closed') {
+                return
+            }
+            Write-NotifyPopupLog -Message ('popup-route-activate-downgrade result={0} reason={1} notificationFp={2}' -f $decision.Result, $(if ([string]::IsNullOrWhiteSpace($decision.Reason)) { 'none' } else { $decision.Reason }), (Get-NotifyRouteFingerprint -Value $NotificationId))
+        }
+
         if (-not $requiresCwdMatch -and -not $hasPreciseSourceTitle) {
             Write-NotifyPopupLog -Message ('popup-focus-miss missing-target-metadata no-target-open-skipped targetFingerprint={0} elapsedMs={1}' -f (Get-NotifyPopupContextFingerprint -Value $TargetHost), [int]([DateTime]::UtcNow - $startedAt).TotalMilliseconds)
             return
@@ -940,6 +965,9 @@ if ($null -ne $script:NotifyPopupWallpaperImage) {
 $targetHost = $FocusTarget
 $targetCwdBase = $CwdBase
 $targetSourceTabTitle = $SourceTabTitle
+$targetOriginKind = $OriginKind
+$targetNotificationId = $NotificationId
+$targetSnapshotId = $SnapshotId
 $didActivate = $false
 $shouldActivate = $false
 
@@ -950,7 +978,7 @@ $activateAction = {
     $script:didActivate = $true
     $script:shouldActivate = $true
     Write-NotifyPopupLog -Message 'popup-click'
-    Write-NotifyPopupLog -Message ('popup-action activate targetFingerprint={0}' -f (Get-NotifyPopupContextFingerprint -Value $targetHost))
+    Write-NotifyPopupLog -Message ('popup-action activate targetFingerprint={0} originKind={1} notificationFp={2} snapshotFp={3}' -f (Get-NotifyPopupContextFingerprint -Value $targetHost), $(if ([string]::IsNullOrWhiteSpace($targetOriginKind)) { 'none' } else { $targetOriginKind }), (Get-NotifyRouteFingerprint -Value $targetNotificationId), (Get-NotifyRouteFingerprint -Value $targetSnapshotId))
     $form.Close()
 }
 
@@ -1053,5 +1081,5 @@ $form.Add_FormClosed({
 [System.Windows.Forms.Application]::Run($form)
 
 if ($shouldActivate) {
-    Invoke-NotifyPopupActivation -TargetHost $targetHost -CurrentDirBase $targetCwdBase -SourceTabTitleValue $targetSourceTabTitle
+    Invoke-NotifyPopupActivation -TargetHost $targetHost -CurrentDirBase $targetCwdBase -SourceTabTitleValue $targetSourceTabTitle -OriginKind $targetOriginKind -NotificationId $targetNotificationId -SnapshotId $targetSnapshotId
 }

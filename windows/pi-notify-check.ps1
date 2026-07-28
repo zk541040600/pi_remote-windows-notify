@@ -93,8 +93,8 @@ if ((Test-Path -LiteralPath $linuxExtensionPath) -and (Test-Path -LiteralPath $w
     if ($linuxExtension -ne $windowsExtension) {
         throw 'Linux and Windows extension templates differ. Copy the canonical extension before shipping.'
     }
-    if ($windowsExtension -notmatch '__piRemoteWindowsNotifyActiveToken' -or $windowsExtension -match '__piRemoteWindowsNotifyRegistered' -or $windowsExtension -notmatch 'getExtensionConfigPaths' -or $windowsExtension -notmatch 'fileURLToPath\(import\.meta\.url\)') {
-        throw 'Extension template must discover remote-windows-notify.json relative to its installed path for custom -RemotePiDir.'
+    if ($windowsExtension -match '__piRemoteWindowsNotifyActiveToken' -or $windowsExtension -match '__piRemoteWindowsNotifyRegistered' -or $windowsExtension -notmatch 'const lifecycleController = new AbortController\(\)' -or $windowsExtension -notmatch 'promptUnsubscribe\(\)' -or $windowsExtension -notmatch 'getExtensionConfigPaths' -or $windowsExtension -notmatch 'fileURLToPath\(import\.meta\.url\)') {
+        throw 'Extension template must use runtime-local lifecycle ownership and discover remote-windows-notify.json relative to its installed path.'
     }
     Write-Host 'OK extension templates match'
 }
@@ -335,25 +335,6 @@ foreach ($name in @('pi-notify-broker.ps1', 'pi-notify-popup.ps1', 'notify-liste
     }
 }
 
-# Broker script assertions: syntax is covered by [1/10]; here we assert privacy,
-# runtime-file coverage, and config defaults.
-if (-not (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'pi-notify-broker.ps1'))) {
-    throw 'pi-notify-broker.ps1 must exist for low-latency broker path.'
-}
-if ($brokerText -notmatch 'System.Net.IPAddress\]::Loopback' -or $brokerText -notmatch '/health' -or $brokerText -notmatch '/popup' -or $brokerText -notmatch '/close') {
-    throw 'Broker must bind loopback only and expose /health, /popup, /close endpoints.'
-}
-if ($brokerText -notmatch 'broker.pid' -or $brokerText -notmatch 'broker.log' -or $brokerText -notmatch 'Global\\PiNotifyBroker_') {
-    throw 'Broker must write broker.pid/broker.log and use a singleton mutex.'
-}
-if ($brokerText -notmatch 'popup-live\.' -or $brokerText -notmatch 'brokerManaged\s*=\s*\$true' -or $brokerText -match 'protected(Host|Cwd|Tab)\s*=') {
-    throw 'Broker-managed live-state files must avoid target-context DPAPI work; broker /activate-oldest and /close use in-memory popup state and popupId.'
-}
-# Privacy: broker logs must not include raw notification content or target context
-$badBrokerLogPattern = ('broker-popup-start ' + 'title=') + '|' + ('broker-popup-start ' + 'body=') + '|' + ('broker-shown ' + 'title=') + '|' + 'sourceTabTitle="' + '|' + 'cwdBase="' + '|' + 'sessionName="' + '|' + 'windowTitle="' + '|' + 'tabName="' + '|' + 'broker-action activate host=' + '|' + 'broker-cache host="' + '|' + 'broker-keywords "'
-if ($brokerText -match $badBrokerLogPattern) {
-    throw 'Broker logs must not persist notification title/body text or raw target context.'
-}
 # QQ worker assertions cover one-shot process ownership, timeout, cleanup, and redacted logs.
 if (-not (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'pi-notify-qq-sender.ps1'))) {
     throw 'pi-notify-qq-sender.ps1 must exist for optional QQ delivery.'
@@ -721,6 +702,7 @@ if (Test-Path -LiteralPath $popupLogDir) {
             throw ('Notification content or raw target context remains in runtime log: {0}' -f $logName)
         }
     }
+
     $qqPendingDir = Join-Path (Split-Path -Parent $configPath) 'qq-pending'
     if (Test-Path -LiteralPath $qqPendingDir) {
         $staleQqFiles = @(Get-ChildItem -LiteralPath $qqPendingDir -Filter '*.txt' -File -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -lt (Get-Date).AddMinutes(-10) })

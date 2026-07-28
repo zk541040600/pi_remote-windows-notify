@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Pi Notify Route — Options</title>
+    <link rel="stylesheet" href="options.css" />
+  </head>
+  <body>
+    <main>
+      <h1>Pi Notify Route</h1>
+      <p class="lede">
+        Map trusted Pi Web origins to a stable <code>instanceKey</code>. Only pages on these
+        origins with a valid <code>?session=</code> register as live notification owners.
+        Host permissions are requested explicitly for the origins you add.
+      </p>
+
+      <section>
+        <h2>Browser</h2>
+        <p id="browserKind" class="mono">—</p>
+        <p class="muted">Profile key: <span id="profileKey" class="mono">—</span></p>
+      </section>
+
+      <section>
+        <h2>Trusted origins</h2>
+        <table id="originTable">
+          <thead>
+            <tr>
+              <th>Origin</th>
+              <th>instanceKey</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+        <div class="row">
+          <input id="newOrigin" type="url" placeholder="http://10.23.50.137:30141" spellcheck="false" />
+          <input id="newInstance" type="text" placeholder="uuid instanceKey" spellcheck="false" />
+          <button id="addBtn" type="button">Add</button>
+        </div>
+        <p class="muted">
+          Example: <code>http://10.23.50.137:30141</code> → a fixed UUID for that Pi Web service.
+        </p>
+      </section>
+
+      <section>
+        <h2>Lease TTL (ms)</h2>
+        <input id="leaseTtl" type="number" min="1000" max="120000" step="1000" />
+      </section>
+
+      <section class="actions">
+        <button id="saveBtn" type="button" class="primary">Save</button>
+        <button id="permBtn" type="button">Request host permissions</button>
+        <span id="status" role="status"></span>
+      </section>
+
+      <section>
+        <h2>Notes</h2>
+        <ul>
+          <li>No raw session IDs or full URLs are logged by this extension.</li>
+          <li>Same session open in multiple tabs/clients → Route Host returns <code>ambiguous</code>.</li>
+          <li>Native host name: <code>io.pi.notify.route</code>.</li>
+        </ul>
+      </section>
+    </main>
+    <script type="module" src="options.js"></script>
+  </body>
+</html>

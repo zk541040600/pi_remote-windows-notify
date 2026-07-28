@@ -824,7 +824,10 @@ function Invoke-NotifyBrokerOldestPopupActivation {
     if ($tag.ContainsKey('DidActivate')) { $tag.DidActivate.Value = $true }
     Set-NotifyBrokerPopupActivating -Tag $tag
     $tag.ActivationQueued.Value = $true
-    Queue-NotifyBrokerActivation -TargetHost $tag.TargetHost -CurrentDirBase $tag.TargetCwdBase -SourceTabTitleValue $tag.TargetSourceTabTitle -TargetFingerprint $tag.TargetFingerprint -PopupId $tag.PopupId -FormToClose $tag.Form
+    $originKind = if ($tag.ContainsKey('OriginKind')) { [string]$tag.OriginKind } else { '' }
+    $notificationId = if ($tag.ContainsKey('NotificationId')) { [string]$tag.NotificationId } else { '' }
+    $snapshotId = if ($tag.ContainsKey('SnapshotId')) { [string]$tag.SnapshotId } else { '' }
+    Queue-NotifyBrokerActivation -TargetHost $tag.TargetHost -CurrentDirBase $tag.TargetCwdBase -SourceTabTitleValue $tag.TargetSourceTabTitle -TargetFingerprint $tag.TargetFingerprint -PopupId $tag.PopupId -FormToClose $tag.Form -OriginKind $originKind -NotificationId $notificationId -SnapshotId $snapshotId
     return $true
 }
 
@@ -835,7 +838,10 @@ function Queue-NotifyBrokerActivation {
         [string]$SourceTabTitleValue,
         [string]$TargetFingerprint,
         [string]$PopupId = '',
-        [System.Windows.Forms.Form]$FormToClose
+        [System.Windows.Forms.Form]$FormToClose,
+        [string]$OriginKind = '',
+        [string]$NotificationId = '',
+        [string]$SnapshotId = ''
     )
 
     if ($null -eq $script:NotifyBrokerActivationQueue) {
@@ -851,7 +857,7 @@ function Queue-NotifyBrokerActivation {
             }
             $request = $script:NotifyBrokerActivationQueue.Dequeue()
             try {
-                Invoke-NotifyBrokerActivation -TargetHost $request.TargetHost -CurrentDirBase $request.CurrentDirBase -SourceTabTitleValue $request.SourceTabTitleValue -TargetFingerprint $request.TargetFingerprint
+                Invoke-NotifyBrokerActivation -TargetHost $request.TargetHost -CurrentDirBase $request.CurrentDirBase -SourceTabTitleValue $request.SourceTabTitleValue -TargetFingerprint $request.TargetFingerprint -OriginKind $request.OriginKind -NotificationId $request.NotificationId -SnapshotId $request.SnapshotId
             }
             finally {
                 if ($null -ne $request.FormToClose -and -not $request.FormToClose.IsDisposed) {
@@ -877,6 +883,9 @@ function Queue-NotifyBrokerActivation {
         TargetFingerprint = $TargetFingerprint
         PopupId = $PopupId
         FormToClose = $FormToClose
+        OriginKind = $OriginKind
+        NotificationId = $NotificationId
+        SnapshotId = $SnapshotId
     })
     $script:NotifyBrokerActivationTimer.Start()
 }
@@ -886,14 +895,36 @@ function Invoke-NotifyBrokerActivation {
         [string]$TargetHost,
         [string]$CurrentDirBase,
         [string]$SourceTabTitleValue,
-        [string]$TargetFingerprint = ''
+        [string]$TargetFingerprint = '',
+        [string]$OriginKind = '',
+        [string]$NotificationId = '',
+        [string]$SnapshotId = ''
     )
 
     try {
         $startedAt = [DateTime]::UtcNow
         $requiresCwdMatch = -not [string]::IsNullOrWhiteSpace($CurrentDirBase)
         $hasPreciseSourceTitle = -not [string]::IsNullOrWhiteSpace($SourceTabTitleValue)
-        Write-NotifyBrokerLog -Message ('broker-activate targetFingerprint={0} cwdFingerprint={1} sourceTabFingerprint={2}' -f (Get-NotifyBrokerContextFingerprint -Value $TargetHost), (Get-NotifyBrokerContextFingerprint -Value $CurrentDirBase), (Get-NotifyBrokerContextFingerprint -Value $SourceTabTitleValue))
+        Write-NotifyBrokerLog -Message ('broker-activate targetFingerprint={0} cwdFingerprint={1} sourceTabFingerprint={2} originKind={3} notificationFp={4} snapshotFp={5}' -f (Get-NotifyBrokerContextFingerprint -Value $TargetHost), (Get-NotifyBrokerContextFingerprint -Value $CurrentDirBase), (Get-NotifyBrokerContextFingerprint -Value $SourceTabTitleValue), $(if ([string]::IsNullOrWhiteSpace($OriginKind)) { 'none' } else { $OriginKind }), (Get-NotifyRouteFingerprint -Value $NotificationId), (Get-NotifyRouteFingerprint -Value $SnapshotId))
+
+        if ($OriginKind -eq 'pi-web') {
+            if ([string]::IsNullOrWhiteSpace($NotificationId) -or [string]::IsNullOrWhiteSpace($SnapshotId)) {
+                Write-NotifyBrokerLog -Message ('broker-route-activate fail-closed result=owner-unresolved reason=missing-snapshot notificationFp={0} elapsedMs={1}' -f (Get-NotifyRouteFingerprint -Value $NotificationId), [int]([DateTime]::UtcNow - $startedAt).TotalMilliseconds)
+                return
+            }
+            $activateOutcome = Invoke-NotifyExactRouteActivate -NotificationId $NotificationId -SnapshotId $SnapshotId -Config $config -WaitMs 5000 -TimeoutMs 8000
+            $decision = $activateOutcome.Decision
+            Write-NotifyBrokerLog -Message ('broker-route-activate decision={0} result={1} reason={2} notificationFp={3} snapshotFp={4} elapsedMs={5}' -f $decision.Decision, $decision.Result, $(if ([string]::IsNullOrWhiteSpace($decision.Reason)) { 'none' } else { $decision.Reason }), (Get-NotifyRouteFingerprint -Value $NotificationId), (Get-NotifyRouteFingerprint -Value $SnapshotId), [int]([DateTime]::UtcNow - $startedAt).TotalMilliseconds)
+            if ($decision.Decision -eq 'handled') {
+                return
+            }
+            if ($decision.Decision -eq 'fail-closed') {
+                return
+            }
+            # terminal-fallback for adapter-unavailable / miss / owner-unresolved
+            Write-NotifyBrokerLog -Message ('broker-route-activate-downgrade result={0} reason={1} notificationFp={2}' -f $decision.Result, $(if ([string]::IsNullOrWhiteSpace($decision.Reason)) { 'none' } else { $decision.Reason }), (Get-NotifyRouteFingerprint -Value $NotificationId))
+        }
+
         if (-not $requiresCwdMatch -and -not $hasPreciseSourceTitle) {
             Write-NotifyBrokerLog -Message ('broker-focus-miss missing-target-metadata no-target-open-skipped targetFingerprint={0} elapsedMs={1}' -f (Get-NotifyBrokerContextFingerprint -Value $TargetHost), [int]([DateTime]::UtcNow - $startedAt).TotalMilliseconds)
             return
@@ -1165,7 +1196,10 @@ function Show-NotifyBrokerPopup {
         [string]$TargetFingerprint,
         [int]$StackIndex,
         [int]$TimeoutSeconds,
-        [string]$PopupPlacementValue
+        [string]$PopupPlacementValue,
+        [string]$OriginKind = '',
+        [string]$NotificationId = '',
+        [string]$SnapshotId = ''
     )
 
     $usedSlots = @{}
@@ -1334,6 +1368,9 @@ function Show-NotifyBrokerPopup {
     $targetHost = $FocusTarget
     $targetCwdBase = $CwdBase
     $targetSourceTabTitle = $SourceTabTitle
+    $targetOriginKind = $OriginKind
+    $targetNotificationId = $NotificationId
+    $targetSnapshotId = $SnapshotId
     $didActivate = $false
     $shouldActivate = $false
 
@@ -1348,6 +1385,9 @@ function Show-NotifyBrokerPopup {
         TargetCwdBase     = $targetCwdBase
         TargetSourceTabTitle = $targetSourceTabTitle
         TargetFingerprint = $TargetFingerprint
+        OriginKind        = $targetOriginKind
+        NotificationId    = $targetNotificationId
+        SnapshotId        = $targetSnapshotId
         StackIndex        = $StackIndex
         PopupPlacement    = $PopupPlacementValue
         CreatedAtUtc      = $popupCreatedAtUtc
@@ -1378,10 +1418,10 @@ function Show-NotifyBrokerPopup {
         $tag.DidActivate.Value = $true
         $tag.ShouldActivate.Value = $true
         Write-NotifyBrokerLog -Message ('broker-popup-click popupId={0}' -f $tag.PopupId)
-        Write-NotifyBrokerLog -Message ('broker-action activate popupId={0} targetFingerprint={1}' -f $tag.PopupId, $tag.TargetFingerprint)
+        Write-NotifyBrokerLog -Message ('broker-action activate popupId={0} targetFingerprint={1} originKind={2} notificationFp={3} snapshotFp={4}' -f $tag.PopupId, $tag.TargetFingerprint, $(if ([string]::IsNullOrWhiteSpace($tag.OriginKind)) { 'none' } else { $tag.OriginKind }), (Get-NotifyRouteFingerprint -Value $tag.NotificationId), (Get-NotifyRouteFingerprint -Value $tag.SnapshotId))
         Set-NotifyBrokerPopupActivating -Tag $tag
         $tag.ActivationQueued.Value = $true
-        Queue-NotifyBrokerActivation -TargetHost $tag.TargetHost -CurrentDirBase $tag.TargetCwdBase -SourceTabTitleValue $tag.TargetSourceTabTitle -TargetFingerprint $tag.TargetFingerprint -PopupId $tag.PopupId -FormToClose $tag.Form
+        Queue-NotifyBrokerActivation -TargetHost $tag.TargetHost -CurrentDirBase $tag.TargetCwdBase -SourceTabTitleValue $tag.TargetSourceTabTitle -TargetFingerprint $tag.TargetFingerprint -PopupId $tag.PopupId -FormToClose $tag.Form -OriginKind $tag.OriginKind -NotificationId $tag.NotificationId -SnapshotId $tag.SnapshotId
     }
 
     $closeAction = {
@@ -1441,7 +1481,7 @@ function Show-NotifyBrokerPopup {
         $script:NotifyBrokerActivePopups.Remove($tag.PopupId) | Out-Null
 
         if ($tag.ShouldActivate.Value -and -not $tag.ActivationQueued.Value) {
-            Queue-NotifyBrokerActivation -TargetHost $tag.TargetHost -CurrentDirBase $tag.TargetCwdBase -SourceTabTitleValue $tag.TargetSourceTabTitle -TargetFingerprint $tag.TargetFingerprint -PopupId $tag.PopupId
+            Queue-NotifyBrokerActivation -TargetHost $tag.TargetHost -CurrentDirBase $tag.TargetCwdBase -SourceTabTitleValue $tag.TargetSourceTabTitle -TargetFingerprint $tag.TargetFingerprint -PopupId $tag.PopupId -OriginKind $tag.OriginKind -NotificationId $tag.NotificationId -SnapshotId $tag.SnapshotId
         }
     })
 
@@ -1481,7 +1521,10 @@ function Close-NotifyBrokerPopup {
                 if ($tag.ContainsKey('DidActivate')) { $tag.DidActivate.Value = $true }
                 Set-NotifyBrokerPopupActivating -Tag $tag
                 $tag.ActivationQueued.Value = $true
-                Queue-NotifyBrokerActivation -TargetHost $tag.TargetHost -CurrentDirBase $tag.TargetCwdBase -SourceTabTitleValue $tag.TargetSourceTabTitle -TargetFingerprint $tag.TargetFingerprint -PopupId $tag.PopupId -FormToClose $tag.Form
+                $originKind = if ($tag.ContainsKey('OriginKind')) { [string]$tag.OriginKind } else { '' }
+                $notificationId = if ($tag.ContainsKey('NotificationId')) { [string]$tag.NotificationId } else { '' }
+                $snapshotId = if ($tag.ContainsKey('SnapshotId')) { [string]$tag.SnapshotId } else { '' }
+                Queue-NotifyBrokerActivation -TargetHost $tag.TargetHost -CurrentDirBase $tag.TargetCwdBase -SourceTabTitleValue $tag.TargetSourceTabTitle -TargetFingerprint $tag.TargetFingerprint -PopupId $tag.PopupId -FormToClose $tag.Form -OriginKind $originKind -NotificationId $notificationId -SnapshotId $snapshotId
             }
             else {
                 $entry.Form.Close()
@@ -1722,6 +1765,9 @@ $script:NotifyBrokerDispatchTimer.Add_Tick({
                 $stackIndex = 0
                 $timeoutSeconds = [int]$config.PopupTimeoutSeconds
                 $popupPlacementValue = $PopupPlacement
+                $originKind = ''
+                $notificationId = ''
+                $snapshotId = ''
                 if ($null -ne $payload) {
                     if ($payload.PSObject.Properties['title'] -and -not [string]::IsNullOrWhiteSpace([string]$payload.title)) { $title = [string]$payload.title }
                     if ($payload.PSObject.Properties['body'] -and -not [string]::IsNullOrWhiteSpace([string]$payload.body)) { $body = [string]$payload.body }
@@ -1733,13 +1779,17 @@ $script:NotifyBrokerDispatchTimer.Add_Tick({
                     if ($payload.PSObject.Properties['stackIndex']) { [int]::TryParse([string]$payload.stackIndex, [ref]$stackIndex) | Out-Null }
                     if ($payload.PSObject.Properties['timeoutSeconds']) { [int]::TryParse([string]$payload.timeoutSeconds, [ref]$timeoutSeconds) | Out-Null }
                     if ($payload.PSObject.Properties['popupPlacement'] -and -not [string]::IsNullOrWhiteSpace([string]$payload.popupPlacement)) { $popupPlacementValue = [string]$payload.popupPlacement }
+                    if ($payload.PSObject.Properties['originKind'] -and -not [string]::IsNullOrWhiteSpace([string]$payload.originKind)) { $originKind = ([string]$payload.originKind).Trim() }
+                    if ($payload.PSObject.Properties['notificationId'] -and -not [string]::IsNullOrWhiteSpace([string]$payload.notificationId)) { $notificationId = ([string]$payload.notificationId).Trim() }
+                    if ($payload.PSObject.Properties['snapshotId'] -and -not [string]::IsNullOrWhiteSpace([string]$payload.snapshotId)) { $snapshotId = ([string]$payload.snapshotId).Trim() }
                 }
                 $title = if ([string]::IsNullOrWhiteSpace($title)) { 'Pi' } else { $title.Trim() }
                 $body = if ([string]::IsNullOrWhiteSpace($body)) { 'Ready for input' } else { $body.Trim() }
                 $focusTarget = if ([string]::IsNullOrWhiteSpace($focusTarget)) { [string]$config.RemoteHostAlias } else { $focusTarget.Trim() }
                 if (([string]$cwdBase).Trim() -match '^\{[^}]+\}$') { $cwdBase = '' }
                 if (([string]$tabTitle).Trim() -match '^\{[^}]+\}$') { $tabTitle = '' }
-                if ([string]::IsNullOrWhiteSpace($cwdBase) -and [string]::IsNullOrWhiteSpace($tabTitle)) {
+                $hasExactRoute = ($originKind -eq 'pi-web') -and (-not [string]::IsNullOrWhiteSpace($notificationId))
+                if ([string]::IsNullOrWhiteSpace($cwdBase) -and [string]::IsNullOrWhiteSpace($tabTitle) -and -not $hasExactRoute) {
                     Write-NotifyBrokerLog -Message ('broker-popup-drop missing-target-metadata targetFingerprint={0}' -f (Get-NotifyBrokerContextFingerprint -Value $focusTarget))
                     continue
                 }
@@ -1750,8 +1800,8 @@ $script:NotifyBrokerDispatchTimer.Add_Tick({
                 $script:NotifyBrokerSequenceId += 1
                 $popupId = ('{0}' -f $script:NotifyBrokerSequenceId)
                 $elapsedMs = [int]([DateTime]::UtcNow - $item.ReceivedAt).TotalMilliseconds
-                Write-NotifyBrokerLog -Message ('broker-popup-queue-dequeue popupId={0} targetFingerprint={1} queueDelayMs={2}' -f $popupId, $targetFingerprint, $elapsedMs)
-                Show-NotifyBrokerPopup -PopupId $popupId -Title $title -Body $body -FocusTarget $focusTarget -CwdBase $cwdBase -SourceTabTitle $tabTitle -SessionName $sessionName -TargetFingerprint $targetFingerprint -StackIndex $stackIndex -TimeoutSeconds $timeoutSeconds -PopupPlacementValue $popupPlacementValue
+                Write-NotifyBrokerLog -Message ('broker-popup-queue-dequeue popupId={0} targetFingerprint={1} queueDelayMs={2} originKind={3} notificationFp={4} snapshotFp={5}' -f $popupId, $targetFingerprint, $elapsedMs, $(if ([string]::IsNullOrWhiteSpace($originKind)) { 'none' } else { $originKind }), (Get-NotifyRouteFingerprint -Value $notificationId), (Get-NotifyRouteFingerprint -Value $snapshotId))
+                Show-NotifyBrokerPopup -PopupId $popupId -Title $title -Body $body -FocusTarget $focusTarget -CwdBase $cwdBase -SourceTabTitle $tabTitle -SessionName $sessionName -TargetFingerprint $targetFingerprint -StackIndex $stackIndex -TimeoutSeconds $timeoutSeconds -PopupPlacementValue $popupPlacementValue -OriginKind $originKind -NotificationId $notificationId -SnapshotId $snapshotId
             }
             elseif ($item.Action -eq '/close') {
                 $payload = $null

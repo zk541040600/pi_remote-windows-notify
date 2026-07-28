@@ -1,35 +1,40 @@
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, test } from "node:test";
 
 import remoteWindowsNotify, {
+  buildNotifyRouteFields,
+  computePiWebRoutingKey,
   getRuntimeConfig,
 } from "../linux/extensions/remote-windows-notify.ts";
 
 const ENV_KEYS = [
   "PI_NOTIFY_ALLOW_NONLOCAL",
   "PI_NOTIFY_ALLOW_NONLOCAL_DYNAMIC",
-  "PI_NOTIFY_ALLOW_TRELLIS_CHANNEL",
   "PI_NOTIFY_BODY_TEMPLATE",
   "PI_NOTIFY_CONFIG",
   "PI_NOTIFY_DISABLED",
   "PI_NOTIFY_ENDPOINT",
+  "PI_NOTIFY_INSTANCE_KEY",
   "PI_NOTIFY_MESSAGE_MODE",
+  "PI_NOTIFY_ORIGIN_KIND",
   "PI_NOTIFY_REMOTE_ALIAS",
   "PI_NOTIFY_TIMEOUT_MS",
   "PI_NOTIFY_TITLE",
   "PI_NOTIFY_TOKEN",
   "PI_SUBAGENT_CHILD",
-  "TRELLIS_CHANNEL",
-  "TRELLIS_CHANNEL_AS",
-  "TRELLIS_SUBAGENT_CHILD",
+  "PI_WEB_NO_OPEN",
 ];
 const savedEnv = new Map(ENV_KEYS.map((key) => [key, process.env[key]]));
 const originalFetch = globalThis.fetch;
 const ASK_USER_PROMPT_EVENT = "rpiv:ask-user:prompt";
+const ROUTING_KEY_DOMAIN = "pi-web-route-v1";
+const KNOWN_INSTANCE = "11111111-2222-3333-4444-555555555555";
+const KNOWN_SESSION = "session-alpha-example";
+const KNOWN_ROUTING_KEY = "8d36f5af4df10f41530341113539bd96e3e9cd5f31db427630a4e6e4915a88c6";
 
 function restoreProcessState() {
   for (const key of ENV_KEYS) {
@@ -51,6 +56,12 @@ function clearNotifyEnvironment() {
   for (const key of ENV_KEYS) {
     delete process.env[key];
   }
+  // Process-skip guards must not block extension registration in unit tests.
+  // These are intentionally not restored via ENV_KEYS (preserve existing tree change).
+  delete process.env.TRELLIS_SUBAGENT_CHILD;
+  delete process.env.TRELLIS_CHANNEL;
+  delete process.env.TRELLIS_CHANNEL_AS;
+  delete process.env.PI_NOTIFY_ALLOW_TRELLIS_CHANNEL;
   globalThis.__piRemoteWindowsNotifyPromptUnsubscribe?.();
   delete globalThis.__piRemoteWindowsNotifyActiveToken;
   delete globalThis.__piRemoteWindowsNotifyLifecycleController;
@@ -118,6 +129,23 @@ function createContext(overrides = {}) {
     },
     ...overrides,
   };
+}
+
+function expectedRoutingKey(instanceKey, rawSessionId) {
+  return createHash("sha256")
+    .update(ROUTING_KEY_DOMAIN)
+    .update("\0")
+    .update(instanceKey)
+    .update("\0")
+    .update(rawSessionId)
+    .digest("hex");
+}
+
+function assertNoRawSessionLeak(payload, rawSessionId) {
+  const serialized = JSON.stringify(payload);
+  assert.doesNotMatch(serialized, new RegExp(rawSessionId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.equal(Object.hasOwn(payload, "sessionId"), false);
+  assert.equal(Object.hasOwn(payload, "rawSessionId"), false);
 }
 
 beforeEach(clearNotifyEnvironment);
@@ -203,6 +231,84 @@ test("environment-only configuration works when no config file exists", async ()
   assert.equal(config.token, "env-token");
 });
 
+test("runtime config accepts explicit pi-web origin and instance key", async (t) => {
+  process.env.PI_WEB_NO_OPEN = "1";
+  writeConfig(t, {
+    endpoint: "http://127.0.0.1:23118/notify",
+    token: "test-token",
+    originKind: "pi-web",
+    instanceKey: KNOWN_INSTANCE,
+  });
+  let config = await getRuntimeConfig();
+  assert.equal(config.piWebOriginConfigured, true);
+  assert.equal(config.instanceKey, KNOWN_INSTANCE);
+
+  delete process.env.PI_WEB_NO_OPEN;
+  config = await getRuntimeConfig();
+  assert.equal(
+    config.piWebOriginConfigured,
+    false,
+    "file-level pi-web config must not classify an unrelated RPC host",
+  );
+  process.env.PI_WEB_NO_OPEN = "1";
+
+  writeConfig(t, {
+    endpoint: "http://127.0.0.1:23118/notify",
+    token: "test-token",
+    originKind: "pi-web",
+    instanceKey: "short",
+  });
+  config = await getRuntimeConfig();
+  assert.equal(config.piWebOriginConfigured, true);
+  assert.equal(config.instanceKey, "", "invalid instanceKey must be rejected");
+
+  writeConfig(t, {
+    endpoint: "http://127.0.0.1:23118/notify",
+    token: "test-token",
+    originKind: "pi-web",
+    instanceKey: "has spaces!!",
+  });
+  config = await getRuntimeConfig();
+  assert.equal(config.instanceKey, "");
+
+  writeConfig(t, {
+    endpoint: "http://127.0.0.1:23118/notify",
+    token: "test-token",
+    originKind: "rpc",
+    instanceKey: KNOWN_INSTANCE,
+  });
+  config = await getRuntimeConfig();
+  assert.equal(config.piWebOriginConfigured, false, "non-pi-web originKind must not enable Web routing");
+
+  writeConfig(t, {
+    endpoint: "http://127.0.0.1:23118/notify",
+    token: "test-token",
+  });
+  process.env.PI_NOTIFY_ORIGIN_KIND = "pi-web";
+  process.env.PI_NOTIFY_INSTANCE_KEY = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+  config = await getRuntimeConfig();
+  assert.equal(config.piWebOriginConfigured, true);
+  assert.equal(config.instanceKey, "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+});
+
+test("runtime config rejects invalid originKind/instanceKey shape", async (t) => {
+  writeConfig(t, {
+    endpoint: "http://127.0.0.1:23118/notify",
+    token: "test-token",
+    originKind: 1,
+  });
+  let config = await getRuntimeConfig();
+  assert.equal(config.enabled, false);
+
+  writeConfig(t, {
+    endpoint: "http://127.0.0.1:23118/notify",
+    token: "test-token",
+    instanceKey: 42,
+  });
+  config = await getRuntimeConfig();
+  assert.equal(config.enabled, false);
+});
+
 test("agent_end uses live context, sanitizes text, and sends one bounded payload", async (t) => {
   writeConfig(t, {
     endpoint: "http://127.0.0.1:23118/notify",
@@ -248,15 +354,21 @@ test("agent_end uses live context, sanitizes text, and sends one bounded payload
   assert.match(requests[0].payload.tabTitle, /^π - actual-project$/);
   assert.doesNotMatch(requests[0].payload.sessionName, /[\u0000-\u001f\u007f]/);
   assert.ok([...requests[0].payload.body].length <= 220);
-  assert.doesNotMatch(requests[0].payload.body, /[\uD800-\uDFFF](?![\uDC00-\uDFFF])/u);
+  assert.equal(requests[0].payload.body.isWellFormed(), true);
+  assert.equal(requests[0].payload.routeVersion, 1);
+  assert.equal(requests[0].payload.notificationKind, "turn-complete");
+  assert.equal(requests[0].payload.originKind, "terminal");
+  assert.equal(typeof requests[0].payload.notificationId, "string");
+  assert.equal(requests[0].payload.notificationId.length, 36);
+  assert.equal(requests[0].payload.instanceKey, undefined);
+  assert.equal(requests[0].payload.routingKey, undefined);
 });
 
-test("ask-user prompt sends one targeted notification before turn end", async (t) => {
+test("dynamic title prefers an explicit session name", async (t) => {
   writeConfig(t, {
     endpoint: "http://127.0.0.1:23118/notify",
     token: "test-token",
     messageMode: "dynamic",
-    remoteHostAlias: "my",
   });
   const requests = [];
   globalThis.fetch = async (_endpoint, options) => {
@@ -266,67 +378,28 @@ test("ask-user prompt sends one targeted notification before turn end", async (t
 
   const runtime = createFakePi();
   remoteWindowsNotify(runtime.pi);
-  const sessionId = "prompt-session-id";
   const context = createContext({
     sessionManager: {
-      getSessionName: () => "prompt-session",
-      getSessionId: () => sessionId,
+      getSessionName: () => "named-session",
     },
   });
   await runtime.emit("session_start", { type: "session_start" }, context);
-  const longHeader = `进程\n模型${"😀".repeat(230)}`;
-  await runtime.emitEvent(ASK_USER_PROMPT_EVENT, {
-    questions: [{ header: longHeader, question: "选择进程模型", options: [] }],
-  });
-  await runtime.emitEvent("unrelated:custom-ui", {});
+  await runtime.emit(
+    "agent_end",
+    {
+      type: "agent_end",
+      messages: [
+        { role: "user", content: "latest user request" },
+        { role: "assistant", content: "completed" },
+      ],
+    },
+    context,
+  );
 
-  const expectedKey = createHash("sha256").update(sessionId).digest("hex").slice(0, 12);
   assert.equal(requests.length, 1);
-  assert.equal(requests[0].focusTarget, "my");
-  assert.equal(requests[0].cwdBase, "actual-project");
-  assert.equal(requests[0].sessionName, "prompt-session");
-  assert.match(requests[0].tabTitle, new RegExp(` · #${expectedKey}$`));
-  assert.match(requests[0].body, /^等待回答：进程 模型/);
-  assert.ok([...requests[0].body].length <= 220);
-  assert.doesNotMatch(requests[0].body, /[\u0000-\u001f\u007f]/);
-
-  await runtime.emit("agent_end", { type: "agent_end", messages: [] }, context);
-  assert.equal(requests.length, 2, "the later turn-complete notification remains a separate state");
-
-  // Network failures from waiting notifications must not surface to the prompt event path.
-  let failureCount = 0;
-  globalThis.fetch = async () => {
-    failureCount += 1;
-    throw new Error("listener unavailable");
-  };
-  await runtime.emitEvent(ASK_USER_PROMPT_EVENT, { questions: [{ header: "retry" }] });
-  assert.equal(failureCount, 1);
+  assert.equal(requests[0].title, "named-session");
+  assert.equal(requests[0].body, "已回复，等你输入 · completed");
 });
-
-test("static ask-user notification does not expose question content", async (t) => {
-  writeConfig(t, {
-    endpoint: "http://127.0.0.1:23118/notify",
-    token: "test-token",
-    messageMode: "static",
-    bodyTemplate: "cwd={cwdBase}",
-  });
-  let payload;
-  globalThis.fetch = async (_endpoint, options) => {
-    payload = JSON.parse(options.body);
-    return { ok: true };
-  };
-
-  const runtime = createFakePi();
-  remoteWindowsNotify(runtime.pi);
-  await runtime.emit("session_start", { type: "session_start" }, createContext());
-  await runtime.emitEvent(ASK_USER_PROMPT_EVENT, {
-    questions: [{ header: "secret-header", question: "secret-question", options: [{ label: "secret-option" }] }],
-  });
-
-  assert.equal(payload.body, "Pi 正在等待你的回答 · cwd=actual-project");
-  assert.doesNotMatch(JSON.stringify(payload), /secret-(?:header|question|option)/);
-});
-
 
 test("session identity makes same-cwd targets stable, distinct, and non-reversible", async (t) => {
   writeConfig(t, {
@@ -378,6 +451,10 @@ test("session identity makes same-cwd targets stable, distinct, and non-reversib
   assert.equal(titleWrites.length, 3);
   assert.ok(titleWrites.every((write) => write === `\u001b]0;${expectedTitle}\u0007`));
   assert.doesNotMatch(JSON.stringify(requests[0]), new RegExp(sessionId));
+  assert.equal(requests[0].originKind, "terminal");
+  assert.equal(requests[0].notificationKind, "turn-complete");
+  assert.equal(requests[0].instanceKey, undefined);
+  assert.equal(requests[0].routingKey, undefined);
 
   await runtime.emit("session_shutdown", { type: "session_shutdown" }, context);
   const secondSessionId = "private-session-beta";
@@ -496,6 +573,7 @@ test("independent runtimes notify with their own session and cwd identity", asyn
   assert.match(requests[0].tabTitle, new RegExp(` · #${keyA}$`));
   assert.match(requests[1].tabTitle, new RegExp(` · #${keyB}$`));
   assert.notEqual(requests[0].tabTitle, requests[1].tabTitle);
+  assert.notEqual(requests[0].notificationId, requests[1].notificationId);
 });
 
 test("resource-only factory load does not deactivate an active chat runtime", async (t) => {
@@ -651,4 +729,320 @@ test("worker processes do not register notification handlers", () => {
   assert.equal(runtime.count("agent_end"), 0);
   assert.equal(runtime.count("session_shutdown"), 0);
   assert.equal(runtime.countEvent(ASK_USER_PROMPT_EVENT), 0);
+});
+
+test("computePiWebRoutingKey matches shared algorithm vectors", () => {
+  assert.equal(computePiWebRoutingKey(KNOWN_INSTANCE, KNOWN_SESSION), KNOWN_ROUTING_KEY);
+  assert.equal(computePiWebRoutingKey(KNOWN_INSTANCE, KNOWN_SESSION).length, 64);
+  assert.equal(
+    computePiWebRoutingKey("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "stable-session"),
+    "981c588f3c44b20b1f42da56b1545edff7e32820095b6ef3e90ef9ffccb41c1f",
+  );
+  assert.notEqual(
+    computePiWebRoutingKey(KNOWN_INSTANCE, "sess-one"),
+    computePiWebRoutingKey(KNOWN_INSTANCE, "sess-two"),
+  );
+  assert.notEqual(
+    computePiWebRoutingKey("a", "bc"),
+    computePiWebRoutingKey("ab", "c"),
+    "NUL separators must prevent concatenation collisions",
+  );
+  assert.throws(() => computePiWebRoutingKey("", "s"));
+  assert.throws(() => computePiWebRoutingKey("i", ""));
+});
+
+test("buildNotifyRouteFields distinguishes TUI, plain RPC, and configured Pi Web", () => {
+  const piWebConfig = { piWebOriginConfigured: true, instanceKey: KNOWN_INSTANCE };
+  const noConfig = { piWebOriginConfigured: false, instanceKey: "" };
+
+  const tuiWithWebConfig = buildNotifyRouteFields("tui", piWebConfig, KNOWN_SESSION, "turn-complete");
+  assert.equal(tuiWithWebConfig.originKind, "terminal");
+  assert.equal(tuiWithWebConfig.routeVersion, 1);
+  assert.equal(tuiWithWebConfig.notificationKind, "turn-complete");
+  assert.equal(tuiWithWebConfig.instanceKey, undefined);
+  assert.equal(tuiWithWebConfig.routingKey, undefined);
+  assert.equal(typeof tuiWithWebConfig.notificationId, "string");
+  assert.equal(tuiWithWebConfig.notificationId.length, 36);
+
+  const plainRpc = buildNotifyRouteFields("rpc", noConfig, KNOWN_SESSION, "ask-user");
+  assert.equal(plainRpc.originKind, "terminal");
+  assert.equal(plainRpc.notificationKind, "ask-user");
+  assert.equal(plainRpc.instanceKey, undefined);
+  assert.equal(plainRpc.routingKey, undefined);
+
+  const configuredWeb = buildNotifyRouteFields("rpc", piWebConfig, KNOWN_SESSION, "turn-complete");
+  assert.equal(configuredWeb.originKind, "pi-web");
+  assert.equal(configuredWeb.instanceKey, KNOWN_INSTANCE);
+  assert.equal(configuredWeb.routingKey, KNOWN_ROUTING_KEY);
+  assert.equal(configuredWeb.notificationKind, "turn-complete");
+
+  const missingSession = buildNotifyRouteFields("rpc", piWebConfig, undefined, "turn-complete");
+  assert.equal(missingSession.originKind, "terminal");
+  assert.equal(missingSession.routingKey, undefined);
+
+  const invalidInstance = buildNotifyRouteFields(
+    "rpc",
+    { piWebOriginConfigured: true, instanceKey: "" },
+    KNOWN_SESSION,
+    "turn-complete",
+  );
+  assert.equal(invalidInstance.originKind, "terminal");
+  assert.equal(invalidInstance.routingKey, undefined);
+
+  const idA = buildNotifyRouteFields("tui", noConfig, undefined, "ask-user").notificationId;
+  const idB = buildNotifyRouteFields("tui", noConfig, undefined, "ask-user").notificationId;
+  assert.notEqual(idA, idB);
+  assert.notEqual(idA, randomUUID()); // smoke: ids are random UUIDs, not empty
+});
+
+test("configured Pi Web RPC emits full routing metadata without raw session ID", async (t) => {
+  process.env.PI_WEB_NO_OPEN = "1";
+  writeConfig(t, {
+    endpoint: "http://127.0.0.1:23118/notify",
+    token: "test-token",
+    messageMode: "static",
+    originKind: "pi-web",
+    instanceKey: KNOWN_INSTANCE,
+  });
+  const requests = [];
+  globalThis.fetch = async (_endpoint, options) => {
+    requests.push(JSON.parse(options.body));
+    return { ok: true };
+  };
+
+  const sessionId = KNOWN_SESSION;
+  const expectedKey = createHash("sha256").update(sessionId).digest("hex").slice(0, 12);
+  const runtime = createFakePi();
+  remoteWindowsNotify(runtime.pi);
+  const context = createContext({
+    mode: "rpc",
+    sessionManager: {
+      getSessionName: () => "web-session",
+      getSessionId: () => sessionId,
+    },
+  });
+  await runtime.emit("session_start", { type: "session_start" }, context);
+  await runtime.emitEvent(ASK_USER_PROMPT_EVENT, { questions: [{ header: "pick" }] });
+  await runtime.emit("agent_end", { type: "agent_end", messages: [] }, context);
+
+  assert.equal(requests.length, 2);
+  for (const payload of requests) {
+    assert.equal(payload.routeVersion, 1);
+    assert.equal(payload.originKind, "pi-web");
+    assert.equal(payload.instanceKey, KNOWN_INSTANCE);
+    assert.equal(payload.routingKey, KNOWN_ROUTING_KEY);
+    assert.equal(payload.routingKey, expectedRoutingKey(KNOWN_INSTANCE, sessionId));
+    assert.match(payload.tabTitle, new RegExp(` · #${expectedKey}$`));
+    assertNoRawSessionLeak(payload, sessionId);
+  }
+  assert.equal(requests[0].notificationKind, "ask-user");
+  assert.equal(requests[1].notificationKind, "turn-complete");
+  assert.notEqual(requests[0].notificationId, requests[1].notificationId);
+});
+
+test("TUI stays terminal even when Pi Web origin config is present", async (t) => {
+  process.env.PI_WEB_NO_OPEN = "1";
+  writeConfig(t, {
+    endpoint: "http://127.0.0.1:23118/notify",
+    token: "test-token",
+    messageMode: "static",
+    originKind: "pi-web",
+    instanceKey: KNOWN_INSTANCE,
+  });
+  const requests = [];
+  globalThis.fetch = async (_endpoint, options) => {
+    requests.push(JSON.parse(options.body));
+    return { ok: true };
+  };
+
+  const sessionId = "tui-must-remain-terminal";
+  const runtime = createFakePi();
+  remoteWindowsNotify(runtime.pi);
+  await runtime.emit(
+    "agent_end",
+    { type: "agent_end", messages: [] },
+    createContext({
+      mode: "tui",
+      sessionManager: {
+        getSessionName: () => "tui-session",
+        getSessionId: () => sessionId,
+      },
+    }),
+  );
+
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].originKind, "terminal");
+  assert.equal(requests[0].instanceKey, undefined);
+  assert.equal(requests[0].routingKey, undefined);
+  assert.equal(requests[0].notificationKind, "turn-complete");
+  assertNoRawSessionLeak(requests[0], sessionId);
+});
+
+test("RPC without explicit pi-web config does not invent Web route fields", async (t) => {
+  writeConfig(t, {
+    endpoint: "http://127.0.0.1:23118/notify",
+    token: "test-token",
+    messageMode: "static",
+  });
+  let payload;
+  globalThis.fetch = async (_endpoint, options) => {
+    payload = JSON.parse(options.body);
+    return { ok: true };
+  };
+
+  const sessionId = "rpc-without-web-config";
+  const runtime = createFakePi();
+  remoteWindowsNotify(runtime.pi);
+  await runtime.emit(
+    "agent_end",
+    { type: "agent_end", messages: [] },
+    createContext({
+      mode: "rpc",
+      sessionManager: {
+        getSessionName: () => "rpc-session",
+        getSessionId: () => sessionId,
+      },
+    }),
+  );
+
+  assert.equal(payload.originKind, "terminal");
+  assert.equal(payload.routeVersion, 1);
+  assert.equal(payload.notificationKind, "turn-complete");
+  assert.equal(payload.instanceKey, undefined);
+  assert.equal(payload.routingKey, undefined);
+  assertNoRawSessionLeak(payload, sessionId);
+});
+
+test("missing or invalid Pi Web instance metadata fails closed but still notifies", async (t) => {
+  process.env.PI_WEB_NO_OPEN = "1";
+  writeConfig(t, {
+    endpoint: "http://127.0.0.1:23118/notify",
+    token: "test-token",
+    messageMode: "static",
+    originKind: "pi-web",
+    // too short / invalid after normalize
+    instanceKey: "bad",
+  });
+  let payload;
+  globalThis.fetch = async (_endpoint, options) => {
+    payload = JSON.parse(options.body);
+    return { ok: true };
+  };
+
+  const sessionId = "web-missing-instance";
+  const runtime = createFakePi();
+  remoteWindowsNotify(runtime.pi);
+  await runtime.emit(
+    "agent_end",
+    { type: "agent_end", messages: [] },
+    createContext({
+      mode: "rpc",
+      sessionManager: {
+        getSessionId: () => sessionId,
+      },
+    }),
+  );
+
+  assert.equal(payload.originKind, "terminal");
+  assert.equal(payload.instanceKey, undefined);
+  assert.equal(payload.routingKey, undefined);
+  assert.equal(payload.routeVersion, 1);
+  assert.equal(payload.notificationKind, "turn-complete");
+  assert.ok(payload.title);
+  assert.ok(payload.body);
+  assertNoRawSessionLeak(payload, sessionId);
+});
+
+test("linux and windows extension templates stay byte-identical", () => {
+  const linux = readFileSync(
+    new URL("../linux/extensions/remote-windows-notify.ts", import.meta.url),
+  );
+  const windows = readFileSync(new URL("../windows/remote-windows-notify.ts", import.meta.url));
+  assert.equal(Buffer.compare(linux, windows), 0);
+});
+
+test("static mode waiting notification does not expose question content", async (t) => {
+  writeConfig(t, {
+    endpoint: "http://127.0.0.1:23118/notify",
+    token: "test-token",
+    messageMode: "static",
+    bodyTemplate: "cwd={cwdBase}",
+  });
+  let payload;
+  globalThis.fetch = async (_endpoint, options) => {
+    payload = JSON.parse(options.body);
+    return { ok: true };
+  };
+
+  const runtime = createFakePi();
+  remoteWindowsNotify(runtime.pi);
+  await runtime.emit("session_start", { type: "session_start" }, createContext());
+  await runtime.emitEvent(ASK_USER_PROMPT_EVENT, {
+    questions: [{ header: "secret-header", question: "secret-question", options: [{ label: "secret-option" }] }],
+  });
+
+  assert.equal(payload.body, "Pi 正在等待你的回答 · cwd=actual-project");
+  assert.doesNotMatch(JSON.stringify(payload), /secret-(?:header|question|option)/);
+  assert.equal(payload.notificationKind, "ask-user");
+  assert.equal(payload.routeVersion, 1);
+});
+
+test("ask-user prompt sends one targeted notification before turn end", async (t) => {
+  writeConfig(t, {
+    endpoint: "http://127.0.0.1:23118/notify",
+    token: "test-token",
+    messageMode: "dynamic",
+    remoteHostAlias: "my",
+  });
+  const requests = [];
+  globalThis.fetch = async (_endpoint, options) => {
+    requests.push(JSON.parse(options.body));
+    return { ok: true };
+  };
+
+  const runtime = createFakePi();
+  remoteWindowsNotify(runtime.pi);
+  const sessionId = "prompt-session-id";
+  const context = createContext({
+    sessionManager: {
+      getSessionName: () => "prompt-session",
+      getSessionId: () => sessionId,
+    },
+  });
+  await runtime.emit("session_start", { type: "session_start" }, context);
+  const longHeader = ["进程", "模型" + "😀".repeat(230)].join("\n");
+  await runtime.emitEvent(ASK_USER_PROMPT_EVENT, {
+    questions: [{ header: longHeader, question: "选择进程模型", options: [] }],
+  });
+  await runtime.emitEvent("unrelated:custom-ui", {});
+
+  const expectedKey = createHash("sha256").update(sessionId).digest("hex").slice(0, 12);
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].focusTarget, "my");
+  assert.equal(requests[0].cwdBase, "actual-project");
+  assert.equal(requests[0].sessionName, "prompt-session");
+  assert.match(requests[0].tabTitle, new RegExp(` · #${expectedKey}$`));
+  assert.match(requests[0].body, new RegExp("^等待回答：进程 模型"));
+  assert.ok([...requests[0].body].length <= 220);
+  assert.doesNotMatch(requests[0].body, /[\u0000-\u001f\u007f]/);
+  assert.equal(requests[0].notificationKind, "ask-user");
+  assert.equal(requests[0].originKind, "terminal");
+  assert.equal(requests[0].routeVersion, 1);
+  assert.equal(typeof requests[0].notificationId, "string");
+  assert.equal(requests[0].notificationId.length, 36);
+  assertNoRawSessionLeak(requests[0], sessionId);
+
+  await runtime.emit("agent_end", { type: "agent_end", messages: [] }, context);
+  assert.equal(requests.length, 2, "the later turn-complete notification remains a separate state");
+  assert.equal(requests[1].notificationKind, "turn-complete");
+  assert.notEqual(requests[0].notificationId, requests[1].notificationId);
+
+  // Network failures from waiting notifications must not surface to the prompt event path.
+  let failureCount = 0;
+  globalThis.fetch = async () => {
+    failureCount += 1;
+    throw new Error("listener unavailable");
+  };
+  await runtime.emitEvent(ASK_USER_PROMPT_EVENT, { questions: [{ header: "retry" }] });
+  assert.equal(failureCount, 1);
 });
