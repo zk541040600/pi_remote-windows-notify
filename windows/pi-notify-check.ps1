@@ -81,7 +81,7 @@ if ((Test-Path -LiteralPath $linuxExtensionPath) -and (Test-Path -LiteralPath $w
 }
 elseif (Test-Path -LiteralPath $flatExtensionPath) {
     $flatExtension = [string]$sourceText['remote-windows-notify.ts']
-    if ($flatExtension -notmatch '__piRemoteWindowsNotifyActiveToken' -or $flatExtension -match '__piRemoteWindowsNotifyRegistered' -or $flatExtension -match 'cachedConfigPromise' -or $flatExtension -notmatch '127\.0\.0\.1:23118/notify' -or $flatExtension -notmatch 'getExtensionConfigPaths' -or $flatExtension -notmatch 'fileURLToPath\(import\.meta\.url\)') {
+    if ($flatExtension -match '__piRemoteWindowsNotifyActiveToken' -or $flatExtension -match '__piRemoteWindowsNotifyRegistered' -or $flatExtension -notmatch 'const lifecycleController = new AbortController\(\)' -or $flatExtension -notmatch 'promptUnsubscribe\(\)' -or $flatExtension -match 'cachedConfigPromise' -or $flatExtension -notmatch '127\.0\.0\.1:23118/notify' -or $flatExtension -notmatch 'getExtensionConfigPaths' -or $flatExtension -notmatch 'fileURLToPath\(import\.meta\.url\)') {
         throw 'Flat extension template is stale.'
     }
     Write-Host 'OK flat extension template is current'

@@ -79,7 +79,10 @@ forbidPattern(
 
 const windowsCheck = read("windows/pi-notify-check.ps1");
 requirePattern(windowsCheck, /pi-notify-ensure\.mjs["']?\s+--check/, "Windows check must invoke read-only ownership verification");
-requirePattern(windowsCheck, /__piRemoteWindowsNotifyActiveToken/, "Windows check must require the active-token lifecycle marker");
+requirePattern(windowsCheck, /\$flatExtension -match '__piRemoteWindowsNotifyActiveToken'/, "Windows check must reject the removed process-global active token");
+forbidPattern(windowsCheck, /\$flatExtension -notmatch '__piRemoteWindowsNotifyActiveToken'/, "Windows check must not require the removed process-global active token");
+requirePattern(windowsCheck, /const lifecycleController = new AbortController\\\(\\\)/, "Windows check must require runtime-local lifecycle ownership");
+requirePattern(windowsCheck, /promptUnsubscribe\\\(\\\)/, "Windows check must require prompt handler cleanup");
 requirePattern(windowsCheck, /pi-notify-qq-sender\.ps1/, "Windows check must cover the QQ worker runtime file");
 
 const common = read("windows/NotifyBridge.Common.ps1");
