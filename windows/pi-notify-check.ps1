@@ -6,6 +6,25 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+# Treat a failure as recent by its timestamp, not by indefinite retention in a quiet log tail.
+function Test-NotifyRecentLogEntry {
+    [CmdletBinding()]
+    param(
+        [string]$Line,
+        [Parameter(Mandatory = $true)][datetime]$Cutoff
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Line) -or $Line -notmatch '^\[(?<Timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3})\]') {
+        return $true
+    }
+
+    $timestamp = [datetime]::MinValue
+    if (-not [datetime]::TryParseExact($Matches.Timestamp, 'yyyy-MM-dd HH:mm:ss.fff', [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeLocal, [ref]$timestamp)) {
+        return $true
+    }
+    return $timestamp -ge $Cutoff
+}
+
 $parentDir = Split-Path -Parent $PSScriptRoot
 $repoDir = if ((Test-Path -LiteralPath (Join-Path $PSScriptRoot 'remote-windows-notify.ts')) -and -not (Test-Path -LiteralPath (Join-Path $parentDir 'linux\extensions\remote-windows-notify.ts'))) {
     $PSScriptRoot
@@ -883,9 +902,10 @@ if ($null -ne $cfg) {
         throw 'Resident hotkey must have exactly one running worker when popupHotkeyEnabled=true. Run pi-notify-refresh.ps1 -SyncRemote.'
     }
 
+    $recentLogCutoff = (Get-Date).AddMinutes(-10)
     $tunnelLog = Join-Path $runtimeBaseDir 'logs\tunnel.log'
     if (Test-Path -LiteralPath $tunnelLog) {
-        $recentTunnelFailures = @(Get-Content -LiteralPath $tunnelLog -Tail 20 | Where-Object { $_ -match 'tunnel-exit code=255 retry=' })
+        $recentTunnelFailures = @(Get-Content -LiteralPath $tunnelLog -Tail 20 | Where-Object { $_ -match 'tunnel-exit code=255 retry=' -and (Test-NotifyRecentLogEntry -Line $_ -Cutoff $recentLogCutoff) })
         if ($recentTunnelFailures.Count -gt 0) {
             $recentTunnelFailures | Select-Object -First 5 | ForEach-Object { Write-Host $_ }
             throw 'Recent reverse tunnel retry failures found.'
@@ -894,14 +914,14 @@ if ($null -ne $cfg) {
     $watchdogLog = Join-Path $runtimeBaseDir 'logs\watchdog.log'
     if (Test-Path -LiteralPath $watchdogLog) {
         $watchdogLines = @(Get-Content -LiteralPath $watchdogLog -Tail 40)
-        $recentWatchdogFailures = @($watchdogLines | Where-Object { $_ -match 'watchdog-error|duplicate-tunnel|stale-broker' })
+        $recentWatchdogFailures = @($watchdogLines | Where-Object { $_ -match 'watchdog-error|duplicate-tunnel|stale-broker' -and (Test-NotifyRecentLogEntry -Line $_ -Cutoff $recentLogCutoff) })
         if ($recentWatchdogFailures.Count -gt 0) {
             $recentWatchdogFailures | Select-Object -First 5 | ForEach-Object { Write-Host $_ }
             throw 'Recent watchdog error, duplicate tunnel, or stale broker repair found.'
         }
         # stale-listener lines are expected when health is false; only flag false-positive
         # restarts where listenerOk=True and duplicate=False (shape-only false restarts).
-        $recentStaleListenerRestarts = @($watchdogLines | Where-Object { $_ -match 'stale-listener' -and $_ -match 'listenerOk=True' -and $_ -match 'duplicate=False' })
+        $recentStaleListenerRestarts = @($watchdogLines | Where-Object { $_ -match 'stale-listener' -and $_ -match 'listenerOk=True' -and $_ -match 'duplicate=False' -and (Test-NotifyRecentLogEntry -Line $_ -Cutoff $recentLogCutoff) })
         if ($recentStaleListenerRestarts.Count -gt 0) {
             $recentStaleListenerRestarts | Select-Object -First 5 | ForEach-Object { Write-Host $_ }
             throw 'Recent false stale-listener restart while listenerOk=True and duplicate=False found.'

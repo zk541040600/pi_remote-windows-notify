@@ -83,6 +83,8 @@ requirePattern(windowsCheck, /\$flatExtension -match '__piRemoteWindowsNotifyAct
 forbidPattern(windowsCheck, /\$flatExtension -notmatch '__piRemoteWindowsNotifyActiveToken'/, "Windows check must not require the removed process-global active token");
 requirePattern(windowsCheck, /const lifecycleController = new AbortController\\\(\\\)/, "Windows check must require runtime-local lifecycle ownership");
 requirePattern(windowsCheck, /promptUnsubscribe\\\(\\\)/, "Windows check must require prompt handler cleanup");
+requirePattern(windowsCheck, /function Test-NotifyRecentLogEntry/, "Windows check must age out historical runtime repair logs");
+requirePattern(windowsCheck, /\$recentLogCutoff = \(Get-Date\)\.AddMinutes\(-10\)/, "Windows check must use a bounded runtime log window");
 requirePattern(windowsCheck, /pi-notify-qq-sender\.ps1/, "Windows check must cover the QQ worker runtime file");
 
 const common = read("windows/NotifyBridge.Common.ps1");
