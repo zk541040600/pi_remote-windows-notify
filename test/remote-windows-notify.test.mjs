@@ -364,7 +364,7 @@ test("agent_end uses live context, sanitizes text, and sends one bounded payload
   assert.equal(requests[0].payload.routingKey, undefined);
 });
 
-test("dynamic title prefers an explicit session name", async (t) => {
+test("dynamic title uses the explicit or Pi Web display session name", async (t) => {
   writeConfig(t, {
     endpoint: "http://127.0.0.1:23118/notify",
     token: "test-token",
@@ -399,6 +399,29 @@ test("dynamic title prefers an explicit session name", async (t) => {
   assert.equal(requests.length, 1);
   assert.equal(requests[0].title, "named-session");
   assert.equal(requests[0].body, "已回复，等你输入 · completed");
+
+  const unnamedRuntime = createFakePi();
+  remoteWindowsNotify(unnamedRuntime.pi);
+  const unnamedContext = createContext();
+  await unnamedRuntime.emit("session_start", { type: "session_start" }, unnamedContext);
+  await unnamedRuntime.emit(
+    "agent_end",
+    {
+      type: "agent_end",
+      messages: [
+        { role: "user", content: "sidebar session title" },
+        { role: "assistant", content: "first answer" },
+        { role: "user", content: "latest user request" },
+        { role: "assistant", content: "completed" },
+      ],
+    },
+    unnamedContext,
+  );
+
+  assert.equal(requests.length, 2);
+  assert.equal(requests[1].title, "sidebar session title");
+  assert.equal(requests[1].sessionName, "sidebar session title");
+  assert.equal(requests[1].body, "已回复，等你输入 · completed");
 });
 
 test("session identity makes same-cwd targets stable, distinct, and non-reversible", async (t) => {

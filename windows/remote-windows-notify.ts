@@ -329,12 +329,12 @@ function buildDynamicNotification(
   messages: AgentMessageLike[],
   config: RuntimeConfig,
   cwd: string,
-  explicitSessionName?: string,
+  sessionName?: string,
 ): { title: string; body: string } {
   const userPrompt = normalizeText(findTextForRole(messages, "user", true), "", 72);
   const assistantText = normalizeText(findTextForRole(messages, "assistant", true), "", 120);
   const { toolNames, hasToolError, hasTrailingToolError } = collectToolInfo(messages);
-  const title = normalizeText(explicitSessionName || userPrompt || assistantText || config.title, "Pi", 72);
+  const title = normalizeText(sessionName || userPrompt || assistantText || config.title, "Pi", 72);
   const hasUnresolvedError = hasTrailingToolError || (hasToolError && assistantTextSignalsProblem(assistantText));
   const status = hasUnresolvedError ? "有报错，等你看" : toolNames.length > 0 ? "已完成，等你确认" : "已回复，等你输入";
   const bodyParts = [status];
@@ -737,7 +737,7 @@ export default function remoteWindowsNotify(pi: ExtensionAPI): void {
     const target = getNotifyTarget(snapshot.cwd, explicitSessionName, sessionKey);
     const payload = config.messageMode === "static"
       ? { title: config.title, body: renderBody(config.bodyTemplate, snapshot.cwd) }
-      : buildDynamicNotification(messages, config, snapshot.cwd, explicitSessionName);
+      : buildDynamicNotification(messages, config, snapshot.cwd, sessionName);
     const route = buildNotifyRouteFields(snapshot.mode, config, snapshot.rawSessionId, "turn-complete");
 
     currentSnapshot = snapshot;
