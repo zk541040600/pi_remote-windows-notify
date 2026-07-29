@@ -89,7 +89,13 @@ public static class Program
         }
 
         var pipeName = GetOption(args, "--pipe") ?? ProtocolConstants.DefaultPipeName;
-        var state = new RouteStateMachine();
+        var statePath = GetOption(args, "--state-file")
+            ?? Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "PiNotifyRouteHost",
+                "route-preferences.json");
+        var state = new RouteStateMachine(
+            preferences: new FileRoutePreferenceStore(statePath));
         var dispatcher = new RouteDispatcher(state);
         await using var server = new NamedPipeRouteServer(dispatcher, pipeName);
         server.Start();

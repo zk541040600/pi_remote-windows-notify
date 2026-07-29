@@ -11,7 +11,7 @@ import { fileURLToPath } from 'node:url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const root = join(__dirname, '..');
-const version = '0.1.0';
+const version = '0.1.1';
 const extensionKey = readFileSync(join(root, 'extension-public-key.txt'), 'utf8').trim();
 const extensionId = [...createHash('sha256').update(Buffer.from(extensionKey, 'base64')).digest('hex').slice(0, 32)]
   .map((nibble) => String.fromCharCode('a'.charCodeAt(0) + Number.parseInt(nibble, 16)))

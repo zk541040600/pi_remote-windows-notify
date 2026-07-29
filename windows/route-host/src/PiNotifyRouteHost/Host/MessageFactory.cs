@@ -45,7 +45,10 @@ public static class MessageFactory
         string instanceKey,
         string routingKey,
         string? pageFingerprint = null,
-        int? leaseTtlMs = null)
+        int? leaseTtlMs = null,
+        string? ownerEvent = null,
+        string? openEventId = null,
+        long? openedAtMs = null)
     {
         var msg = Create(MessageTypes.RegisterOwner, clock);
         msg.AdapterKey = adapterKey;
@@ -55,6 +58,9 @@ public static class MessageFactory
         msg.RoutingKey = routingKey;
         msg.PageFingerprint = pageFingerprint;
         msg.LeaseTtlMs = leaseTtlMs;
+        msg.OwnerEvent = ownerEvent;
+        msg.OpenEventId = openEventId;
+        msg.OpenedAtMs = openedAtMs;
         return msg;
     }
 

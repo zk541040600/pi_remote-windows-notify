@@ -23,6 +23,7 @@ import { ActivationPoller } from '../core/activation-poller.mjs';
 import {
   isWakeMessage,
   dispatchWakeToPoller,
+  recoverAdapterRegistration,
   refreshLiveOwnerLeases,
   shouldRunWakeMaintenance,
   validateWakeMessage,
@@ -69,6 +70,8 @@ let lastWakeMaintenanceMs = 0;
 let lastInvalidWakeLogMs = Number.NEGATIVE_INFINITY;
 /** Shared lease refresh promise prevents interval/wake overlap. */
 let leaseRefreshPromise = null;
+/** Shared daemon-state recovery promise prevents overlapping wake re-registration. */
+let registrationRecoveryPromise = null;
 
 const chromeApi = globalThis.chrome;
 
@@ -242,6 +245,59 @@ async function refreshLeases(opts = {}) {
   return leaseRefreshPromise;
 }
 
+/**
+ * Rebuild daemon-side adapter/owner state after an authoritative adapter-unknown
+ * response. A daemon restart clears leases but does not necessarily disconnect the
+ * long-lived Chrome Native Messaging port, so the normal onConnectionChange handler
+ * may never run.
+ *
+ * Owner recovery remains fail-closed: enumerateTabs only observes currently live
+ * tabs, and OwnerRegistry registers only trusted origins with a valid session.
+ *
+ * @param {{ source?: string }} [opts]
+ * @returns {Promise<{ action: string, ownerCount?: number, reason?: string }>}
+ */
+async function recoverRouteRegistrations(opts = {}) {
+  if (!registry || !native?.isConnected) {
+    return { action: 'skipped', reason: 'disconnected' };
+  }
+  if (registrationRecoveryPromise) return registrationRecoveryPromise;
+
+  const activeRegistry = registry;
+  const source = opts.source || 'adapter-state-lost';
+  registrationRecoveryPromise = (async () => {
+    const outcome = await recoverAdapterRegistration({
+      registry: activeRegistry,
+      enumerateTabs,
+      isCurrent: () => registry === activeRegistry && Boolean(native?.isConnected),
+    });
+    if (outcome.action === 'recovered') {
+      log.info('route-registration-recovered', {
+        source,
+        ownerCount: outcome.ownerCount ?? 0,
+      });
+    } else if (outcome.action === 'failed') {
+      log.warn('route-registration-recovery-failed', {
+        reason: outcome.reason || 'error',
+        source,
+      });
+    }
+    return outcome;
+  })()
+    .catch((err) => {
+      log.warn('route-registration-recovery-failed', {
+        reason: err?.message || 'error',
+        source,
+      });
+      return { action: 'failed', reason: err?.message || 'error' };
+    })
+    .finally(() => {
+      registrationRecoveryPromise = null;
+    });
+
+  return registrationRecoveryPromise;
+}
+
 function startHeartbeat() {
   if (heartbeatTimer != null) {
     clearInterval(heartbeatTimer);
@@ -284,6 +340,8 @@ export async function handleWakeMessage(raw, opts = {}) {
   try {
     const out = await dispatchWakeToPoller(raw, ensureActivationPoller(), {
       validate: false,
+      onAdapterStateLost: () =>
+        recoverRouteRegistrations({ source: 'wake-adapter-unknown' }),
     });
     if (runMaintenance) await refreshLeases({ source: 'wake' });
     return out;
@@ -421,9 +479,8 @@ async function onActivate(raw) {
     elapsedMs: outcome.elapsedMs,
   });
 
-  // Preserve the inbound requestId for correlation; activationRequestId is authoritative for daemon status.
-  resultMsg.requestId = command.requestId;
-  resultMsg.activationRequestId = command.activationRequestId || command.requestId;
+  // The result envelope keeps its generated requestId. Reusing the activate requestId would hit
+  // daemon replay protection; activationRequestId is the authoritative correlation field.
 
   try {
     if (native?.isConnected) {
@@ -486,6 +543,7 @@ function wireTabListeners() {
             tabId: details.tabId,
             windowId: tab.windowId,
             url: details.url || tab.url,
+            explicitOpen: true,
           })
           .catch(() => {});
       });
@@ -503,6 +561,7 @@ function wireTabListeners() {
             tabId: details.tabId,
             windowId: tab.windowId,
             url: details.url || tab.url,
+            explicitOpen: true,
           })
           .catch(() => {});
       });
@@ -584,6 +643,7 @@ export const __test = {
   handleWakeMessage,
   isWakeMessage,
   refreshLeases,
+  recoverRouteRegistrations,
   RouteResults,
   MessageTypes,
 };

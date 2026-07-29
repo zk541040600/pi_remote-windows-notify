@@ -54,13 +54,13 @@ public static class MessageValidator
         if (Exceeds(msg.AdapterKey) || Exceeds(msg.OwnerKey) || Exceeds(msg.PageKey) ||
             Exceeds(msg.InstanceKey) || Exceeds(msg.RoutingKey) || Exceeds(msg.NotificationId) ||
             Exceeds(msg.SnapshotId) || Exceeds(msg.ProfileKey) || Exceeds(msg.PageFingerprint) ||
-            Exceeds(msg.ActivationRequestId))
+            Exceeds(msg.ActivationRequestId) || Exceeds(msg.OpenEventId))
         {
             return RouteResponse.Reject(msg.RequestId, RouteResults.Rejected, RejectReasons.InvalidField);
         }
 
         if (ExceedsLabel(msg.AdapterKind) || ExceedsLabel(msg.BrowserKind) || ExceedsLabel(msg.NotificationKind) ||
-            ExceedsLabel(msg.Result) || ExceedsLabel(msg.Reason))
+            ExceedsLabel(msg.Result) || ExceedsLabel(msg.Reason) || ExceedsLabel(msg.OwnerEvent))
         {
             return RouteResponse.Reject(msg.RequestId, RouteResults.Rejected, RejectReasons.InvalidField);
         }
@@ -117,6 +117,36 @@ public static class MessageValidator
         // routingKey must be full SHA-256 hex (64 chars) or base64url-ish opaque of similar length.
         if (msg.RoutingKey!.Length < 32 || msg.RoutingKey.Length > ProtocolConstants.MaxOpaqueFieldLength)
         {
+            return RouteResponse.Reject(msg.RequestId, RouteResults.Rejected, RejectReasons.InvalidField);
+        }
+
+        if (msg.OwnerEvent is not null &&
+            msg.OwnerEvent is not OwnerEvents.ExplicitOpen and not OwnerEvents.Restore)
+        {
+            return RouteResponse.Reject(msg.RequestId, RouteResults.Rejected, RejectReasons.InvalidField);
+        }
+
+        if (string.Equals(msg.OwnerEvent, OwnerEvents.ExplicitOpen, StringComparison.Ordinal))
+        {
+            if (string.IsNullOrWhiteSpace(msg.OpenEventId) ||
+                !IsOpaqueId(msg.OpenEventId!) ||
+                msg.OpenedAtMs is not long openedAtMs ||
+                openedAtMs <= 0)
+            {
+                return RouteResponse.Reject(msg.RequestId, RouteResults.Rejected, RejectReasons.MissingField);
+            }
+
+            // Both clients and daemon run in the same Windows user session. Bound bad/future
+            // metadata so a corrupt client clock cannot permanently dominate routing.
+            if (openedAtMs > msg.IssuedAtMs + 60_000 ||
+                openedAtMs < msg.IssuedAtMs - 24 * 60 * 60_000L)
+            {
+                return RouteResponse.Reject(msg.RequestId, RouteResults.Rejected, RejectReasons.InvalidField);
+            }
+        }
+        else if (msg.OpenEventId is not null || msg.OpenedAtMs is not null)
+        {
+            // Restore/legacy publications never carry ordering metadata.
             return RouteResponse.Reject(msg.RequestId, RouteResults.Rejected, RejectReasons.InvalidField);
         }
 

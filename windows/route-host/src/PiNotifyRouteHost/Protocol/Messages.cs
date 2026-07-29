@@ -72,6 +72,21 @@ public sealed class RouteMessage
     [JsonPropertyName("pageFingerprint")]
     public string? PageFingerprint { get; set; }
 
+    /// <summary>
+    /// Owner publication intent. "explicit-open" is emitted only for a real document/session
+    /// open; "restore" is used for lease refresh, reconnect, enumeration, and daemon recovery.
+    /// </summary>
+    [JsonPropertyName("ownerEvent")]
+    public string? OwnerEvent { get; set; }
+
+    /// <summary>Opaque idempotency key for one explicit document/session open.</summary>
+    [JsonPropertyName("openEventId")]
+    public string? OpenEventId { get; set; }
+
+    /// <summary>Client wall-clock time of the explicit open (Unix epoch milliseconds).</summary>
+    [JsonPropertyName("openedAtMs")]
+    public long? OpenedAtMs { get; set; }
+
     // --- freeze / activate ---
 
     [JsonPropertyName("notificationId")]

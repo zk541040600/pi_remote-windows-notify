@@ -57,6 +57,14 @@ public readonly record struct SessionRouteKey(string InstanceKey, string Routing
     public override string ToString() => InstanceKey + "\0" + RoutingKey;
 }
 
+public sealed class OwnerPreference
+{
+    public required string AdapterKey { get; init; }
+    public required string OpenEventId { get; init; }
+    public long OpenedAtMs { get; init; }
+    public long Revision { get; init; }
+}
+
 /// <summary>In-process hook so unit tests can exercise activate without real pipes.</summary>
 public interface IAdapterActivator
 {

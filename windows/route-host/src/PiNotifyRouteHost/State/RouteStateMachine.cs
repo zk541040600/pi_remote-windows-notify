@@ -10,6 +10,7 @@ namespace PiNotifyRouteHost.State;
 public sealed class RouteStateMachine
 {
     private readonly IClock _clock;
+    private readonly IRoutePreferenceStore _preferences;
     private readonly object _gate = new();
     private readonly Dictionary<string, LiveAdapter> _adapters = new(StringComparer.Ordinal);
     private readonly Dictionary<string, LiveOwner> _ownersByKey = new(StringComparer.Ordinal);
@@ -23,10 +24,14 @@ public sealed class RouteStateMachine
     private readonly Dictionary<string, Queue<string>> _pendingByAdapter = new(StringComparer.Ordinal);
     private readonly string _daemonId;
 
-    public RouteStateMachine(IClock? clock = null, string? daemonId = null)
+    public RouteStateMachine(
+        IClock? clock = null,
+        string? daemonId = null,
+        IRoutePreferenceStore? preferences = null)
     {
         _clock = clock ?? new SystemClock();
         _daemonId = daemonId ?? Guid.NewGuid().ToString("N");
+        _preferences = preferences ?? new MemoryRoutePreferenceStore();
     }
 
     public string DaemonId => _daemonId;
@@ -410,6 +415,21 @@ public sealed class RouteStateMachine
         var ttl = msg.LeaseTtlMs ?? ProtocolConstants.DefaultLeaseTtlMs;
         var sessionKey = new SessionRouteKey(msg.InstanceKey!, msg.RoutingKey!);
 
+        if (string.Equals(msg.OwnerEvent, OwnerEvents.ExplicitOpen, StringComparison.Ordinal) &&
+            !_preferences.TryRecordExplicitOpen(
+                sessionKey,
+                msg.AdapterKey!,
+                msg.OpenEventId!,
+                msg.OpenedAtMs!.Value,
+                out _))
+        {
+            // Do not acknowledge an ordering mutation that cannot survive daemon restart.
+            return RouteResponse.Reject(
+                msg.RequestId,
+                RouteResults.Rejected,
+                RejectReasons.PreferencePersistFailed);
+        }
+
         if (_ownersByKey.TryGetValue(msg.OwnerKey!, out var existing))
         {
             // Owner re-register: if session identity changes, move between session buckets.
@@ -613,18 +633,54 @@ public sealed class RouteStateMachine
 
         if (live.Count > 1)
         {
-            SafeLog.Info("freeze-ambiguous",
-                ("routeFp", RoutingKey.Fingerprint(routingKey)),
-                ("instanceFp", RoutingKey.FingerprintInstance(instanceKey)),
-                ("candidates", live.Count));
-            return new RouteResponse
+            var ranked = live
+                .Select(owner => new
+                {
+                    Owner = owner,
+                    Preference = _preferences.GetPreference(sessionKey, owner.AdapterKey),
+                })
+                .Where(item => item.Preference is not null)
+                .ToList();
+
+            // Never choose from a ranked subset. Every live owner must have valid durable
+            // metadata, otherwise an unranked restored/corrupt endpoint could be the real winner.
+            if (ranked.Count == live.Count)
             {
-                RequestId = msg.RequestId,
-                Result = RouteResults.Ambiguous,
-                CandidateCount = live.Count,
-                RoutingFingerprint = RoutingKey.Fingerprint(routingKey),
-                InstanceFingerprint = RoutingKey.FingerprintInstance(instanceKey),
-            };
+                var winnerPreference = ranked
+                    .Select(item => item.Preference!)
+                    .OrderByDescending(item => item.OpenedAtMs)
+                    .ThenByDescending(item => item.Revision)
+                    .First();
+                var winners = ranked
+                    .Where(item =>
+                        item.Preference!.OpenedAtMs == winnerPreference.OpenedAtMs &&
+                        item.Preference.Revision == winnerPreference.Revision)
+                    .Select(item => item.Owner)
+                    .ToList();
+
+                // One adapter may expose multiple same-session pages. Adapter rank cannot pick
+                // a tab safely, so retain the original fail-closed ambiguity in that case.
+                if (winners.Count == 1)
+                {
+                    live = winners;
+                }
+            }
+
+            if (live.Count > 1)
+            {
+                SafeLog.Info("freeze-ambiguous",
+                    ("routeFp", RoutingKey.Fingerprint(routingKey)),
+                    ("instanceFp", RoutingKey.FingerprintInstance(instanceKey)),
+                    ("candidates", live.Count));
+                return new RouteResponse
+                {
+                    RequestId = msg.RequestId,
+                    Result = RouteResults.Ambiguous,
+                    CandidateCount = live.Count,
+                    RoutingFingerprint = RoutingKey.Fingerprint(routingKey),
+                    InstanceFingerprint = RoutingKey.FingerprintInstance(instanceKey),
+                };
+            }
         }
 
         var owner = live[0];

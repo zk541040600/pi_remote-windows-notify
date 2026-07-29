@@ -14,6 +14,8 @@
 import {
   MessageTypes,
   PROTOCOL_VERSION,
+  RejectReasons,
+  RouteResults,
   WAKE_MAINTENANCE_INTERVAL_MS,
 } from './protocol.mjs';
 
@@ -116,6 +118,71 @@ export function shouldRunWakeMaintenance(args) {
 }
 
 /**
+ * A daemon restart intentionally clears all adapter/owner leases while the Chrome
+ * Native Messaging port can remain connected. In that state there is no disconnect
+ * event to trigger the normal post-connect registration path; the first wake-driven
+ * poll is the authoritative signal that the daemon forgot this adapter.
+ *
+ * Do not recover on generic daemon-unreachable failures: registration would only add
+ * traffic while the daemon is unavailable.
+ *
+ * @param {unknown} outcome
+ * @returns {boolean}
+ */
+export function shouldRecoverAdapterRegistration(outcome) {
+  if (!outcome || typeof outcome !== 'object') return false;
+  const result = /** @type {Record<string, unknown>} */ (outcome);
+  return (
+    result.result === RouteResults.AdapterUnavailable &&
+    result.reason === RejectReasons.AdapterUnknown
+  );
+}
+
+/**
+ * Recreate daemon-side state from a still-live browser registry after a daemon restart.
+ * The caller supplies live-tab enumeration so this core module never gains browser API
+ * access or an alternate owner-selection path.
+ *
+ * @param {{
+ *   registry: {
+ *     registerAdapter: () => Promise<unknown>,
+ *     listOwners: () => unknown[],
+ *   },
+ *   enumerateTabs: () => Promise<void>,
+ *   isCurrent?: () => boolean,
+ * }} args
+ * @returns {Promise<{ action: string, ownerCount?: number, reason?: string }>}
+ */
+export async function recoverAdapterRegistration(args) {
+  const isCurrent = args.isCurrent ?? (() => true);
+  if (!args.registry || !isCurrent()) {
+    return { action: 'skipped', reason: 'state-changed' };
+  }
+
+  const response = await args.registry.registerAdapter();
+  if (
+    !response ||
+    typeof response !== 'object' ||
+    /** @type {Record<string, unknown>} */ (response).result !== RouteResults.Ok
+  ) {
+    return { action: 'failed', reason: 'adapter-register-rejected' };
+  }
+  if (!isCurrent()) {
+    return { action: 'skipped', reason: 'state-changed' };
+  }
+
+  await args.enumerateTabs();
+  if (!isCurrent()) {
+    return { action: 'skipped', reason: 'state-changed' };
+  }
+
+  return {
+    action: 'recovered',
+    ownerCount: args.registry.listOwners().length,
+  };
+}
+
+/**
  * Refresh only owners whose current live tab still proves the same page/session route.
  * Uses owner heartbeat rather than register-owner, so a close/navigation race cannot
  * recreate an owner that an event handler already removed.
@@ -200,6 +267,7 @@ export async function refreshLiveOwnerLeases(args) {
  * @param {{
  *   validate?: boolean,
  *   onInvalid?: (reason: string) => void,
+ *   onAdapterStateLost?: (outcome: { action: string, result?: string, reason?: string, activationRequestId?: string }) => void | Promise<void>,
  * }} [opts]
  * @returns {Promise<{ action: string, result?: string, reason?: string, activationRequestId?: string } | null>}
  */
@@ -220,5 +288,12 @@ export async function dispatchWakeToPoller(raw, poller, opts = {}) {
     return { action: 'skipped', reason: 'no-poller' };
   }
 
-  return poller.tick();
+  const outcome = await poller.tick();
+  if (
+    shouldRecoverAdapterRegistration(outcome) &&
+    typeof opts.onAdapterStateLost === 'function'
+  ) {
+    await opts.onAdapterStateLost(outcome);
+  }
+  return outcome;
 }

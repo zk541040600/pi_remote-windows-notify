@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { OwnerRegistry, multiOwnerMetadata } from '../core/owner-registry.mjs';
 import { buildTrustedOriginMap } from '../core/url-session.mjs';
 import { computeRoutingKeySync } from '../core/routing-key.mjs';
-import { MessageTypes } from '../core/protocol.mjs';
+import { MessageTypes, OwnerEvents } from '../core/protocol.mjs';
 
 const INSTANCE = '11111111-2222-3333-4444-555555555555';
 const ORIGIN = 'http://10.23.50.137:30141';
@@ -107,6 +107,43 @@ describe('owner registry state transitions', () => {
     });
     assert.equal(r.action, 'refreshed');
     assert.equal(registry.getByTabId(4).pageKey, pageKey);
+  });
+
+  it('marks only a committed document as explicit-open and restores never steal', async () => {
+    const { registry, sent } = makeRegistry();
+    await registry.observeTab({
+      tabId: 8,
+      windowId: 10,
+      url: `${ORIGIN}/?session=${S1}`,
+    });
+    const enumerated = sent.find((m) => m.type === MessageTypes.RegisterOwner);
+    assert.equal(enumerated.ownerEvent, OwnerEvents.Restore);
+    assert.equal(enumerated.openEventId, undefined);
+    const restorePageKey = registry.getByTabId(8).pageKey;
+
+    sent.length = 0;
+    await registry.observeTab({
+      tabId: 8,
+      windowId: 10,
+      url: `${ORIGIN}/?session=${S1}`,
+      explicitOpen: true,
+    });
+    const explicit = sent.find((m) => m.type === MessageTypes.RegisterOwner);
+    assert.equal(explicit.ownerEvent, OwnerEvents.ExplicitOpen);
+    assert.equal(typeof explicit.openEventId, 'string');
+    assert.equal(typeof explicit.openedAtMs, 'number');
+    assert.notEqual(registry.getByTabId(8).pageKey, restorePageKey);
+
+    sent.length = 0;
+    await registry.observeTab({
+      tabId: 8,
+      windowId: 10,
+      url: `${ORIGIN}/?session=${S1}`,
+    });
+    const reconnect = sent.find((m) => m.type === MessageTypes.RegisterOwner);
+    assert.equal(reconnect.ownerEvent, OwnerEvents.Restore);
+    assert.equal(reconnect.openEventId, undefined);
+    assert.equal(reconnect.openedAtMs, undefined);
   });
 
   it('tracks multi-owner metadata without picking a winner', async () => {

@@ -260,6 +260,8 @@ describe('ActivationPoller', () => {
     const resultMsg = port.posted[0];
     assert.equal(resultMsg.type, MessageTypes.ActivateResult);
     assert.equal(resultMsg.activationRequestId, activationRequestId);
+    assert.notEqual(resultMsg.requestId, activationRequestId);
+    assert.notEqual(resultMsg.requestId, 'poll-1');
     assert.equal(resultMsg.result, RouteResults.SessionUrlConfirmed);
     assert.equal(resultMsg.adapterKey, ADAPTER);
     // Must not leak raw session / full URL
@@ -307,6 +309,8 @@ describe('ActivationPoller', () => {
     await poller.tick();
     assert.equal(port.posted[0].activationRequestId, activationRequestId);
     assert.notEqual(port.posted[0].activationRequestId, 'poll-envelope-id-should-not-be-result-key');
+    assert.notEqual(port.posted[0].requestId, activationRequestId);
+    assert.notEqual(port.posted[0].requestId, 'poll-envelope-id-should-not-be-result-key');
   });
 
   it('pauses while disconnected (no poll send)', async () => {
@@ -542,6 +546,7 @@ describe('ActivationPoller', () => {
   it('buildActivateResult includes activationRequestId for daemon status', () => {
     const registry = makeRegistry();
     const msg = registry.buildActivateResult({
+      requestId: 'act-build-01',
       activationRequestId: 'act-build-01',
       result: RouteResults.SessionUrlConfirmed,
       snapshotId: 'snap-1',
@@ -549,6 +554,7 @@ describe('ActivationPoller', () => {
     });
     assert.equal(msg.type, MessageTypes.ActivateResult);
     assert.equal(msg.activationRequestId, 'act-build-01');
+    assert.notEqual(msg.requestId, 'act-build-01');
     assert.equal(msg.result, RouteResults.SessionUrlConfirmed);
     assert.equal(msg.adapterKey, ADAPTER);
   });

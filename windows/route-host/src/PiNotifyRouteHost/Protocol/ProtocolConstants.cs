@@ -136,6 +136,12 @@ public static class MessageTypes
     public const string Wake = "wake";
 }
 
+public static class OwnerEvents
+{
+    public const string ExplicitOpen = "explicit-open";
+    public const string Restore = "restore";
+}
+
 public static class RouteResults
 {
     public const string Ready = "ready";
@@ -180,4 +186,5 @@ public static class RejectReasons
     public const string ActivationUnknown = "activation-unknown";
     public const string PendingAdapterDelivery = "pending-adapter-delivery";
     public const string WrongAdapter = "wrong-adapter";
+    public const string PreferencePersistFailed = "preference-persist-failed";
 }

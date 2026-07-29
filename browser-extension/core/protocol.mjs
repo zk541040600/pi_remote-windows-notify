@@ -59,6 +59,11 @@ export const MessageTypes = Object.freeze({
   Wake: 'wake',
 });
 
+export const OwnerEvents = Object.freeze({
+  ExplicitOpen: 'explicit-open',
+  Restore: 'restore',
+});
+
 export const RouteResults = Object.freeze({
   Ready: 'ready',
   Miss: 'miss',

@@ -13,6 +13,8 @@ import {
   validateWakeMessage,
   buildWakeMessage,
   shouldRunWakeMaintenance,
+  shouldRecoverAdapterRegistration,
+  recoverAdapterRegistration,
   refreshLiveOwnerLeases,
   dispatchWakeToPoller,
   WAKE_FIELDS,
@@ -126,6 +128,106 @@ describe('shouldRunWakeMaintenance', () => {
   });
 });
 
+describe('shouldRecoverAdapterRegistration', () => {
+  it('recovers only when a live daemon explicitly forgot the adapter', () => {
+    assert.equal(
+      shouldRecoverAdapterRegistration({
+        action: 'host-error',
+        result: RouteResults.AdapterUnavailable,
+        reason: RejectReasons.AdapterUnknown,
+      }),
+      true,
+    );
+    assert.equal(
+      shouldRecoverAdapterRegistration({
+        action: 'host-error',
+        result: RouteResults.AdapterUnavailable,
+        reason: 'daemon-unreachable',
+      }),
+      false,
+    );
+    assert.equal(
+      shouldRecoverAdapterRegistration({
+        action: 'no-pending',
+        result: RouteResults.Ok,
+        reason: RejectReasons.NoPending,
+      }),
+      false,
+    );
+  });
+});
+
+describe('recoverAdapterRegistration', () => {
+  it('registers the adapter before re-enumerating live trusted tabs', async () => {
+    const calls = [];
+    const registry = {
+      async registerAdapter() {
+        calls.push('register-adapter');
+        return { result: RouteResults.Ok };
+      },
+      listOwners() {
+        return [{ ownerKey: 'owner-a' }];
+      },
+    };
+
+    const out = await recoverAdapterRegistration({
+      registry,
+      enumerateTabs: async () => {
+        calls.push('enumerate-tabs');
+      },
+    });
+
+    assert.deepEqual(calls, ['register-adapter', 'enumerate-tabs']);
+    assert.deepEqual(out, { action: 'recovered', ownerCount: 1 });
+  });
+
+  it('does not enumerate or revive owners when adapter registration is rejected', async () => {
+    let enumerations = 0;
+    const out = await recoverAdapterRegistration({
+      registry: {
+        async registerAdapter() {
+          return { result: RouteResults.Rejected };
+        },
+        listOwners() {
+          return [];
+        },
+      },
+      enumerateTabs: async () => {
+        enumerations += 1;
+      },
+    });
+
+    assert.equal(enumerations, 0);
+    assert.deepEqual(out, {
+      action: 'failed',
+      reason: 'adapter-register-rejected',
+    });
+  });
+
+  it('stops when the active registry changes during recovery', async () => {
+    let current = true;
+    let enumerations = 0;
+    const out = await recoverAdapterRegistration({
+      registry: {
+        async registerAdapter() {
+          current = false;
+          return { result: RouteResults.Ok };
+        },
+        listOwners() {
+          return [];
+        },
+      },
+      enumerateTabs: async () => {
+        enumerations += 1;
+      },
+      isCurrent: () => current,
+    });
+
+    assert.equal(enumerations, 0);
+    assert.deepEqual(out, { action: 'skipped', reason: 'state-changed' });
+  });
+});
+
 describe('refreshLiveOwnerLeases', () => {
   const instanceKey = '11111111-2222-3333-4444-555555555555';
   const origin = 'http://10.23.50.137:30141';
@@ -225,6 +327,58 @@ describe('dispatchWakeToPoller', () => {
     );
     assert.equal(ticks, 1);
     assert.equal(out?.action, 'no-pending');
+  });
+
+  it('invokes bounded re-registration when wake polling proves daemon state was reset', async () => {
+    let recoveries = 0;
+    const poller = {
+      async tick() {
+        return {
+          action: 'host-error',
+          result: RouteResults.AdapterUnavailable,
+          reason: RejectReasons.AdapterUnknown,
+        };
+      },
+    };
+
+    const out = await dispatchWakeToPoller(
+      { type: 'wake', protocolVersion: 1, seq: 1 },
+      poller,
+      {
+        onAdapterStateLost: async () => {
+          recoveries += 1;
+        },
+      },
+    );
+
+    assert.equal(recoveries, 1);
+    assert.equal(out?.result, RouteResults.AdapterUnavailable);
+    assert.equal(out?.reason, RejectReasons.AdapterUnknown);
+  });
+
+  it('does not re-register while the daemon is unreachable', async () => {
+    let recoveries = 0;
+    const poller = {
+      async tick() {
+        return {
+          action: 'host-error',
+          result: RouteResults.AdapterUnavailable,
+          reason: 'daemon-unreachable',
+        };
+      },
+    };
+
+    await dispatchWakeToPoller(
+      { type: 'wake', protocolVersion: 1, seq: 1 },
+      poller,
+      {
+        onAdapterStateLost: async () => {
+          recoveries += 1;
+        },
+      },
+    );
+
+    assert.equal(recoveries, 0);
   });
 
   it('does not double-handle a matched poll response as a wake', async () => {

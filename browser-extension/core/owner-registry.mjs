@@ -7,6 +7,7 @@
 import {
   DEFAULT_LEASE_TTL_MS,
   MessageTypes,
+  OwnerEvents,
   PROTOCOL_VERSION,
   RouteResults,
   RejectReasons,
@@ -36,6 +37,9 @@ import {
  *   pageFingerprint: string,
  *   registeredAtMs: number,
  *   lastSeenAtMs: number,
+ *   openEventId?: string,
+ *   openedAtMs?: number,
+ *   explicitOpenPending: boolean,
  * }} OwnerRecord
  *
  * @typedef {{
@@ -62,6 +66,9 @@ import {
  *   reason?: string,
  *   elapsedMs?: number,
  *   deadlineMs?: number,
+ *   ownerEvent?: string,
+ *   openEventId?: string,
+ *   openedAtMs?: number,
  * }} RouteMessage
  */
 
@@ -189,11 +196,17 @@ export class OwnerRegistry {
 
   /**
    * Process a tab URL observation. Atomic unregister/register when session/origin changes.
-   * @param {{ tabId: number, windowId: number, url: string | undefined | null }} tab
+   * @param {{
+   *   tabId: number,
+   *   windowId: number,
+   *   url: string | undefined | null,
+   *   explicitOpen?: boolean,
+   * }} tab
    * @returns {Promise<{ action: string, owner?: OwnerRecord, reason?: string }>}
    */
   async observeTab(tab) {
     const { tabId, windowId } = tab;
+    const explicitOpen = tab.explicitOpen === true;
     const url = tab.url ?? '';
     const existing = this.byTabId.get(tabId);
 
@@ -231,15 +244,18 @@ export class OwnerRegistry {
         existing.routingKey === rk &&
         existing.windowId === windowId;
 
-      if (same) {
+      if (same && !explicitOpen) {
         existing.lastSeenAtMs = this.now();
-        // Re-register / heartbeat lease (idempotent register-owner)
+        // Enumeration, heartbeat, reconnect, and MV3 wake recovery publish restore only.
         await this.#sendRegisterOwner(existing);
         return { action: 'refreshed', owner: existing };
       }
 
-      // Session/origin/window changed: atomic unregister then register new pageKey.
-      await this.#unregisterLocal(existing, 'session-or-origin-changed');
+      // A committed/reloaded document is a new explicit open even when the route is unchanged.
+      await this.#unregisterLocal(
+        existing,
+        explicitOpen && same ? 'explicit-document-open' : 'session-or-origin-changed',
+      );
     }
 
     const pageKey = newPageKey();
@@ -257,6 +273,9 @@ export class OwnerRegistry {
       pageFingerprint: fp,
       registeredAtMs: this.now(),
       lastSeenAtMs: this.now(),
+      openEventId: explicitOpen ? newRequestId() : undefined,
+      openedAtMs: explicitOpen ? this.now() : undefined,
+      explicitOpenPending: explicitOpen,
     };
 
     this.byTabId.set(tabId, owner);
@@ -408,17 +427,8 @@ export class OwnerRegistry {
       elapsedMs: args.elapsedMs,
       adapterKey: this.adapterKey,
     });
-    // Keep requestId as a distinct envelope id (already set by buildMessage),
-    // but if caller only supplied one id, also put it on requestId for legacy hosts.
-    if (activationRequestId && !args.requestId) {
-      // leave generated requestId; activationRequestId carries correlation
-    } else if (typeof args.requestId === 'string' && args.requestId) {
-      // Preserve explicit requestId when provided (push-activate path).
-      msg.requestId = args.requestId;
-      if (!msg.activationRequestId) {
-        msg.activationRequestId = args.requestId;
-      }
-    }
+    // Never reuse the activate request as this envelope's requestId. The daemon's replay cache
+    // already contains that ID; correlation belongs exclusively in activationRequestId.
     return msg;
   }
 
@@ -478,8 +488,20 @@ export class OwnerRegistry {
       routingKey: owner.routingKey,
       pageFingerprint: owner.pageFingerprint,
       leaseTtlMs: this.leaseTtlMs,
+      ownerEvent: owner.explicitOpenPending ? OwnerEvents.ExplicitOpen : OwnerEvents.Restore,
+      openEventId: owner.explicitOpenPending ? owner.openEventId : undefined,
+      openedAtMs: owner.explicitOpenPending ? owner.openedAtMs : undefined,
     });
-    return this.send(msg);
+    const response = await this.send(msg);
+    if (
+      owner.explicitOpenPending &&
+      response &&
+      typeof response === 'object' &&
+      (response.result === RouteResults.Ok || response.result === RouteResults.Accepted)
+    ) {
+      owner.explicitOpenPending = false;
+    }
+    return response;
   }
 
   /**
