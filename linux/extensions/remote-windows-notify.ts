@@ -247,6 +247,7 @@ function readContextSnapshot(ctx: unknown, messages: AgentMessageLike[] = []): C
   let cwd = process.cwd();
   let mode: string | undefined;
   let explicitSessionName: string | undefined;
+  let firstSessionUserText = "";
 
   try {
     const context = ctx as { cwd?: unknown; mode?: unknown; sessionManager?: { getCwd?: () => unknown } };
@@ -263,13 +264,33 @@ function readContextSnapshot(ctx: unknown, messages: AgentMessageLike[] = []): C
   }
 
   try {
-    const manager = (ctx as { sessionManager?: { getSessionName?: () => unknown } })?.sessionManager;
+    const manager = (ctx as {
+      sessionManager?: {
+        getSessionName?: () => unknown;
+        getBranch?: () => unknown;
+      };
+    })?.sessionManager;
     explicitSessionName = normalizeTabTitlePart(manager?.getSessionName?.(), "") || undefined;
+    const branch = manager?.getBranch?.();
+    if (Array.isArray(branch)) {
+      for (const candidate of branch) {
+        const entry = candidate as { type?: unknown; message?: { role?: unknown; content?: unknown } };
+        if (entry?.type !== "message" || entry.message?.role !== "user") {
+          continue;
+        }
+        firstSessionUserText = extractTextContent(entry.message.content);
+        if (firstSessionUserText.trim()) {
+          break;
+        }
+      }
+    }
   } catch {
   }
 
-  const displaySessionName =
-    explicitSessionName || normalizeText(findTextForRole(messages, "user", false), "", 96) || undefined;
+  const displaySessionName = explicitSessionName ||
+    normalizeText(firstSessionUserText, "", 96) ||
+    normalizeText(findTextForRole(messages, "user", false), "", 96) ||
+    undefined;
   const identity = readSessionIdentity(ctx);
   return {
     cwd,

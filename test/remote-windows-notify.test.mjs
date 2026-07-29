@@ -402,15 +402,27 @@ test("dynamic title uses the explicit or Pi Web display session name", async (t)
 
   const unnamedRuntime = createFakePi();
   remoteWindowsNotify(unnamedRuntime.pi);
-  const unnamedContext = createContext();
+  const unnamedContext = createContext({
+    sessionManager: {
+      getSessionName: () => undefined,
+      getBranch: () => [
+        {
+          type: "message",
+          message: { role: "user", content: "sidebar session title" },
+        },
+        {
+          type: "message",
+          message: { role: "assistant", content: "first answer" },
+        },
+      ],
+    },
+  });
   await unnamedRuntime.emit("session_start", { type: "session_start" }, unnamedContext);
   await unnamedRuntime.emit(
     "agent_end",
     {
       type: "agent_end",
       messages: [
-        { role: "user", content: "sidebar session title" },
-        { role: "assistant", content: "first answer" },
         { role: "user", content: "latest user request" },
         { role: "assistant", content: "completed" },
       ],
