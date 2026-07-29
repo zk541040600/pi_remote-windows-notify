@@ -263,6 +263,32 @@ Assert-equal 'fail-closed' $activateStale.Decision.Decision 'mock-activate-ambig
 
 $script:NotifyRouteHostClientMock = $null
 
+# --- Foreground auto-dismiss origin allowlist ---
+# Mirrors the pure helper used by pi-notify-broker.ps1 and pi-notify-popup.ps1 so pure
+# decision coverage does not require WinForms/UIAutomation. Keep semantics identical.
+function Test-NotifyForegroundDismissAllowed {
+    param([string]$OriginKind = '')
+
+    $kind = if ($null -eq $OriginKind) { '' } else { $OriginKind.Trim() }
+    return ([string]::IsNullOrWhiteSpace($kind) -or $kind -eq 'terminal')
+}
+
+Write-Host "`n== Foreground dismiss origin allowlist =="
+# Same tabTitle fixture intentionally reused: eligibility must ignore title/cwd content.
+$sameTabTitle = 'pi - proj - #abc123def456'
+Assert-True (Test-NotifyForegroundDismissAllowed -OriginKind 'terminal') 'dismiss-allowed-terminal'
+Assert-True (Test-NotifyForegroundDismissAllowed -OriginKind '') 'dismiss-allowed-legacy-empty'
+Assert-True (Test-NotifyForegroundDismissAllowed -OriginKind '  ') 'dismiss-allowed-legacy-whitespace'
+Assert-True (Test-NotifyForegroundDismissAllowed) 'dismiss-allowed-legacy-omitted'
+Assert-True (-not (Test-NotifyForegroundDismissAllowed -OriginKind 'pi-web')) 'dismiss-denied-pi-web'
+Assert-True (-not (Test-NotifyForegroundDismissAllowed -OriginKind 'PI-WEB')) 'dismiss-denied-pi-web-case'
+Assert-True (-not (Test-NotifyForegroundDismissAllowed -OriginKind 'browser')) 'dismiss-denied-unknown-browser'
+Assert-True (-not (Test-NotifyForegroundDismissAllowed -OriginKind 'pi-web-desktop')) 'dismiss-denied-future-desktop'
+Assert-True (-not (Test-NotifyForegroundDismissAllowed -OriginKind 'unknown')) 'dismiss-denied-unknown'
+# Title presence must not override origin allowlist (reproduces the real bug fixture).
+Assert-True (Test-NotifyForegroundDismissAllowed -OriginKind 'terminal') ('dismiss-allowed-terminal-same-title fixture={0}' -f $sameTabTitle)
+Assert-True (-not (Test-NotifyForegroundDismissAllowed -OriginKind 'pi-web')) ('dismiss-denied-pi-web-same-title fixture={0}' -f $sameTabTitle)
+
 # --- Envelope shape ---
 Write-Host "`n== Envelope =="
 $envl = New-NotifyRouteRequestEnvelope -Type 'freeze' -Fields @{ notificationId = 'n'; instanceKey = 'i'; routingKey = 'r' } -TtlMs 5000

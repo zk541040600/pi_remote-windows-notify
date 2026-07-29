@@ -550,6 +550,14 @@ function Get-NotifyPopupSelectedTerminalTarget {
     return $null
 }
 
+# Terminal/legacy only: WT title/cwd foreground auto-dismiss must not run for pi-web or unknown origins.
+function Test-NotifyForegroundDismissAllowed {
+    param([string]$OriginKind = '')
+
+    $kind = if ($null -eq $OriginKind) { '' } else { $OriginKind.Trim() }
+    return ([string]::IsNullOrWhiteSpace($kind) -or $kind -eq 'terminal')
+}
+
 function Test-NotifyPopupForegroundTarget {
     param(
         [string]$CurrentDirBase,
@@ -1010,6 +1018,10 @@ $focusWatchTimer.Add_Tick({
         $focusWatchTimer.Stop()
         $timer.Stop()
         $form.Close()
+        return
+    }
+
+    if (-not (Test-NotifyForegroundDismissAllowed -OriginKind $targetOriginKind)) {
         return
     }
 

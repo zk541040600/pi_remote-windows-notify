@@ -446,6 +446,23 @@ if ($brokerText -notmatch 'Queue-NotifyBrokerPrewarm' -or $brokerText -notmatch 
 if ($brokerText -notmatch 'Test-NotifyBrokerSessionTaggedTitle' -or $brokerText -notmatch '\$CacheEntry\.Tab\.Current\.Name' -or $brokerText -notmatch 'broker-prewarm-ambiguous' -or $brokerText -notmatch 'broker-focus-ambiguous' -or $brokerText -notmatch 'if \(\$hasPreciseSourceTitle -and -not \$sourceTabTitleMatch\)') {
     throw 'Broker must require precise source-title matches, reject ambiguous candidates, and validate only session-tagged caches against the live tab name.'
 }
+# Origin-aware foreground auto-dismiss: only terminal/legacy may match WT title/cwd.
+if ($brokerText -notmatch 'function Test-NotifyForegroundDismissAllowed' -or $popupText -notmatch 'function Test-NotifyForegroundDismissAllowed') {
+    throw 'Broker and fallback popup must define Test-NotifyForegroundDismissAllowed for origin-gated foreground auto-dismiss.'
+}
+if ($brokerText -notmatch '\[string\]::IsNullOrWhiteSpace\(\$kind\) -or \$kind -eq ''terminal''' -or $popupText -notmatch '\[string\]::IsNullOrWhiteSpace\(\$kind\) -or \$kind -eq ''terminal''') {
+    throw 'Foreground dismiss allowlist must accept only empty/legacy origin or explicit terminal; do not exclude only pi-web.'
+}
+if ($brokerText -notmatch 'if \(-not \(Test-NotifyForegroundDismissAllowed -OriginKind \$tag\.OriginKind\)\) \{\s*return\s*\}\s*if \(Test-NotifyBrokerForegroundTarget') {
+    throw 'Broker focus-watch timer must return for non-terminal origins before WT foreground title/cwd matching.'
+}
+if ($popupText -notmatch 'if \(-not \(Test-NotifyForegroundDismissAllowed -OriginKind \$targetOriginKind\)\) \{\s*return\s*\}\s*if \(Test-NotifyPopupForegroundTarget') {
+    throw 'Fallback popup focus-watch timer must return for non-terminal origins before WT foreground title/cwd matching.'
+}
+if ($brokerText -notmatch 'source="foreground-target"' -or $popupText -notmatch 'source="foreground-target"') {
+    throw 'Broker and fallback popup must retain foreground-target dismiss logging for terminal/legacy paths.'
+}
+Write-Host 'OK origin-aware foreground auto-dismiss guards in broker and fallback popup'
 if ($brokerText -notmatch 'Get-NotifyBrokerWallpaperCardImage' -or $brokerText -notmatch 'broker-wallpaper-card-rendered' -or $brokerText -notmatch 'DrawImageUnscaled' -or $brokerText -notmatch 'Get-NotifyBrokerWallpaperCardImage -Width 420 -Height 154') {
     throw 'Broker popup paint must use startup-warmed cached card-size wallpaper rendering instead of per-paint high-quality scaling.'
 }

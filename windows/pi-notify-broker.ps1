@@ -487,6 +487,14 @@ function Select-NotifyBrokerTab {
     return $false
 }
 
+# Terminal/legacy only: WT title/cwd foreground auto-dismiss must not run for pi-web or unknown origins.
+function Test-NotifyForegroundDismissAllowed {
+    param([string]$OriginKind = '')
+
+    $kind = if ($null -eq $OriginKind) { '' } else { $OriginKind.Trim() }
+    return ([string]::IsNullOrWhiteSpace($kind) -or $kind -eq 'terminal')
+}
+
 # Foreground target detection: auto-close popup when user switches to the target tab
 function Test-NotifyBrokerForegroundTarget {
     param(
@@ -1449,6 +1457,9 @@ function Show-NotifyBrokerPopup {
     $focusWatchTimer.Interval = 800
     $focusWatchTimer.Add_Tick({
         $tag = $this.PopupTag
+        if (-not (Test-NotifyForegroundDismissAllowed -OriginKind $tag.OriginKind)) {
+            return
+        }
         if (Test-NotifyBrokerForegroundTarget -CurrentDirBase $tag.TargetCwdBase -SourceTabTitleValue $tag.TargetSourceTabTitle -TargetFingerprint $tag.TargetFingerprint) {
             Write-NotifyBrokerLog -Message ('broker-action dismiss source="foreground-target" popupId={0}' -f $tag.PopupId)
             $this.Stop()
