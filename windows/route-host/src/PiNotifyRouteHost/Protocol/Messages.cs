@@ -1,3 +1,4 @@
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
@@ -13,6 +14,7 @@ public static class JsonDefaults
         WriteIndented = false,
         ReadCommentHandling = JsonCommentHandling.Disallow,
         AllowTrailingCommas = false,
+        UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow,
         MaxDepth = 8,
     };
 }
@@ -45,6 +47,18 @@ public sealed class RouteMessage
     [JsonPropertyName("adapterKey")]
     public string? AdapterKey { get; set; }
 
+    /// <summary>Opaque identity of one adapter process/service-worker generation.</summary>
+    [JsonPropertyName("adapterGeneration")]
+    public string? AdapterGeneration { get; set; }
+
+    /// <summary>
+    /// Client-reserved strict runtime start order, anchored to wall time but
+    /// durably increased across equal milliseconds and clock rollback. Present
+    /// only on register-adapter; retained retries reuse the exact value.
+    /// </summary>
+    [JsonPropertyName("adapterStartedAtMs")]
+    public long? AdapterStartedAtMs { get; set; }
+
     [JsonPropertyName("adapterKind")]
     public string? AdapterKind { get; set; }
 
@@ -56,6 +70,13 @@ public sealed class RouteMessage
 
     [JsonPropertyName("ownerKey")]
     public string? OwnerKey { get; set; }
+
+    /// <summary>
+    /// Optional predecessor removed atomically with register-owner. This closes
+    /// the gap when an unregister-owner request or acknowledgement was lost.
+    /// </summary>
+    [JsonPropertyName("replacesOwnerKey")]
+    public string? ReplacesOwnerKey { get; set; }
 
     [JsonPropertyName("pageKey")]
     public string? PageKey { get; set; }
@@ -98,6 +119,20 @@ public sealed class RouteMessage
     [JsonPropertyName("snapshotId")]
     public string? SnapshotId { get; set; }
 
+    /// <summary>
+    /// Host-owned opaque handle for a notification whose exact owner is temporarily
+    /// unavailable. It never contains a session, URL, routing key, or token.
+    /// </summary>
+    [JsonPropertyName("recoveryTicketId")]
+    public string? RecoveryTicketId { get; set; }
+
+    /// <summary>
+    /// Requested lifetime for a pre-snapshot recovery ticket. Accepted only on freeze.
+    /// Each resolve remains a separate short request.
+    /// </summary>
+    [JsonPropertyName("recoveryTtlMs")]
+    public int? RecoveryTtlMs { get; set; }
+
     [JsonPropertyName("deadlineMs")]
     public long? DeadlineMs { get; set; }
 
@@ -132,6 +167,16 @@ public sealed class RouteMessage
         {
             error = RejectReasons.Oversized;
             return null;
+        }
+
+        // Windows PowerShell 5.1 prefixes redirected native-process stdin with
+        // one UTF-8 BOM. Treat exactly one leading BOM as a transport encoding
+        // marker; a second BOM remains invalid JSON, and U+FEFF inside fields
+        // is still validated as data by the field-specific contracts.
+        var preamble = Encoding.UTF8.Preamble;
+        if (utf8Json.StartsWith(preamble))
+        {
+            utf8Json = utf8Json[preamble.Length..];
         }
 
         try
@@ -178,6 +223,9 @@ public sealed class RouteResponse
 
     [JsonPropertyName("snapshotId")]
     public string? SnapshotId { get; set; }
+
+    [JsonPropertyName("recoveryTicketId")]
+    public string? RecoveryTicketId { get; set; }
 
     [JsonPropertyName("candidateCount")]
     public int? CandidateCount { get; set; }

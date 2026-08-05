@@ -33,6 +33,26 @@ public class RoutingKeyTests
     }
 
     [Fact]
+    public void Compute_preserves_printable_edge_whitespace()
+    {
+        Assert.Equal(
+            "687e3332585d90c6d0a6d0f615738fa80e251932ceee0acb061a24fada3b3433",
+            RoutingKey.Compute(
+                "11111111-2222-3333-4444-555555555555",
+                " padded "));
+    }
+
+    [Fact]
+    public void Compute_accepts_a_valid_surrogate_pair()
+    {
+        Assert.Equal(
+            "18a9bdd83e4a6bf02686680349a490077bd4db3cb05e418e04d9225447df3ba0",
+            RoutingKey.Compute(
+                "11111111-2222-3333-4444-555555555555",
+                "valid-🚀"));
+    }
+
+    [Fact]
     public void Different_sessions_produce_different_keys()
     {
         const string instanceKey = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
@@ -63,6 +83,45 @@ public class RoutingKeyTests
     }
 
     [Fact]
+    public void Compute_rejects_non_portable_session_identity_before_hashing()
+    {
+        const string instanceKey = "11111111-2222-3333-4444-555555555555";
+        var invalidSessions = new[]
+        {
+            "bad\u0085id",
+            "\uFEFF",
+            "\uD800",
+            "\uDC00",
+            "https://example.invalid/session",
+            new string('x', 257)
+        };
+
+        foreach (var sessionId in invalidSessions)
+        {
+            Assert.ThrowsAny<ArgumentException>(() => RoutingKey.Compute(instanceKey, sessionId));
+        }
+    }
+
+    [Theory]
+    [InlineData("short")]
+    [InlineData("bad/path")]
+    [InlineData("bad=value")]
+    [InlineData(" padded-instance ")]
+    public void Compute_rejects_non_portable_instance_identity_before_hashing(
+        string instanceKey)
+    {
+        Assert.ThrowsAny<ArgumentException>(
+            () => RoutingKey.Compute(instanceKey, "session"));
+    }
+
+    [Fact]
+    public void Compute_rejects_overlong_instance_identity_before_hashing()
+    {
+        Assert.ThrowsAny<ArgumentException>(
+            () => RoutingKey.Compute(new string('x', 129), "session"));
+    }
+
+    [Fact]
     public void Fingerprint_is_first_12_hex_chars()
     {
         var key = RoutingKey.Compute("inst-key-001", "sess-001");
@@ -72,9 +131,9 @@ public class RoutingKeyTests
     [Fact]
     public void Domain_separator_prevents_trivial_concatenation_collision()
     {
-        // instanceKey="a", session="bc" vs instanceKey="ab", session="c" must differ due to NUL separators.
-        var k1 = RoutingKey.Compute("a", "bc");
-        var k2 = RoutingKey.Compute("ab", "c");
+        // The two concatenations are both "abcdefghij"; the NUL separators keep them distinct.
+        var k1 = RoutingKey.Compute("abcdefgh", "ij");
+        var k2 = RoutingKey.Compute("abcdefghi", "j");
         Assert.NotEqual(k1, k2);
     }
 

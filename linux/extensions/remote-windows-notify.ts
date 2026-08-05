@@ -88,6 +88,10 @@ const ROUTING_KEY_DOMAIN = "pi-web-route-v1";
 const INSTANCE_KEY_MIN_LENGTH = 8;
 const INSTANCE_KEY_MAX_LENGTH = 128;
 const INSTANCE_KEY_PATTERN = /^[A-Za-z0-9._+-]+$/;
+const INSTANCE_KEY_PADDING_PATTERN =
+  /^[\u0009-\u000d\u0020]+|[\u0009-\u000d\u0020]+$/g;
+const SESSION_ID_MIN_LENGTH = 1;
+const SESSION_ID_MAX_LENGTH = 256;
 const OSC_SEQUENCE_PATTERN = /(?:\u001b\]|\u009d)[\s\S]*?(?:\u0007|\u001b\\|\u009c|$)/gu;
 const TERMINAL_STRING_PATTERN = /(?:\u001b[P^_X]|\u0090|\u0098|\u009e|\u009f)[\s\S]*?(?:\u001b\\|\u009c|$)/gu;
 const CSI_SEQUENCE_PATTERN = /(?:\u001b\[|\u009b)[0-?]*[ -/]*[@-~]/gu;
@@ -101,6 +105,62 @@ function isTruthy(value: string | undefined): boolean {
 
 function configString(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
+}
+
+function isPortableSessionWhitespaceCode(code: number): boolean {
+  return (
+    (code >= 0x0009 && code <= 0x000d) ||
+    code === 0x0020 ||
+    code === 0x0085 ||
+    code === 0x00a0 ||
+    code === 0x1680 ||
+    (code >= 0x2000 && code <= 0x200a) ||
+    code === 0x2028 ||
+    code === 0x2029 ||
+    code === 0x202f ||
+    code === 0x205f ||
+    code === 0x3000 ||
+    code === 0xfeff
+  );
+}
+
+function isValidPiWebSessionId(value: unknown): value is string {
+  if (
+    typeof value !== "string" ||
+    value.length < SESSION_ID_MIN_LENGTH ||
+    value.length > SESSION_ID_MAX_LENGTH
+  ) {
+    return false;
+  }
+
+  let hasNonWhitespace = false;
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (
+      code < 0x20 ||
+      (code >= 0x7f && code <= 0x9f) ||
+      code === 0xfeff
+    ) {
+      return false;
+    }
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (index + 1 >= value.length || next < 0xdc00 || next > 0xdfff) {
+        return false;
+      }
+      hasNonWhitespace = true;
+      index += 1;
+      continue;
+    }
+    if (code >= 0xdc00 && code <= 0xdfff) {
+      return false;
+    }
+    if (!isPortableSessionWhitespaceCode(code)) {
+      hasNonWhitespace = true;
+    }
+  }
+
+  return hasNonWhitespace && !value.includes("://");
 }
 
 function normalizeText(value: unknown, fallback: string, maxLength: number): string {
@@ -139,10 +199,11 @@ function truncateUtf8(value: string, maxBytes: number): string {
  * Does not accept empty inputs; callers must fail-closed before invoking.
  */
 export function computePiWebRoutingKey(instanceKey: string, rawSessionId: string): string {
-  if (typeof instanceKey !== "string" || !instanceKey.trim()) {
-    throw new Error("instanceKey is required");
+  const normalizedInstanceKey = normalizeInstanceKey(instanceKey);
+  if (!normalizedInstanceKey || normalizedInstanceKey !== instanceKey) {
+    throw new Error("instanceKey is invalid");
   }
-  if (typeof rawSessionId !== "string" || !rawSessionId.trim()) {
+  if (!isValidPiWebSessionId(rawSessionId)) {
     throw new Error("rawSessionId is required");
   }
   return createHash("sha256")
@@ -155,7 +216,10 @@ export function computePiWebRoutingKey(instanceKey: string, rawSessionId: string
 }
 
 function normalizeInstanceKey(value: unknown): string {
-  const key = configString(value);
+  const key =
+    typeof value === "string"
+      ? value.replace(INSTANCE_KEY_PADDING_PATTERN, "")
+      : "";
   if (
     key.length < INSTANCE_KEY_MIN_LENGTH ||
     key.length > INSTANCE_KEY_MAX_LENGTH ||
@@ -180,7 +244,7 @@ function readSessionIdentity(ctx: unknown): { rawSessionId?: string; sessionKey?
   try {
     const manager = (ctx as { sessionManager?: { getSessionId?: () => unknown } })?.sessionManager;
     const sessionId = manager?.getSessionId?.();
-    if (typeof sessionId !== "string" || !sessionId.trim()) {
+    if (!isValidPiWebSessionId(sessionId)) {
       return {};
     }
     const rawSessionId = sessionId;
@@ -533,7 +597,11 @@ export function buildNotifyRouteFields(
     return base;
   }
 
-  if (!config.piWebOriginConfigured || !config.instanceKey || !rawSessionId?.trim()) {
+  if (
+    !config.piWebOriginConfigured ||
+    !config.instanceKey ||
+    !isValidPiWebSessionId(rawSessionId)
+  ) {
     return base;
   }
 

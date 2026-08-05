@@ -1,3 +1,5 @@
+using System.Diagnostics;
+using System.Globalization;
 using System.Text;
 using System.Text.Json;
 using PiNotifyRouteHost.Host;
@@ -89,13 +91,16 @@ public static class Program
         }
 
         var pipeName = GetOption(args, "--pipe") ?? ProtocolConstants.DefaultPipeName;
-        var statePath = GetOption(args, "--state-file")
-            ?? Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "PiNotifyRouteHost",
-                "route-preferences.json");
+        var statePath = GetOption(args, "--state-file");
+        if (statePath is null)
+        {
+            statePath = SessionStoragePaths.GetDefaultBindingStatePath();
+            SessionStoragePaths.TryClaimLegacyBindingState(
+                SessionStoragePaths.GetLegacyBindingStatePath(),
+                statePath);
+        }
         var state = new RouteStateMachine(
-            preferences: new FileRoutePreferenceStore(statePath));
+            bindings: new FileRouteBindingStore(statePath));
         var dispatcher = new RouteDispatcher(state);
         await using var server = new NamedPipeRouteServer(dispatcher, pipeName);
         server.Start();
@@ -157,24 +162,26 @@ public static class Program
         async Task<RouteResponse> Forward(RouteMessage msg, CancellationToken ct)
         {
             await using var client = new NamedPipeRouteClient(pipeName);
-            await client.ConnectAsync(timeoutMs: 2000, ct).ConfigureAwait(false);
-            return await client.SendAsync(msg, ct).ConfigureAwait(false);
+            return await client
+                .SendRequestAsync(
+                    msg,
+                    ProtocolConstants.DefaultRequestTtlMs,
+                    ct)
+                .ConfigureAwait(false);
         }
 
         var relay = new NativeMessagingRelay(callerOrigin, allowed, Forward);
         await relay.RunAsync().ConfigureAwait(false);
-        return 0;
+        return relay.HadFatalOutputFailure ? 1 : 0;
     }
 
     private static async Task<int> RunClientAsync(string[] args)
     {
         var pipeName = GetOption(args, "--pipe") ?? ProtocolConstants.DefaultPipeName;
         var jsonPath = GetOption(args, "--json");
-        var waitMsOpt = GetOption(args, "--wait-ms");
-        int? waitMs = null;
-        if (waitMsOpt is not null && int.TryParse(waitMsOpt, out var parsedWait))
+        if (!TryGetClientWaitMs(args, out var waitMs))
         {
-            waitMs = Math.Clamp(parsedWait, 0, ProtocolConstants.MaxRequestTtlMs);
+            return WriteClientReject(string.Empty, RejectReasons.InvalidField);
         }
 
         string json;
@@ -201,71 +208,229 @@ public static class Program
             return 1;
         }
 
-        await using var client = new NamedPipeRouteClient(pipeName);
-        await client.ConnectAsync().ConfigureAwait(false);
-        var response = await client.SendAsync(msg).ConfigureAwait(false);
-
-        // Optional: for external activate, poll activation-status until terminal or deadline.
-        if (waitMs is int budget && budget > 0 &&
-            string.Equals(msg.Type, MessageTypes.Activate, StringComparison.Ordinal) &&
-            string.Equals(response.Result, RouteResults.Accepted, StringComparison.Ordinal))
+        if (waitMs is not null &&
+            !string.Equals(
+                msg.Type,
+                MessageTypes.Activate,
+                StringComparison.Ordinal))
         {
-            var activationRequestId = response.ActivationRequestId ?? msg.RequestId;
-            var deadline = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() + budget;
+            return WriteClientReject(msg.RequestId, RejectReasons.InvalidField);
+        }
+
+        await using var client = new NamedPipeRouteClient(pipeName);
+        RouteResponse response;
+
+        // For external activate, one monotonic budget covers pipe connect,
+        // initial delivery and every activation-status poll.
+        if (waitMs is int budget && budget > 0 &&
+            string.Equals(msg.Type, MessageTypes.Activate, StringComparison.Ordinal))
+        {
+            var effectiveWaitMs = budget;
             if (msg.DeadlineMs is long d && d > 0)
             {
-                deadline = Math.Min(deadline, d);
+                var wallNow = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                effectiveWaitMs = (int)Math.Min(
+                    budget,
+                    Math.Max(0L, d - wallNow));
             }
 
-            response = await WaitForActivationAsync(client, activationRequestId, deadline).ConfigureAwait(false);
+            var clientWaitStarted = Stopwatch.GetTimestamp();
+            using var clientWaitCts = new CancellationTokenSource(
+                Math.Max(0, effectiveWaitMs));
+            var clientWaitToken = clientWaitCts.Token;
+
+            if (effectiveWaitMs <= 0)
+            {
+                response = ActivationTimeout(msg.RequestId);
+            }
+            else
+            {
+                try
+                {
+                    await client
+                        .ConnectAsync(
+                            Math.Min(2000, effectiveWaitMs),
+                            clientWaitToken)
+                        .ConfigureAwait(false);
+                    response = await client
+                        .SendAsync(msg, clientWaitToken)
+                        .ConfigureAwait(false);
+
+                    if (string.Equals(
+                            response.Result,
+                            RouteResults.Accepted,
+                            StringComparison.Ordinal))
+                    {
+                        var activationRequestId =
+                            response.ActivationRequestId ?? msg.RequestId;
+                        response = await WaitForActivationAsync(
+                                client,
+                                activationRequestId,
+                                effectiveWaitMs,
+                                clientWaitStarted,
+                                clientWaitToken)
+                            .ConfigureAwait(false);
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    response = ActivationTimeout(msg.RequestId);
+                }
+            }
+        }
+        else
+        {
+            response = await client
+                .SendRequestAsync(
+                    msg,
+                    ProtocolConstants.DefaultRequestTtlMs)
+                .ConfigureAwait(false);
         }
 
         Console.Out.WriteLine(Encoding.UTF8.GetString(response.ToUtf8Bytes()));
         return response.Result is RouteResults.Ok or RouteResults.Ready or RouteResults.SessionUrlConfirmed
-            or RouteResults.AlreadyActive or RouteResults.Accepted or RouteResults.Pending
+            or RouteResults.SessionConfirmed or RouteResults.AlreadyActive
+            or RouteResults.Accepted or RouteResults.Pending
+            or RouteResults.Recovering
             ? 0
             : 3;
     }
 
+    private static bool TryGetClientWaitMs(
+        string[] args,
+        out int? waitMs)
+    {
+        waitMs = null;
+        var optionIndex = -1;
+        for (var i = 1; i < args.Length; i++)
+        {
+            if (!string.Equals(
+                    args[i],
+                    "--wait-ms",
+                    StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            if (optionIndex >= 0)
+            {
+                return false;
+            }
+
+            optionIndex = i;
+        }
+
+        if (optionIndex < 0)
+        {
+            return true;
+        }
+
+        if (optionIndex + 1 >= args.Length ||
+            !int.TryParse(
+                args[optionIndex + 1],
+                NumberStyles.None,
+                CultureInfo.InvariantCulture,
+                out var parsedWait) ||
+            parsedWait <= 0 ||
+            parsedWait > ProtocolConstants.MaxRequestTtlMs)
+        {
+            return false;
+        }
+
+        waitMs = parsedWait;
+        return true;
+    }
+
+    private static int WriteClientReject(
+        string requestId,
+        string reason)
+    {
+        var response = RouteResponse.Reject(
+            requestId,
+            RouteResults.Rejected,
+            reason);
+        Console.Out.WriteLine(
+            Encoding.UTF8.GetString(response.ToUtf8Bytes()));
+        return 1;
+    }
+
     /// <summary>
-    /// Poll activation-status until a terminal result or wall-clock deadline.
+    /// Poll activation-status until a terminal result or monotonic wait budget.
     /// Suitable for PowerShell exact-ack without implementing the poll loop in script.
     /// </summary>
     private static async Task<RouteResponse> WaitForActivationAsync(
         NamedPipeRouteClient client,
         string activationRequestId,
-        long deadlineMs)
+        int waitBudgetMs,
+        long clientWaitStarted,
+        CancellationToken clientWaitToken)
     {
         var clock = new SystemClock();
         RouteResponse? last = null;
 
-        while (true)
+        try
         {
-            var now = clock.UtcNowMs;
-            if (now > deadlineMs)
+            while (true)
             {
-                return last is not null && last.Result != RouteResults.Pending
-                    ? last
-                    : RouteResponse.Reject(activationRequestId, RouteResults.Timeout, RejectReasons.Expired);
+                var elapsedMs = (long)Stopwatch
+                    .GetElapsedTime(clientWaitStarted)
+                    .TotalMilliseconds;
+                var remainingBudgetMs = (long)waitBudgetMs - elapsedMs;
+                if (remainingBudgetMs <= 0)
+                {
+                    return ActivationTimeout(activationRequestId);
+                }
+
+                var now = clock.UtcNowMs;
+                var statusMsg = MessageFactory.ActivationStatus(
+                    clock,
+                    activationRequestId);
+                // Envelope time remains wall-clock protocol data, but its TTL
+                // is derived from the monotonic local wait budget.
+                var envelopeTtlMs = Math.Clamp(
+                    (int)Math.Min(
+                        remainingBudgetMs,
+                        ProtocolConstants.MaxRequestTtlMs),
+                    ProtocolConstants.MinLeaseTtlMs,
+                    ProtocolConstants.MaxRequestTtlMs);
+                statusMsg.ExpiresAtMs = now + envelopeTtlMs;
+
+                last = await client
+                    .SendAsync(statusMsg, clientWaitToken)
+                    .ConfigureAwait(false);
+
+                if (!string.Equals(
+                        last.Result,
+                        RouteResults.Pending,
+                        StringComparison.Ordinal))
+                {
+                    // Preserve activationRequestId on the final response for callers.
+                    last.ActivationRequestId ??= activationRequestId;
+                    return last;
+                }
+
+                var sleepMs = Math.Min(
+                    50,
+                    Math.Max(
+                        1,
+                        (int)Math.Min(remainingBudgetMs, int.MaxValue) / 4));
+                await Task.Delay(sleepMs, clientWaitToken).ConfigureAwait(false);
             }
-
-            var statusMsg = MessageFactory.ActivationStatus(clock, activationRequestId);
-            // Ensure envelope expires after the remaining wait budget.
-            var remaining = Math.Max(ProtocolConstants.MinLeaseTtlMs, (int)Math.Min(deadlineMs - now, ProtocolConstants.MaxRequestTtlMs));
-            statusMsg.ExpiresAtMs = now + remaining;
-
-            last = await client.SendAsync(statusMsg).ConfigureAwait(false);
-
-            if (!string.Equals(last.Result, RouteResults.Pending, StringComparison.Ordinal))
-            {
-                // Preserve activationRequestId on the final response for callers.
-                last.ActivationRequestId ??= activationRequestId;
-                return last;
-            }
-
-            var sleep = Math.Min(50, Math.Max(10, (int)(deadlineMs - now) / 4));
-            await Task.Delay(sleep).ConfigureAwait(false);
         }
+        catch (OperationCanceledException) when (clientWaitToken.IsCancellationRequested)
+        {
+            return ActivationTimeout(activationRequestId);
+        }
+    }
+
+    private static RouteResponse ActivationTimeout(string activationRequestId)
+    {
+        var response = RouteResponse.Reject(
+            activationRequestId,
+            RouteResults.Timeout,
+            RejectReasons.Expired);
+        response.ActivationRequestId = activationRequestId;
+        return response;
     }
 
     private static async Task<int> RunSelfTestAsync()
@@ -289,7 +454,7 @@ public static class Program
         await dispatcher.DispatchAsync(MessageFactory.RegisterAdapter(clock, adapterKey, "mock")).ConfigureAwait(false);
         dispatcher.TrySetActivator(adapterKey, MockAdapterActivator.ConfirmSessionUrl);
         await dispatcher.DispatchAsync(MessageFactory.RegisterOwner(
-            clock, adapterKey, "owner-0001", "page-0001", instance, routing, pageFingerprint: "fp-a")).ConfigureAwait(false);
+            clock, adapterKey, "mock", "owner-0001", "page-0001", instance, routing, pageFingerprint: "fp-a")).ConfigureAwait(false);
 
         var freeze = await dispatcher.DispatchAsync(MessageFactory.Freeze(clock, "notif-unique-0001", instance, routing, "turn-complete")).ConfigureAwait(false);
         if (freeze.Result != RouteResults.Ready || string.IsNullOrEmpty(freeze.SnapshotId))
@@ -307,7 +472,7 @@ public static class Program
 
         // ambiguous
         await dispatcher.DispatchAsync(MessageFactory.RegisterOwner(
-            clock, adapterKey, "owner-0002", "page-0002", instance, routing, pageFingerprint: "fp-b")).ConfigureAwait(false);
+            clock, adapterKey, "mock", "owner-0002", "page-0002", instance, routing, pageFingerprint: "fp-b")).ConfigureAwait(false);
         var amb = await dispatcher.DispatchAsync(MessageFactory.Freeze(clock, "notif-amb-0001", instance, routing)).ConfigureAwait(false);
         if (amb.Result != RouteResults.Ambiguous || amb.CandidateCount != 2)
         {
@@ -323,11 +488,90 @@ public static class Program
             return 1;
         }
 
+        // first-session binding: later adapters cannot steal, offline does not fall back,
+        // and restoring the bound adapter resumes routing.
+        var bindingState = new RouteStateMachine(
+            clock,
+            daemonId: "selftest-binding",
+            bindings: new MemoryRouteBindingStore());
+        var bindingDispatcher = new RouteDispatcher(bindingState, clock);
+        var chromeAdapter = "adapter-binding-chrome";
+        var desktopAdapter = "adapter-binding-desktop";
+        await bindingDispatcher.DispatchAsync(
+            MessageFactory.RegisterAdapter(clock, chromeAdapter, "chrome")).ConfigureAwait(false);
+        await bindingDispatcher.DispatchAsync(
+            MessageFactory.RegisterAdapter(clock, desktopAdapter, "pi-web-desktop")).ConfigureAwait(false);
+
+        var bindingRouting = RoutingKey.Compute(instance, "session-first-binding-example");
+        await bindingDispatcher.DispatchAsync(MessageFactory.RegisterOwner(
+            clock,
+            chromeAdapter,
+            "chrome",
+            "owner-binding-chrome",
+            "page-binding-chrome",
+            instance,
+            bindingRouting,
+            ownerEvent: OwnerEvents.ExplicitOpen,
+            openEventId: "event-binding-chrome",
+            openedAtMs: clock.UtcNowMs)).ConfigureAwait(false);
+        clock.AdvanceMs(10);
+        await bindingDispatcher.DispatchAsync(MessageFactory.RegisterOwner(
+            clock,
+            desktopAdapter,
+            "pi-web-desktop",
+            "owner-binding-desktop",
+            "page-binding-desktop",
+            instance,
+            bindingRouting,
+            ownerEvent: OwnerEvents.ExplicitOpen,
+            openEventId: "event-binding-desktop",
+            openedAtMs: clock.UtcNowMs)).ConfigureAwait(false);
+
+        var bound = await bindingDispatcher.DispatchAsync(
+            MessageFactory.Freeze(clock, "notif-binding-0001", instance, bindingRouting)).ConfigureAwait(false);
+        if (bound.Result != RouteResults.Ready || bound.AdapterKind != "chrome")
+        {
+            SafeLog.Error("self-test-fail", ("case", "first-binding"), ("result", bound.Result), ("adapterKind", bound.AdapterKind));
+            return 1;
+        }
+
+        await bindingDispatcher.DispatchAsync(
+            MessageFactory.UnregisterOwner(
+                clock,
+                chromeAdapter,
+                "owner-binding-chrome")).ConfigureAwait(false);
+        var boundOffline = await bindingDispatcher.DispatchAsync(
+            MessageFactory.Freeze(clock, "notif-binding-offline-0001", instance, bindingRouting)).ConfigureAwait(false);
+        if (boundOffline.Result != RouteResults.Miss ||
+            boundOffline.Reason != RouteResults.OwnerUnresolved)
+        {
+            SafeLog.Error("self-test-fail", ("case", "bound-offline"), ("result", boundOffline.Result), ("reason", boundOffline.Reason));
+            return 1;
+        }
+
+        await bindingDispatcher.DispatchAsync(MessageFactory.RegisterOwner(
+            clock,
+            chromeAdapter,
+            "chrome",
+            "owner-binding-chrome-restored",
+            "page-binding-chrome-restored",
+            instance,
+            bindingRouting,
+            ownerEvent: OwnerEvents.Restore)).ConfigureAwait(false);
+        var boundRestored = await bindingDispatcher.DispatchAsync(
+            MessageFactory.Freeze(clock, "notif-binding-restored-0001", instance, bindingRouting)).ConfigureAwait(false);
+        if (boundRestored.Result != RouteResults.Ready || boundRestored.AdapterKind != "chrome")
+        {
+            SafeLog.Error("self-test-fail", ("case", "bound-restored"), ("result", boundRestored.Result), ("adapterKind", boundRestored.AdapterKind));
+            return 1;
+        }
+
         Console.Out.WriteLine(JsonSerializer.Serialize(new
         {
             result = "ok",
             daemonId = state.DaemonId,
             routingFingerprint = RoutingKey.Fingerprint(routing),
+            binding = "first-opener",
         }, JsonDefaults.Options));
         return 0;
     }

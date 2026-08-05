@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.IO.Pipes;
 using PiNotifyRouteHost.Framing;
 using PiNotifyRouteHost.Logging;
@@ -6,21 +7,46 @@ using PiNotifyRouteHost.Protocol;
 namespace PiNotifyRouteHost.Host;
 
 /// <summary>
-/// Daemon named-pipe listener. On Windows, pipe name is user-session local by convention
-/// (Local\ scope via name choice at install time). Cross-platform byte-mode framing for tests.
+/// Daemon named-pipe listener. The production default uses Windows LOCAL\ pipe
+/// scope so independent login sessions cannot share one daemon endpoint.
 /// </summary>
 public sealed class NamedPipeRouteServer : IAsyncDisposable
 {
     private readonly RouteDispatcher _dispatcher;
     private readonly string _pipeName;
+    private readonly TimeSpan _clientIdleTimeout;
+    private readonly TimeSpan _clientWriteTimeout;
     private readonly CancellationTokenSource _cts = new();
+    private readonly ConcurrentDictionary<long, Task> _clientTasks = new();
     private Task? _acceptLoop;
     private int _started;
+    private long _nextClientId;
 
-    public NamedPipeRouteServer(RouteDispatcher dispatcher, string? pipeName = null)
+    public NamedPipeRouteServer(
+        RouteDispatcher dispatcher,
+        string? pipeName = null,
+        TimeSpan? clientIdleTimeout = null,
+        TimeSpan? clientWriteTimeout = null)
     {
         _dispatcher = dispatcher;
         _pipeName = PipeNames.GetDaemonPipeName(pipeName);
+        _clientIdleTimeout = clientIdleTimeout ??
+            TimeSpan.FromMilliseconds(
+                ProtocolConstants.PipeClientIdleTimeoutMs);
+        if (_clientIdleTimeout <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(clientIdleTimeout));
+        }
+
+        _clientWriteTimeout = clientWriteTimeout ??
+            TimeSpan.FromMilliseconds(
+                ProtocolConstants.PipeClientWriteTimeoutMs);
+        if (_clientWriteTimeout <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(clientWriteTimeout));
+        }
     }
 
     public string PipeName => _pipeName;
@@ -47,7 +73,11 @@ public sealed class NamedPipeRouteServer : IAsyncDisposable
                 await pipe.WaitForConnectionAsync(ct).ConfigureAwait(false);
                 var connected = pipe;
                 pipe = null;
-                _ = Task.Run(() => HandleClientAsync(connected, ct), ct);
+                // Do not pass the shutdown token to Task.Run itself. If it is
+                // canceled between accept and scheduling, the delegate would
+                // never run and the accepted pipe would never be disposed.
+                TrackClient(
+                    Task.Run(() => HandleClientAsync(connected, ct)));
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
@@ -76,6 +106,8 @@ public sealed class NamedPipeRouteServer : IAsyncDisposable
     private async Task HandleClientAsync(NamedPipeServerStream pipe, CancellationToken ct)
     {
         await using (pipe)
+        using (var clientBudgetCts =
+               CancellationTokenSource.CreateLinkedTokenSource(ct))
         {
             try
             {
@@ -84,13 +116,30 @@ public sealed class NamedPipeRouteServer : IAsyncDisposable
                     byte[]? body;
                     try
                     {
-                        body = await LengthPrefixedJson.ReadAsync(pipe, ProtocolConstants.MaxMessageBytes, ct)
+                        clientBudgetCts.CancelAfter(_clientIdleTimeout);
+                        body = await LengthPrefixedJson
+                            .ReadAsync(
+                                pipe,
+                                ProtocolConstants.MaxMessageBytes,
+                                clientBudgetCts.Token)
                             .ConfigureAwait(false);
+                        clientBudgetCts.CancelAfter(
+                            Timeout.InfiniteTimeSpan);
                     }
                     catch (InvalidOperationException)
                     {
                         var err = RouteResponse.Reject(string.Empty, RouteResults.Oversized, RejectReasons.Oversized);
-                        await WriteResponseAsync(pipe, err, ct).ConfigureAwait(false);
+                        await TryWriteResponseAsync(
+                                pipe,
+                                err,
+                                clientBudgetCts,
+                                ct)
+                            .ConfigureAwait(false);
+                        break;
+                    }
+                    catch (OperationCanceledException)
+                        when (!ct.IsCancellationRequested)
+                    {
                         break;
                     }
 
@@ -103,12 +152,28 @@ public sealed class NamedPipeRouteServer : IAsyncDisposable
                     if (msg is null)
                     {
                         var err = RouteResponse.Reject(string.Empty, RouteResults.Rejected, parseError ?? RejectReasons.InvalidField);
-                        await WriteResponseAsync(pipe, err, ct).ConfigureAwait(false);
+                        if (!await TryWriteResponseAsync(
+                                pipe,
+                                err,
+                                clientBudgetCts,
+                                ct)
+                            .ConfigureAwait(false))
+                        {
+                            break;
+                        }
                         continue;
                     }
 
                     var response = await _dispatcher.DispatchAsync(msg, ct).ConfigureAwait(false);
-                    await WriteResponseAsync(pipe, response, ct).ConfigureAwait(false);
+                    if (!await TryWriteResponseAsync(
+                            pipe,
+                            response,
+                            clientBudgetCts,
+                            ct)
+                        .ConfigureAwait(false))
+                    {
+                        break;
+                    }
                 }
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -126,10 +191,42 @@ public sealed class NamedPipeRouteServer : IAsyncDisposable
         }
     }
 
-    private static async Task WriteResponseAsync(Stream pipe, RouteResponse response, CancellationToken ct)
+    private void TrackClient(Task clientTask)
     {
-        var bytes = response.ToUtf8Bytes();
-        await LengthPrefixedJson.WriteAsync(pipe, bytes, ct).ConfigureAwait(false);
+        var clientId = Interlocked.Increment(ref _nextClientId);
+        _clientTasks[clientId] = clientTask;
+        _ = clientTask.ContinueWith(
+            completed =>
+            {
+                _ = completed.Exception;
+                _clientTasks.TryRemove(clientId, out _);
+            },
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
+    }
+
+    private async Task<bool> TryWriteResponseAsync(
+        Stream pipe,
+        RouteResponse response,
+        CancellationTokenSource clientBudgetCts,
+        CancellationToken shutdownToken)
+    {
+        try
+        {
+            clientBudgetCts.CancelAfter(_clientWriteTimeout);
+            var bytes = response.ToUtf8Bytes();
+            await LengthPrefixedJson
+                .WriteAsync(pipe, bytes, clientBudgetCts.Token)
+                .ConfigureAwait(false);
+            clientBudgetCts.CancelAfter(Timeout.InfiniteTimeSpan);
+            return true;
+        }
+        catch (OperationCanceledException)
+            when (!shutdownToken.IsCancellationRequested)
+        {
+            return false;
+        }
     }
 
     private NamedPipeServerStream CreateServerStream()
@@ -158,6 +255,19 @@ public sealed class NamedPipeRouteServer : IAsyncDisposable
             catch (OperationCanceledException)
             {
                 // expected
+            }
+        }
+
+        var clientTasks = _clientTasks.Values.ToArray();
+        if (clientTasks.Length > 0)
+        {
+            try
+            {
+                await Task.WhenAll(clientTasks).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                // Expected after the server shutdown token is canceled.
             }
         }
 

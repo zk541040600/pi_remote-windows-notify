@@ -2,6 +2,8 @@ namespace PiNotifyRouteHost.Host;
 
 public static class PipeNames
 {
+    private const string SessionLocalPrefix = @"LOCAL\";
+
     /// <summary>
     /// Current-user scoped named pipe base. On Windows the OS isolates Local\\ pipes per session;
     /// we still embed a stable product name only (no secrets).
@@ -12,8 +14,21 @@ public static class PipeNames
             ? Protocol.ProtocolConstants.DefaultPipeName
             : overrideName.Trim();
 
-        // Keep pipe name simple and allowlist-safe.
-        foreach (var c in baseName)
+        var isSessionLocal = baseName.StartsWith(
+            SessionLocalPrefix,
+            StringComparison.OrdinalIgnoreCase);
+        var simpleName = isSessionLocal
+            ? baseName[SessionLocalPrefix.Length..]
+            : baseName;
+        if (simpleName.Length == 0)
+        {
+            throw new ArgumentException(
+                "Pipe name must not be empty.",
+                nameof(overrideName));
+        }
+
+        // Allow only the Windows login-session prefix plus one simple name.
+        foreach (var c in simpleName)
         {
             if (!(char.IsAsciiLetterOrDigit(c) || c is '-' or '_' or '.'))
             {
@@ -21,6 +36,8 @@ public static class PipeNames
             }
         }
 
-        return baseName;
+        return isSessionLocal
+            ? SessionLocalPrefix + simpleName
+            : simpleName;
     }
 }

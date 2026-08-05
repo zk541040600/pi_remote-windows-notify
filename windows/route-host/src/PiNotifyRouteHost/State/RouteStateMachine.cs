@@ -1,3 +1,5 @@
+using System.Diagnostics;
+using System.Security.Cryptography;
 using PiNotifyRouteHost.Logging;
 using PiNotifyRouteHost.Protocol;
 
@@ -10,88 +12,90 @@ namespace PiNotifyRouteHost.State;
 public sealed class RouteStateMachine
 {
     private readonly IClock _clock;
-    private readonly IRoutePreferenceStore _preferences;
+    private readonly IRouteBindingStore _bindings;
     private readonly object _gate = new();
     private readonly Dictionary<string, LiveAdapter> _adapters = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, AdapterGenerationFence> _adapterGenerationFences =
+        new(StringComparer.Ordinal);
     private readonly Dictionary<string, LiveOwner> _ownersByKey = new(StringComparer.Ordinal);
     private readonly Dictionary<SessionRouteKey, HashSet<string>> _ownersBySession = new();
     private readonly Dictionary<string, NotificationSnapshot> _snapshotsByNotification = new(StringComparer.Ordinal);
     private readonly Dictionary<string, NotificationSnapshot> _snapshotsById = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, NotificationRecoveryTicket> _recoveriesByNotification = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, NotificationRecoveryTicket> _recoveriesById = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, RecoveryTombstone> _recoveryTombstones = new(StringComparer.Ordinal);
     private readonly Dictionary<string, ReplayEntry> _replay = new(StringComparer.Ordinal);
     /// <summary>activationRequestId -> pending/completed external activation.</summary>
     private readonly Dictionary<string, PendingActivation> _activations = new(StringComparer.Ordinal);
     /// <summary>adapterKey -> FIFO queue of undelivered activationRequestIds.</summary>
     private readonly Dictionary<string, Queue<string>> _pendingByAdapter = new(StringComparer.Ordinal);
     private readonly string _daemonId;
+    private long _lastObservedUtcMs;
 
     public RouteStateMachine(
         IClock? clock = null,
         string? daemonId = null,
-        IRoutePreferenceStore? preferences = null)
+        IRouteBindingStore? bindings = null)
     {
         _clock = clock ?? new SystemClock();
         _daemonId = daemonId ?? Guid.NewGuid().ToString("N");
-        _preferences = preferences ?? new MemoryRoutePreferenceStore();
+        _bindings = bindings ?? new MemoryRouteBindingStore();
+        _lastObservedUtcMs = _clock.UtcNowMs;
     }
 
     public string DaemonId => _daemonId;
 
     public int LiveAdapterCount
     {
-        get { lock (_gate) { SweepExpired_NoLock(); return _adapters.Count; } }
+        get { lock (_gate) { ObserveNowAndSweep_NoLock(); return _adapters.Count; } }
     }
 
     public int LiveOwnerCount
     {
-        get { lock (_gate) { SweepExpired_NoLock(); return _ownersByKey.Count; } }
+        get { lock (_gate) { ObserveNowAndSweep_NoLock(); return _ownersByKey.Count; } }
     }
 
     public int SnapshotCount
     {
-        get { lock (_gate) { SweepExpired_NoLock(); return _snapshotsById.Count; } }
+        get { lock (_gate) { ObserveNowAndSweep_NoLock(); return _snapshotsById.Count; } }
     }
 
     public RouteResponse Handle(RouteMessage msg)
     {
-        var now = _clock.UtcNowMs;
-        var started = now;
-
-        var envelopeError = MessageValidator.ValidateEnvelope(msg, now, ProtocolConstants.MaxMessageBytes);
-        if (envelopeError is not null)
-        {
-            return envelopeError;
-        }
+        var started = Stopwatch.GetTimestamp();
 
         lock (_gate)
         {
-            SweepExpired_NoLock();
-
-            // Replay protection: identical requestId returns cached response (idempotent).
-            if (_replay.TryGetValue(msg.RequestId, out var existing) && existing.ExpiresAtMs >= now)
+            var clockError = ObserveRequestNow_NoLock(
+                msg.RequestId,
+                out var now);
+            if (clockError is not null)
             {
-                var cached = CloneResponse(existing.Response);
-                cached.Reason = existing.Response.Reason ?? RejectReasons.Replay;
-                if (cached.Result is RouteResults.Ready or RouteResults.Ok or RouteResults.SessionUrlConfirmed
-                    or RouteResults.AlreadyActive or RouteResults.Accepted or RouteResults.SessionConfirmed)
-                {
-                    // Keep original success result; mark reason as replay for observability.
-                    cached.Reason = RejectReasons.Replay;
-                }
-                else if (string.IsNullOrEmpty(cached.Result) || cached.Result == RouteResults.Ok)
-                {
-                    cached.Result = RouteResults.Replay;
-                }
-
-                return cached;
+                return clockError;
+            }
+            var envelopeError = MessageValidator.ValidateEnvelope(
+                msg,
+                now,
+                ProtocolConstants.MaxMessageBytes);
+            if (envelopeError is not null)
+            {
+                return envelopeError;
             }
 
-            if (msg.Nonce is not null)
+            // Replay protection: identical requestId returns cached response (idempotent).
+            var replay = GetRequestReplay_NoLock(msg, now, markSuccessfulReplay: true);
+            if (replay is not null)
             {
-                var nonceKey = "nonce:" + msg.Nonce;
-                if (_replay.TryGetValue(nonceKey, out var nonceHit) && nonceHit.ExpiresAtMs >= now)
-                {
-                    return Remember_NoLock(msg, RouteResponse.Reject(msg.RequestId, RouteResults.Replay, RejectReasons.Replay), now);
-                }
+                return replay;
+            }
+
+            var nonceReplay = GetNonceReplay_NoLock(
+                msg,
+                now,
+                markSuccessfulReplay: true);
+            if (nonceReplay is not null)
+            {
+                return nonceReplay;
             }
 
             RouteResponse response = msg.Type switch
@@ -99,10 +103,12 @@ public sealed class RouteStateMachine
                 MessageTypes.Health or MessageTypes.Ping => HandleHealth_NoLock(msg, now),
                 MessageTypes.RegisterAdapter => HandleRegisterAdapter_NoLock(msg, now),
                 MessageTypes.UnregisterAdapter => HandleUnregisterAdapter_NoLock(msg, now),
+                MessageTypes.RegisterOpenIntent => HandleRegisterOpenIntent_NoLock(msg, now),
                 MessageTypes.RegisterOwner => HandleRegisterOwner_NoLock(msg, now),
                 MessageTypes.UnregisterOwner => HandleUnregisterOwner_NoLock(msg, now),
                 MessageTypes.Heartbeat => HandleHeartbeat_NoLock(msg, now),
                 MessageTypes.Freeze => HandleFreeze_NoLock(msg, now),
+                MessageTypes.ResolveRecovery => HandleResolveRecovery_NoLock(msg, now),
                 // Activate is normally dispatched via RouteDispatcher (enqueue/in-process).
                 // Direct Handle path still enqueues for external adapters for consistency.
                 MessageTypes.Activate => HandleActivateEnqueue_NoLock(msg, now),
@@ -112,7 +118,7 @@ public sealed class RouteStateMachine
                 _ => RouteResponse.Reject(msg.RequestId, RouteResults.Rejected, RejectReasons.UnknownType),
             };
 
-            response.ElapsedMs = _clock.UtcNowMs - started;
+            response.ElapsedMs = (long)Stopwatch.GetElapsedTime(started).TotalMilliseconds;
             return Remember_NoLock(msg, response, now);
         }
     }
@@ -123,10 +129,15 @@ public sealed class RouteStateMachine
     /// </summary>
     public RouteResponse CompleteActivate(string requestId, string notificationId, string snapshotId, AdapterActivateResult adapterResult)
     {
-        var now = _clock.UtcNowMs;
         lock (_gate)
         {
-            SweepExpired_NoLock();
+            var clockError = ObserveRequestNow_NoLock(
+                requestId,
+                out var now);
+            if (clockError is not null)
+            {
+                return clockError;
+            }
 
             if (!_snapshotsById.TryGetValue(snapshotId, out var snap) ||
                 !string.Equals(snap.NotificationId, notificationId, StringComparison.Ordinal))
@@ -139,11 +150,22 @@ public sealed class RouteStateMachine
                 return RouteResponse.Reject(requestId, RouteResults.Stale, RejectReasons.Expired);
             }
 
+            if (!SnapshotMatchesCurrentBinding_NoLock(snap))
+            {
+                snap.LastActivateResult = RouteResults.Stale;
+                snap.LastActivateReason = RejectReasons.OwnerChanged;
+                return SnapshotBindingChangedResponse(requestId, snap);
+            }
+
             // Revalidate live owner still matches frozen page/owner/adapter/routing.
             if (!_ownersByKey.TryGetValue(snap.OwnerKey, out var owner) ||
                 owner.LeaseExpiresAtMs < now ||
                 !string.Equals(owner.PageKey, snap.PageKey, StringComparison.Ordinal) ||
                 !string.Equals(owner.AdapterKey, snap.AdapterKey, StringComparison.Ordinal) ||
+                !string.Equals(
+                    owner.AdapterGeneration,
+                    snap.AdapterGeneration,
+                    StringComparison.Ordinal) ||
                 !string.Equals(owner.InstanceKey, snap.InstanceKey, StringComparison.Ordinal) ||
                 !string.Equals(owner.RoutingKey, snap.RoutingKey, StringComparison.Ordinal) ||
                 (snap.PageFingerprint is not null &&
@@ -158,6 +180,7 @@ public sealed class RouteStateMachine
                     Result = RouteResults.Stale,
                     Reason = RejectReasons.OwnerChanged,
                     SnapshotId = snap.SnapshotId,
+                    ActivationRequestId = snap.ActivationRequestId,
                     RoutingFingerprint = RoutingKey.Fingerprint(snap.RoutingKey),
                     InstanceFingerprint = RoutingKey.FingerprintInstance(snap.InstanceKey),
                     OwnerFingerprint = SafeLog.OwnerFp(snap.OwnerKey),
@@ -165,7 +188,12 @@ public sealed class RouteStateMachine
                 };
             }
 
-            if (!_adapters.TryGetValue(snap.AdapterKey, out var adapter) || adapter.LeaseExpiresAtMs < now)
+            if (!_adapters.TryGetValue(snap.AdapterKey, out var adapter) ||
+                adapter.LeaseExpiresAtMs < now ||
+                !string.Equals(
+                    adapter.AdapterGeneration,
+                    snap.AdapterGeneration,
+                    StringComparison.Ordinal))
             {
                 snap.LastActivateResult = RouteResults.AdapterUnavailable;
                 snap.LastActivateReason = RejectReasons.LeaseExpired;
@@ -175,11 +203,13 @@ public sealed class RouteStateMachine
                     Result = RouteResults.AdapterUnavailable,
                     Reason = RejectReasons.LeaseExpired,
                     SnapshotId = snap.SnapshotId,
+                    ActivationRequestId = snap.ActivationRequestId,
                 };
             }
 
             snap.LastActivateResult = adapterResult.Result;
             snap.LastActivateReason = adapterResult.Reason;
+            snap.ActivationRequestId ??= requestId;
 
             return new RouteResponse
             {
@@ -187,6 +217,7 @@ public sealed class RouteStateMachine
                 Result = adapterResult.Result,
                 Reason = adapterResult.Reason,
                 SnapshotId = snap.SnapshotId,
+                ActivationRequestId = snap.ActivationRequestId,
                 AdapterKind = snap.AdapterKind,
                 OwnerFingerprint = SafeLog.OwnerFp(snap.OwnerKey),
                 RoutingFingerprint = RoutingKey.Fingerprint(snap.RoutingKey),
@@ -202,10 +233,15 @@ public sealed class RouteStateMachine
     /// </summary>
     public (RouteResponse? Early, NotificationSnapshot? Snapshot, LiveAdapter? Adapter) BeginActivate(RouteMessage msg)
     {
-        var now = _clock.UtcNowMs;
         lock (_gate)
         {
-            SweepExpired_NoLock();
+            var clockError = ObserveRequestNow_NoLock(
+                msg.RequestId,
+                out var now);
+            if (clockError is not null)
+            {
+                return (clockError, null, null);
+            }
 
             var envelopeError = MessageValidator.ValidateEnvelope(msg, now, ProtocolConstants.MaxMessageBytes);
             if (envelopeError is not null)
@@ -213,9 +249,19 @@ public sealed class RouteStateMachine
                 return (envelopeError, null, null);
             }
 
-            if (_replay.TryGetValue(msg.RequestId, out var existing) && existing.ExpiresAtMs >= now)
+            var replay = GetRequestReplay_NoLock(msg, now, markSuccessfulReplay: false);
+            if (replay is not null)
             {
-                return (CloneResponse(existing.Response), null, null);
+                return (replay, null, null);
+            }
+
+            var nonceReplay = GetNonceReplay_NoLock(
+                msg,
+                now,
+                markSuccessfulReplay: false);
+            if (nonceReplay is not null)
+            {
+                return (nonceReplay, null, null);
             }
 
             var (early, snap, adapter) = BeginActivateUnlocked(msg, now);
@@ -224,16 +270,37 @@ public sealed class RouteStateMachine
                 return (Remember_NoLock(msg, early, now), null, null);
             }
 
+            // Reserve the request identity before an in-process activator runs
+            // outside the state lock. An exact concurrent retry observes this
+            // pending replay instead of invoking the foreground side effect twice.
+            Remember_NoLock(
+                msg,
+                new RouteResponse
+                {
+                    RequestId = msg.RequestId,
+                    Result = RouteResults.Pending,
+                    Reason = RejectReasons.Replay,
+                    SnapshotId = snap!.SnapshotId,
+                    ActivationRequestId = msg.RequestId,
+                    AdapterKind = adapter!.AdapterKind,
+                },
+                now);
             return (null, snap, adapter);
         }
     }
 
-    public void RememberActivateResponse(RouteMessage msg, RouteResponse response)
+    public RouteResponse RememberActivateResponse(RouteMessage msg, RouteResponse response)
     {
-        var now = _clock.UtcNowMs;
         lock (_gate)
         {
-            Remember_NoLock(msg, response, now);
+            var clockError = ObserveRequestNow_NoLock(
+                msg.RequestId,
+                out var now);
+            if (clockError is not null)
+            {
+                return clockError;
+            }
+            return Remember_NoLock(msg, response, now);
         }
     }
 
@@ -241,7 +308,7 @@ public sealed class RouteStateMachine
     {
         lock (_gate)
         {
-            SweepExpired_NoLock();
+            ObserveNowAndSweep_NoLock();
             return _adapters.TryGetValue(adapterKey, out var a) ? a : null;
         }
     }
@@ -250,7 +317,7 @@ public sealed class RouteStateMachine
     {
         lock (_gate)
         {
-            SweepExpired_NoLock();
+            ObserveNowAndSweep_NoLock();
             return _snapshotsById.TryGetValue(snapshotId, out var s) ? s : null;
         }
     }
@@ -259,7 +326,7 @@ public sealed class RouteStateMachine
     {
         lock (_gate)
         {
-            SweepExpired_NoLock();
+            ObserveNowAndSweep_NoLock();
             var key = new SessionRouteKey(instanceKey, routingKey);
             if (!_ownersBySession.TryGetValue(key, out var set))
             {
@@ -275,14 +342,9 @@ public sealed class RouteStateMachine
     {
         lock (_gate)
         {
-            _adapters.Clear();
-            _ownersByKey.Clear();
-            _ownersBySession.Clear();
-            _snapshotsByNotification.Clear();
-            _snapshotsById.Clear();
-            _replay.Clear();
-            _activations.Clear();
-            _pendingByAdapter.Clear();
+            ClearRuntimeState_NoLock();
+            _adapterGenerationFences.Clear();
+            _lastObservedUtcMs = _clock.UtcNowMs;
         }
     }
 
@@ -290,14 +352,14 @@ public sealed class RouteStateMachine
     {
         lock (_gate)
         {
-            SweepExpired_NoLock();
+            ObserveNowAndSweep_NoLock();
             return _activations.TryGetValue(activationRequestId, out var a) ? a : null;
         }
     }
 
     public int PendingActivationCount
     {
-        get { lock (_gate) { SweepExpired_NoLock(); return _activations.Count(a => !a.Value.Completed); } }
+        get { lock (_gate) { ObserveNowAndSweep_NoLock(); return _activations.Count(a => !a.Value.Completed); } }
     }
 
     private RouteResponse HandleHealth_NoLock(RouteMessage msg, long now)
@@ -337,6 +399,54 @@ public sealed class RouteStateMachine
             return err;
         }
 
+        var candidateIdentity = new AdapterBindingIdentity
+        {
+            AdapterKind = msg.AdapterKind!,
+            BrowserKind = msg.BrowserKind!,
+            ProfileKey = msg.ProfileKey!,
+        };
+        if (!_bindings.IsAdapterIdentityCompatible(
+                msg.AdapterKey!,
+                candidateIdentity))
+        {
+            return RouteResponse.Reject(
+                msg.RequestId,
+                RouteResults.Rejected,
+                RejectReasons.InvalidField);
+        }
+
+        if (_adapterGenerationFences.TryGetValue(msg.AdapterKey!, out var fence))
+        {
+            if (!RouteBindingStoreLogic.IdentityMatches(fence.Identity, candidateIdentity))
+            {
+                return RouteResponse.Reject(
+                    msg.RequestId,
+                    RouteResults.Rejected,
+                    RejectReasons.InvalidField);
+            }
+
+            if (msg.AdapterStartedAtMs!.Value < fence.AdapterStartedAtMs ||
+                (msg.AdapterStartedAtMs.Value == fence.AdapterStartedAtMs &&
+                 !string.Equals(
+                     msg.AdapterGeneration,
+                     fence.AdapterGeneration,
+                     StringComparison.Ordinal)))
+            {
+                return RejectAdapterGeneration_NoLock(msg.RequestId);
+            }
+        }
+        else if (_adapterGenerationFences.Count >=
+                 ProtocolConstants.MaxAdapterGenerationFences)
+        {
+            // Never evict a generation fence: doing so would allow a delayed
+            // superseded process to reclaim that adapter key. New keys fail
+            // closed until the next daemon epoch instead.
+            return RouteResponse.Reject(
+                msg.RequestId,
+                RouteResults.Rejected,
+                RejectReasons.Capacity);
+        }
+
         if (!_adapters.ContainsKey(msg.AdapterKey!) && _adapters.Count >= ProtocolConstants.MaxAdapters)
         {
             return RouteResponse.Reject(msg.RequestId, RouteResults.Rejected, RejectReasons.Capacity);
@@ -345,22 +455,82 @@ public sealed class RouteStateMachine
         var ttl = msg.LeaseTtlMs ?? ProtocolConstants.DefaultLeaseTtlMs;
         if (_adapters.TryGetValue(msg.AdapterKey!, out var existing))
         {
-            existing.LeaseExpiresAtMs = now + ttl;
-            existing.LastHeartbeatMs = now;
-            // Preserve in-process activator across heartbeats.
+            if (!AdapterIdentityMatches(existing, msg))
+            {
+                // adapterKey is the durable first-binding identity. Reusing it for another
+                // browser/profile/surface would silently transfer or merge session ownership.
+                return RouteResponse.Reject(
+                    msg.RequestId,
+                    RouteResults.Rejected,
+                    RejectReasons.InvalidField);
+            }
+
+            if (string.Equals(
+                    existing.AdapterGeneration,
+                    msg.AdapterGeneration,
+                    StringComparison.Ordinal))
+            {
+                if (existing.AdapterStartedAtMs != msg.AdapterStartedAtMs)
+                {
+                    return RouteResponse.Reject(
+                        msg.RequestId,
+                        RouteResults.Rejected,
+                        RejectReasons.InvalidField);
+                }
+
+                // A lost acknowledgement can cause the same runtime to retry
+                // register-adapter with a fresh request ID. This is a lease
+                // refresh, not a new generation barrier.
+                existing.LeaseExpiresAtMs = now + ttl;
+                existing.LastHeartbeatMs = now;
+                RememberAdapterGeneration_NoLock(msg, candidateIdentity);
+                return RouteResponse.Ok(msg.RequestId);
+            }
+
+            if (msg.AdapterStartedAtMs!.Value <= existing.AdapterStartedAtMs)
+            {
+                // A delayed frame from an older process must never take the
+                // adapter back from the newer live generation.
+                return RejectAdapterGeneration_NoLock(msg.RequestId);
+            }
+
+            // A genuinely newer process/connection generation is the barrier.
+            // It rebuilds owner/page keys, so retaining the prior generation
+            // would make restored sessions ambiguous until lease expiry.
+            var activator = existing.Activator;
+            ClearAdapterRuntimeState_NoLock(msg.AdapterKey!, now);
+            _adapters[msg.AdapterKey!] = new LiveAdapter
+            {
+                AdapterKey = msg.AdapterKey!,
+                AdapterGeneration = msg.AdapterGeneration!,
+                AdapterStartedAtMs = msg.AdapterStartedAtMs.Value,
+                AdapterKind = msg.AdapterKind!,
+                BrowserKind = msg.BrowserKind!,
+                ProfileKey = msg.ProfileKey!,
+                LeaseExpiresAtMs = now + ttl,
+                RegisteredAtMs = now,
+                LastHeartbeatMs = now,
+                // Preserve the optional in-process test activator; production
+                // adapters republish current owners immediately.
+                Activator = activator,
+            };
+            RememberAdapterGeneration_NoLock(msg, candidateIdentity);
             return RouteResponse.Ok(msg.RequestId);
         }
 
         _adapters[msg.AdapterKey!] = new LiveAdapter
         {
             AdapterKey = msg.AdapterKey!,
+            AdapterGeneration = msg.AdapterGeneration!,
+            AdapterStartedAtMs = msg.AdapterStartedAtMs!.Value,
             AdapterKind = msg.AdapterKind!,
-            BrowserKind = msg.BrowserKind,
-            ProfileKey = msg.ProfileKey,
+            BrowserKind = msg.BrowserKind!,
+            ProfileKey = msg.ProfileKey!,
             LeaseExpiresAtMs = now + ttl,
             RegisteredAtMs = now,
             LastHeartbeatMs = now,
         };
+        RememberAdapterGeneration_NoLock(msg, candidateIdentity);
 
         SafeLog.Info("adapter-register",
             ("adapterKind", msg.AdapterKind),
@@ -371,32 +541,97 @@ public sealed class RouteStateMachine
 
     private RouteResponse HandleUnregisterAdapter_NoLock(RouteMessage msg, long now)
     {
-        if (string.IsNullOrWhiteSpace(msg.AdapterKey))
+        if (!_adapters.TryGetValue(msg.AdapterKey!, out var adapter))
         {
-            return RouteResponse.Reject(msg.RequestId, RouteResults.Rejected, RejectReasons.MissingField);
+            // Repeating an already completed unregister is harmless.
+            return RouteResponse.Ok(msg.RequestId);
         }
 
-        if (_adapters.Remove(msg.AdapterKey!))
+        if (!AdapterGenerationMatches(adapter, msg))
         {
-            // Drop owners owned by this adapter.
-            var toRemove = _ownersByKey.Values.Where(o => o.AdapterKey == msg.AdapterKey).Select(o => o.OwnerKey).ToList();
-            foreach (var ownerKey in toRemove)
-            {
-                RemoveOwner_NoLock(ownerKey);
-            }
-
-            // Fail-closed: open activations for this adapter become adapter-unavailable.
-            foreach (var pending in _activations.Values
-                         .Where(a => string.Equals(a.AdapterKey, msg.AdapterKey, StringComparison.Ordinal) && !a.Completed)
-                         .ToList())
-            {
-                CompleteActivation_NoLock(pending, RouteResults.AdapterUnavailable, RejectReasons.AdapterUnknown, null, now);
-            }
-
-            _pendingByAdapter.Remove(msg.AdapterKey!);
+            return RejectAdapterGeneration_NoLock(msg.RequestId);
         }
 
+        _adapters.Remove(msg.AdapterKey!);
+        ClearAdapterRuntimeState_NoLock(msg.AdapterKey!, now);
         return RouteResponse.Ok(msg.RequestId);
+    }
+
+    private void ClearAdapterRuntimeState_NoLock(string adapterKey, long now)
+    {
+        var toRemove = _ownersByKey.Values
+            .Where(owner => string.Equals(
+                owner.AdapterKey,
+                adapterKey,
+                StringComparison.Ordinal))
+            .Select(owner => owner.OwnerKey)
+            .ToList();
+        foreach (var ownerKey in toRemove)
+        {
+            RemoveOwner_NoLock(ownerKey);
+        }
+
+        // Commands handed to the old process generation must never be claimed
+        // or completed by its replacement.
+        foreach (var pending in _activations.Values
+                     .Where(activation =>
+                         string.Equals(
+                             activation.AdapterKey,
+                             adapterKey,
+                             StringComparison.Ordinal) &&
+                         !activation.Completed)
+                     .ToList())
+        {
+            CompleteActivation_NoLock(
+                pending,
+                RouteResults.AdapterUnavailable,
+                RejectReasons.AdapterUnknown,
+                null,
+                now);
+        }
+
+        _pendingByAdapter.Remove(adapterKey);
+    }
+
+    private RouteResponse HandleRegisterOpenIntent_NoLock(
+        RouteMessage msg,
+        long now)
+    {
+        var err = MessageValidator.ValidateRegisterOpenIntent(msg);
+        if (err is not null)
+        {
+            return err;
+        }
+
+        if (!_adapters.TryGetValue(msg.AdapterKey!, out var adapter) ||
+            adapter.LeaseExpiresAtMs < now)
+        {
+            return RouteResponse.Reject(
+                msg.RequestId,
+                RouteResults.AdapterUnavailable,
+                RejectReasons.AdapterUnknown);
+        }
+
+        if (!AdapterGenerationMatches(adapter, msg))
+        {
+            return RejectAdapterGeneration_NoLock(msg.RequestId);
+        }
+
+        if (!AdapterIdentityMatches(adapter, msg))
+        {
+            return RouteResponse.Reject(
+                msg.RequestId,
+                RouteResults.Rejected,
+                RejectReasons.InvalidField);
+        }
+
+        var bindingError = ValidateAndBindExplicitOpen_NoLock(
+            msg,
+            adapter,
+            new SessionRouteKey(msg.InstanceKey!, msg.RoutingKey!),
+            now,
+            bindExplicitOpen: true);
+        return bindingError ?? RouteResponse.Ok(msg.RequestId);
     }
 
     private RouteResponse HandleRegisterOwner_NoLock(RouteMessage msg, long now)
@@ -407,30 +642,95 @@ public sealed class RouteStateMachine
             return err;
         }
 
-        if (!_adapters.TryGetValue(msg.AdapterKey!, out var adapter) || adapter.LeaseExpiresAtMs < now)
+        if (!_adapters.TryGetValue(msg.AdapterKey!, out var adapter) ||
+            adapter.LeaseExpiresAtMs < now)
         {
             return RouteResponse.Reject(msg.RequestId, RouteResults.AdapterUnavailable, RejectReasons.AdapterUnknown);
         }
 
-        var ttl = msg.LeaseTtlMs ?? ProtocolConstants.DefaultLeaseTtlMs;
-        var sessionKey = new SessionRouteKey(msg.InstanceKey!, msg.RoutingKey!);
-
-        if (string.Equals(msg.OwnerEvent, OwnerEvents.ExplicitOpen, StringComparison.Ordinal) &&
-            !_preferences.TryRecordExplicitOpen(
-                sessionKey,
-                msg.AdapterKey!,
-                msg.OpenEventId!,
-                msg.OpenedAtMs!.Value,
-                out _))
+        if (!AdapterGenerationMatches(adapter, msg))
         {
-            // Do not acknowledge an ordering mutation that cannot survive daemon restart.
+            return RejectAdapterGeneration_NoLock(msg.RequestId);
+        }
+
+        if (!AdapterIdentityMatches(adapter, msg))
+        {
+            // Real Chrome/Desktop publications repeat adapter identity. This closes the
+            // owner path after a colliding adapter registration was rejected.
             return RouteResponse.Reject(
                 msg.RequestId,
                 RouteResults.Rejected,
-                RejectReasons.PreferencePersistFailed);
+                RejectReasons.InvalidField);
         }
 
-        if (_ownersByKey.TryGetValue(msg.OwnerKey!, out var existing))
+        _ownersByKey.TryGetValue(msg.OwnerKey!, out var existing);
+        if (existing is not null &&
+            (!string.Equals(existing.AdapterKey, msg.AdapterKey, StringComparison.Ordinal) ||
+             !string.Equals(
+                 existing.AdapterGeneration,
+                 msg.AdapterGeneration,
+                 StringComparison.Ordinal)))
+        {
+            // ownerKey is the immutable child identity captured by notification snapshots.
+            // Reparenting it would invalidate frozen targets and could strand the durable
+            // adapter binding. Reject before any binding-store mutation.
+            return RouteResponse.Reject(
+                msg.RequestId,
+                RouteResults.Rejected,
+                RejectReasons.OwnerChanged);
+        }
+
+        LiveOwner? predecessor = null;
+        if (msg.ReplacesOwnerKey is not null &&
+            _ownersByKey.TryGetValue(msg.ReplacesOwnerKey, out predecessor) &&
+            (!string.Equals(
+                 predecessor.AdapterKey,
+                 msg.AdapterKey,
+                 StringComparison.Ordinal) ||
+             !string.Equals(
+                 predecessor.AdapterGeneration,
+                 msg.AdapterGeneration,
+                 StringComparison.Ordinal)))
+        {
+            return RouteResponse.Reject(
+                msg.RequestId,
+                RouteResults.Rejected,
+                RejectReasons.OwnerChanged);
+        }
+
+        // Capacity is an admission decision, so it must happen before durable
+        // first-opener binding is mutated. A rejected owner must never create
+        // or correct a phantom session binding.
+        var projectedOwnerCount = _ownersByKey.Count +
+            (existing is null ? 1 : 0) -
+            (predecessor is null ? 0 : 1);
+        if (projectedOwnerCount > ProtocolConstants.MaxOwners)
+        {
+            return RouteResponse.Reject(msg.RequestId, RouteResults.Rejected, RejectReasons.Capacity);
+        }
+
+        var ttl = msg.LeaseTtlMs ?? ProtocolConstants.DefaultLeaseTtlMs;
+        var sessionKey = new SessionRouteKey(msg.InstanceKey!, msg.RoutingKey!);
+        var bindingError = ValidateAndBindExplicitOpen_NoLock(
+            msg,
+            adapter,
+            sessionKey,
+            now,
+            bindExplicitOpen: string.Equals(
+                msg.OwnerEvent,
+                OwnerEvents.ExplicitOpen,
+                StringComparison.Ordinal));
+        if (bindingError is not null)
+        {
+            return bindingError;
+        }
+
+        if (predecessor is not null)
+        {
+            RemoveOwner_NoLock(predecessor.OwnerKey);
+        }
+
+        if (existing is not null)
         {
             // Owner re-register: if session identity changes, move between session buckets.
             if (!string.Equals(existing.InstanceKey, msg.InstanceKey, StringComparison.Ordinal) ||
@@ -441,12 +741,13 @@ public sealed class RouteStateMachine
                 {
                     OwnerKey = msg.OwnerKey!,
                     AdapterKey = msg.AdapterKey!,
+                    AdapterGeneration = msg.AdapterGeneration!,
                     PageKey = msg.PageKey!,
                     InstanceKey = msg.InstanceKey!,
                     RoutingKey = msg.RoutingKey!,
                     PageFingerprint = msg.PageFingerprint,
-                    BrowserKind = msg.BrowserKind ?? adapter.BrowserKind,
-                    ProfileKey = msg.ProfileKey ?? adapter.ProfileKey,
+                    BrowserKind = msg.BrowserKind!,
+                    ProfileKey = msg.ProfileKey!,
                     LeaseExpiresAtMs = now + ttl,
                     RegisteredAtMs = now,
                     LastHeartbeatMs = now,
@@ -463,12 +764,13 @@ public sealed class RouteStateMachine
                     {
                         OwnerKey = msg.OwnerKey!,
                         AdapterKey = msg.AdapterKey!,
+                        AdapterGeneration = msg.AdapterGeneration!,
                         PageKey = msg.PageKey!,
                         InstanceKey = msg.InstanceKey!,
                         RoutingKey = msg.RoutingKey!,
                         PageFingerprint = msg.PageFingerprint,
-                        BrowserKind = msg.BrowserKind ?? adapter.BrowserKind,
-                        ProfileKey = msg.ProfileKey ?? adapter.ProfileKey,
+                        BrowserKind = msg.BrowserKind!,
+                        ProfileKey = msg.ProfileKey!,
                         LeaseExpiresAtMs = now + ttl,
                         RegisteredAtMs = existing.RegisteredAtMs,
                         LastHeartbeatMs = now,
@@ -486,21 +788,17 @@ public sealed class RouteStateMachine
             return RouteResponse.Ok(msg.RequestId);
         }
 
-        if (_ownersByKey.Count >= ProtocolConstants.MaxOwners)
-        {
-            return RouteResponse.Reject(msg.RequestId, RouteResults.Rejected, RejectReasons.Capacity);
-        }
-
         var owner = new LiveOwner
         {
             OwnerKey = msg.OwnerKey!,
             AdapterKey = msg.AdapterKey!,
+            AdapterGeneration = msg.AdapterGeneration!,
             PageKey = msg.PageKey!,
             InstanceKey = msg.InstanceKey!,
             RoutingKey = msg.RoutingKey!,
             PageFingerprint = msg.PageFingerprint,
-            BrowserKind = msg.BrowserKind ?? adapter.BrowserKind,
-            ProfileKey = msg.ProfileKey ?? adapter.ProfileKey,
+            BrowserKind = msg.BrowserKind!,
+            ProfileKey = msg.ProfileKey!,
             LeaseExpiresAtMs = now + ttl,
             RegisteredAtMs = now,
             LastHeartbeatMs = now,
@@ -519,8 +817,70 @@ public sealed class RouteStateMachine
         return RouteResponse.Ok(msg.RequestId);
     }
 
+    private RouteResponse? ValidateAndBindExplicitOpen_NoLock(
+        RouteMessage msg,
+        LiveAdapter adapter,
+        SessionRouteKey sessionKey,
+        long receivedAtMs,
+        bool bindExplicitOpen)
+    {
+        var existingBinding = _bindings.GetBinding(sessionKey);
+        if (existingBinding is not null &&
+            string.Equals(
+                existingBinding.AdapterKey,
+                msg.AdapterKey,
+                StringComparison.Ordinal) &&
+            !BindingIdentityMatches(existingBinding.AdapterIdentity, adapter))
+        {
+            // A persisted adapter key cannot be inherited by another surface
+            // after restart. Reject before any binding correction.
+            return RouteResponse.Reject(
+                msg.RequestId,
+                RouteResults.Rejected,
+                RejectReasons.InvalidField);
+        }
+
+        if (!bindExplicitOpen)
+        {
+            return null;
+        }
+
+        if (!_bindings.TryBindFirstExplicitOpen(
+                sessionKey,
+                msg.AdapterKey!,
+                AdapterBindingIdentity.From(adapter),
+                msg.OpenEventId!,
+                msg.OpenedAtMs!.Value,
+                receivedAtMs,
+                out _))
+        {
+            // Do not acknowledge a binding mutation that cannot survive daemon
+            // restart.
+            return RouteResponse.Reject(
+                msg.RequestId,
+                RouteResults.Rejected,
+                RejectReasons.BindingPersistFailed);
+        }
+
+        return null;
+    }
+
     private RouteResponse HandleUnregisterOwner_NoLock(RouteMessage msg, long now)
     {
+        if (!_adapters.TryGetValue(msg.AdapterKey!, out var adapter) ||
+            adapter.LeaseExpiresAtMs < now)
+        {
+            return RouteResponse.Reject(
+                msg.RequestId,
+                RouteResults.AdapterUnavailable,
+                RejectReasons.AdapterUnknown);
+        }
+
+        if (!AdapterGenerationMatches(adapter, msg))
+        {
+            return RejectAdapterGeneration_NoLock(msg.RequestId);
+        }
+
         if (string.IsNullOrWhiteSpace(msg.OwnerKey) &&
             (string.IsNullOrWhiteSpace(msg.InstanceKey) || string.IsNullOrWhiteSpace(msg.RoutingKey)))
         {
@@ -529,6 +889,22 @@ public sealed class RouteStateMachine
 
         if (!string.IsNullOrWhiteSpace(msg.OwnerKey))
         {
+            if (_ownersByKey.TryGetValue(msg.OwnerKey!, out var owner) &&
+                (!string.Equals(
+                     owner.AdapterKey,
+                     msg.AdapterKey,
+                     StringComparison.Ordinal) ||
+                 !string.Equals(
+                     owner.AdapterGeneration,
+                     msg.AdapterGeneration,
+                     StringComparison.Ordinal)))
+            {
+                return RouteResponse.Reject(
+                    msg.RequestId,
+                    RouteResults.Rejected,
+                    RejectReasons.OwnerChanged);
+            }
+
             RemoveOwner_NoLock(msg.OwnerKey!);
             return RouteResponse.Ok(msg.RequestId);
         }
@@ -538,12 +914,17 @@ public sealed class RouteStateMachine
         {
             foreach (var ownerKey in set.ToList())
             {
-                if (!string.IsNullOrWhiteSpace(msg.AdapterKey))
+                if (_ownersByKey.TryGetValue(ownerKey, out var o) &&
+                    (!string.Equals(
+                         o.AdapterKey,
+                         msg.AdapterKey,
+                         StringComparison.Ordinal) ||
+                     !string.Equals(
+                         o.AdapterGeneration,
+                         msg.AdapterGeneration,
+                         StringComparison.Ordinal)))
                 {
-                    if (_ownersByKey.TryGetValue(ownerKey, out var o) && o.AdapterKey != msg.AdapterKey)
-                    {
-                        continue;
-                    }
+                    continue;
                 }
 
                 RemoveOwner_NoLock(ownerKey);
@@ -557,17 +938,50 @@ public sealed class RouteStateMachine
     {
         var ttl = msg.LeaseTtlMs ?? ProtocolConstants.DefaultLeaseTtlMs;
 
-        if (!string.IsNullOrWhiteSpace(msg.AdapterKey) && _adapters.TryGetValue(msg.AdapterKey!, out var adapter))
+        if (!_adapters.TryGetValue(msg.AdapterKey!, out var adapter))
         {
-            adapter.LeaseExpiresAtMs = now + ttl;
-            adapter.LastHeartbeatMs = now;
+            // A lease refresh is proof only when the target still exists.
+            // Returning ok here strands clients after daemon restart or
+            // expiry because they have no reason to re-register.
+            return RouteResponse.Reject(
+                msg.RequestId,
+                RouteResults.AdapterUnavailable,
+                RejectReasons.AdapterUnknown);
         }
 
-        if (!string.IsNullOrWhiteSpace(msg.OwnerKey) && _ownersByKey.TryGetValue(msg.OwnerKey!, out var owner))
+        if (!AdapterGenerationMatches(adapter, msg))
         {
+            return RejectAdapterGeneration_NoLock(msg.RequestId);
+        }
+
+        if (!string.IsNullOrWhiteSpace(msg.OwnerKey))
+        {
+            if (!_ownersByKey.TryGetValue(msg.OwnerKey!, out var owner) ||
+                (!string.IsNullOrWhiteSpace(msg.AdapterKey) &&
+                 !string.Equals(
+                     owner.AdapterKey,
+                     msg.AdapterKey,
+                     StringComparison.Ordinal)) ||
+                !string.Equals(
+                    owner.AdapterGeneration,
+                    msg.AdapterGeneration,
+                    StringComparison.Ordinal))
+            {
+                return RouteResponse.Reject(
+                    msg.RequestId,
+                    RouteResults.Stale,
+                    RejectReasons.OwnerChanged);
+            }
+
             owner.LeaseExpiresAtMs = now + ttl;
             owner.LastHeartbeatMs = now;
         }
+
+        // Do not refresh the adapter until every requested child proof passes.
+        // A stale/foreign owner heartbeat cannot keep an otherwise dead
+        // generation alive through a rejected partial mutation.
+        adapter.LeaseExpiresAtMs = now + ttl;
+        adapter.LastHeartbeatMs = now;
 
         return RouteResponse.Ok(msg.RequestId);
     }
@@ -585,8 +999,19 @@ public sealed class RouteStateMachine
         {
             if (existing.ExpiresAtMs >= now &&
                 string.Equals(existing.InstanceKey, msg.InstanceKey, StringComparison.Ordinal) &&
-                string.Equals(existing.RoutingKey, msg.RoutingKey, StringComparison.Ordinal))
+                string.Equals(existing.RoutingKey, msg.RoutingKey, StringComparison.Ordinal) &&
+                string.Equals(
+                    existing.NotificationKind,
+                    msg.NotificationKind,
+                    StringComparison.Ordinal))
             {
+                if (!SnapshotMatchesCurrentBinding_NoLock(existing))
+                {
+                    return SnapshotBindingChangedResponse(
+                        msg.RequestId,
+                        existing);
+                }
+
                 return new RouteResponse
                 {
                     RequestId = msg.RequestId,
@@ -601,12 +1026,35 @@ public sealed class RouteStateMachine
                 };
             }
 
-            // Different route for same notificationId is rejected (immutable).
+            // Route and kind are immutable fields of a notificationId.
             if (!string.Equals(existing.InstanceKey, msg.InstanceKey, StringComparison.Ordinal) ||
-                !string.Equals(existing.RoutingKey, msg.RoutingKey, StringComparison.Ordinal))
+                !string.Equals(existing.RoutingKey, msg.RoutingKey, StringComparison.Ordinal) ||
+                !string.Equals(
+                    existing.NotificationKind,
+                    msg.NotificationKind,
+                    StringComparison.Ordinal))
             {
                 return RouteResponse.Reject(msg.RequestId, RouteResults.Rejected, RejectReasons.SnapshotMismatch);
             }
+        }
+
+        // A recovery ticket is a pre-snapshot transaction. A duplicate freeze
+        // may advance that same transaction, but can never create a second route
+        // or mutate its notification fields.
+        if (_recoveriesByNotification.TryGetValue(msg.NotificationId!, out var recovery))
+        {
+            if (!RecoveryFieldsMatch(recovery, msg))
+            {
+                return RouteResponse.Reject(
+                    msg.RequestId,
+                    RouteResults.Rejected,
+                    RejectReasons.SnapshotMismatch);
+            }
+
+            return ResolveRecoveryTicket_NoLock(
+                msg.RequestId,
+                recovery,
+                now);
         }
 
         var instanceKey = msg.InstanceKey!;
@@ -620,7 +1068,7 @@ public sealed class RouteStateMachine
                 ("routeFp", RoutingKey.Fingerprint(routingKey)),
                 ("instanceFp", RoutingKey.FingerprintInstance(instanceKey)),
                 ("candidates", 0));
-            return new RouteResponse
+            var miss = new RouteResponse
             {
                 RequestId = msg.RequestId,
                 Result = RouteResults.Miss,
@@ -629,96 +1077,425 @@ public sealed class RouteStateMachine
                 RoutingFingerprint = RoutingKey.Fingerprint(routingKey),
                 InstanceFingerprint = RoutingKey.FingerprintInstance(instanceKey),
             };
+            return BeginRecoveryOrReturn_NoLock(msg, sessionKey, miss, now);
         }
 
-        if (live.Count > 1)
+        var binding = _bindings.GetBinding(sessionKey);
+        if (binding is not null)
         {
-            var ranked = live
-                .Select(owner => new
-                {
-                    Owner = owner,
-                    Preference = _preferences.GetPreference(sessionKey, owner.AdapterKey),
-                })
-                .Where(item => item.Preference is not null)
+            var boundOwners = live
+                .Where(owner =>
+                    string.Equals(owner.AdapterKey, binding.AdapterKey, StringComparison.Ordinal) &&
+                    _adapters.TryGetValue(owner.AdapterKey, out var boundAdapter) &&
+                    BindingIdentityMatches(binding.AdapterIdentity, boundAdapter))
                 .ToList();
 
-            // Never choose from a ranked subset. Every live owner must have valid durable
-            // metadata, otherwise an unranked restored/corrupt endpoint could be the real winner.
-            if (ranked.Count == live.Count)
+            // A durable binding must never silently transfer just because its adapter is
+            // temporarily offline. The bound adapter can restore its owner and resume later.
+            if (boundOwners.Count == 0)
             {
-                var winnerPreference = ranked
-                    .Select(item => item.Preference!)
-                    .OrderByDescending(item => item.OpenedAtMs)
-                    .ThenByDescending(item => item.Revision)
-                    .First();
-                var winners = ranked
-                    .Where(item =>
-                        item.Preference!.OpenedAtMs == winnerPreference.OpenedAtMs &&
-                        item.Preference.Revision == winnerPreference.Revision)
-                    .Select(item => item.Owner)
-                    .ToList();
-
-                // One adapter may expose multiple same-session pages. Adapter rank cannot pick
-                // a tab safely, so retain the original fail-closed ambiguity in that case.
-                if (winners.Count == 1)
-                {
-                    live = winners;
-                }
-            }
-
-            if (live.Count > 1)
-            {
-                SafeLog.Info("freeze-ambiguous",
+                SafeLog.Info("freeze-bound-owner-unavailable",
                     ("routeFp", RoutingKey.Fingerprint(routingKey)),
                     ("instanceFp", RoutingKey.FingerprintInstance(instanceKey)),
-                    ("candidates", live.Count));
-                return new RouteResponse
+                    ("candidates", 0));
+                var unavailable = new RouteResponse
                 {
                     RequestId = msg.RequestId,
-                    Result = RouteResults.Ambiguous,
-                    CandidateCount = live.Count,
+                    Result = RouteResults.Miss,
+                    Reason = RouteResults.OwnerUnresolved,
+                    CandidateCount = 0,
                     RoutingFingerprint = RoutingKey.Fingerprint(routingKey),
                     InstanceFingerprint = RoutingKey.FingerprintInstance(instanceKey),
                 };
+                return BeginRecoveryOrReturn_NoLock(
+                    msg,
+                    sessionKey,
+                    unavailable,
+                    now);
             }
+
+            live = boundOwners;
+        }
+        else if (live.Count == 1 && !_bindings.AllowsUnboundSingleOwnerRouting)
+        {
+            // A durable store cannot distinguish a genuinely never-bound route from one whose
+            // metadata was missing, rejected as legacy/corrupt, or evicted at capacity. A lone
+            // restore owner therefore cannot become the winner without a real explicit open.
+            var unresolved = new RouteResponse
+            {
+                RequestId = msg.RequestId,
+                Result = RouteResults.Miss,
+                Reason = RouteResults.OwnerUnresolved,
+                CandidateCount = 0,
+                RoutingFingerprint = RoutingKey.Fingerprint(routingKey),
+                InstanceFingerprint = RoutingKey.FingerprintInstance(instanceKey),
+            };
+            return BeginRecoveryOrReturn_NoLock(
+                msg,
+                sessionKey,
+                unresolved,
+                now);
+        }
+
+        // One adapter may expose multiple same-session pages. An adapter binding cannot safely
+        // choose a tab, so retain fail-closed ambiguity inside the bound adapter.
+        if (live.Count > 1)
+        {
+            SafeLog.Info("freeze-ambiguous",
+                ("routeFp", RoutingKey.Fingerprint(routingKey)),
+                ("instanceFp", RoutingKey.FingerprintInstance(instanceKey)),
+                ("candidates", live.Count));
+            return new RouteResponse
+            {
+                RequestId = msg.RequestId,
+                Result = RouteResults.Ambiguous,
+                CandidateCount = live.Count,
+                RoutingFingerprint = RoutingKey.Fingerprint(routingKey),
+                InstanceFingerprint = RoutingKey.FingerprintInstance(instanceKey),
+            };
         }
 
         var owner = live[0];
         if (!_adapters.TryGetValue(owner.AdapterKey, out var adapter) || adapter.LeaseExpiresAtMs < now)
         {
-            return new RouteResponse
+            var unavailable = new RouteResponse
             {
                 RequestId = msg.RequestId,
                 Result = RouteResults.AdapterUnavailable,
                 Reason = RejectReasons.AdapterUnknown,
                 CandidateCount = 1,
             };
+            return BeginRecoveryOrReturn_NoLock(
+                msg,
+                sessionKey,
+                unavailable,
+                now);
         }
 
-        if (_snapshotsById.Count >= ProtocolConstants.MaxSnapshots &&
-            !_snapshotsByNotification.ContainsKey(msg.NotificationId!))
+        return CreateSnapshot_NoLock(
+            msg.RequestId,
+            msg.NotificationId!,
+            msg.NotificationKind,
+            owner,
+            adapter,
+            now);
+    }
+
+    private RouteResponse HandleResolveRecovery_NoLock(
+        RouteMessage msg,
+        long now)
+    {
+        var error = MessageValidator.ValidateResolveRecovery(msg);
+        if (error is not null)
         {
-            // Drop oldest expired or oldest snapshot to free capacity.
+            return error;
+        }
+
+        if (!_recoveriesById.TryGetValue(
+                msg.RecoveryTicketId!,
+                out var recovery))
+        {
+            if (_recoveryTombstones.TryGetValue(
+                    msg.RecoveryTicketId!,
+                    out var tombstone) &&
+                tombstone.RetainUntilMs >= now &&
+                string.Equals(
+                    tombstone.NotificationId,
+                    msg.NotificationId,
+                    StringComparison.Ordinal))
+            {
+                return RecoveryTerminalResponse(
+                    msg.RequestId,
+                    tombstone.RecoveryTicketId,
+                    tombstone.Result,
+                    tombstone.Reason);
+            }
+
+            return new RouteResponse
+            {
+                RequestId = msg.RequestId,
+                Result = RouteResults.Stale,
+                Reason = RejectReasons.RecoveryUnknown,
+                RecoveryTicketId = msg.RecoveryTicketId,
+            };
+        }
+
+        if (!string.Equals(
+                recovery.NotificationId,
+                msg.NotificationId,
+                StringComparison.Ordinal))
+        {
+            return new RouteResponse
+            {
+                RequestId = msg.RequestId,
+                Result = RouteResults.Stale,
+                Reason = RejectReasons.RecoveryUnknown,
+                RecoveryTicketId = msg.RecoveryTicketId,
+            };
+        }
+
+        return ResolveRecoveryTicket_NoLock(
+            msg.RequestId,
+            recovery,
+            now);
+    }
+
+    private RouteResponse BeginRecoveryOrReturn_NoLock(
+        RouteMessage msg,
+        SessionRouteKey session,
+        RouteResponse fallback,
+        long now)
+    {
+        if (msg.RecoveryTtlMs is null)
+        {
+            return fallback;
+        }
+
+        if (_recoveriesById.Count >= ProtocolConstants.MaxRecoveryTickets)
+        {
+            EvictOldestRecovery_NoLock(now);
+            if (_recoveriesById.Count >= ProtocolConstants.MaxRecoveryTickets)
+            {
+                return RouteResponse.Reject(
+                    msg.RequestId,
+                    RouteResults.Rejected,
+                    RejectReasons.Capacity);
+            }
+        }
+
+        var ttlMs = msg.RecoveryTtlMs ??
+            ProtocolConstants.DefaultRecoveryTicketTtlMs;
+        var recovery = new NotificationRecoveryTicket
+        {
+            RecoveryTicketId = Guid.NewGuid().ToString("N"),
+            NotificationId = msg.NotificationId!,
+            NotificationKind = msg.NotificationKind,
+            InstanceKey = session.InstanceKey,
+            RoutingKey = session.RoutingKey,
+            CreatedAtMs = now,
+            PendingExpiresAtMs = now + ttlMs,
+            RetainUntilMs = now + ttlMs + ProtocolConstants.RecoveryResultTtlMs,
+        };
+
+        _recoveriesByNotification[recovery.NotificationId] = recovery;
+        _recoveriesById[recovery.RecoveryTicketId] = recovery;
+
+        SafeLog.Info(
+            "freeze-recovering",
+            ("routeFp", RoutingKey.Fingerprint(recovery.RoutingKey)),
+            ("instanceFp", RoutingKey.FingerprintInstance(recovery.InstanceKey)),
+            ("ticketFp", RoutingKey.Fingerprint(recovery.RecoveryTicketId)),
+            ("binding", _bindings.GetBinding(session) is not null));
+
+        return RecoveringResponse(
+            msg.RequestId,
+            recovery,
+            fallback.Reason ?? RouteResults.OwnerUnresolved,
+            fallback.CandidateCount ?? 0);
+    }
+
+    private RouteResponse ResolveRecoveryTicket_NoLock(
+        string requestId,
+        NotificationRecoveryTicket recovery,
+        long now)
+    {
+        if (recovery.TerminalResult is not null)
+        {
+            return new RouteResponse
+            {
+                RequestId = requestId,
+                Result = recovery.TerminalResult,
+                Reason = recovery.TerminalReason,
+                RecoveryTicketId = recovery.RecoveryTicketId,
+            };
+        }
+
+        var session = new SessionRouteKey(
+            recovery.InstanceKey,
+            recovery.RoutingKey);
+        var currentBinding = _bindings.GetBinding(session);
+
+        if (recovery.ResolvedSnapshotId is not null)
+        {
+            if (_snapshotsById.TryGetValue(
+                    recovery.ResolvedSnapshotId,
+                    out var resolved))
+            {
+                if (resolved.ExpiresAtMs < now)
+                {
+                    return CompleteRecovery_NoLock(
+                        requestId,
+                        recovery,
+                        RouteResults.Expired,
+                        RejectReasons.RecoveryExpired,
+                        now);
+                }
+
+                if (!string.Equals(
+                        resolved.NotificationId,
+                        recovery.NotificationId,
+                        StringComparison.Ordinal) ||
+                    !SnapshotMatchesCurrentBinding_NoLock(resolved))
+                {
+                    return CompleteRecovery_NoLock(
+                        requestId,
+                        recovery,
+                        RouteResults.Stale,
+                        RejectReasons.OwnerChanged,
+                        now);
+                }
+
+                return SnapshotReadyResponse(
+                    requestId,
+                    resolved,
+                    recovery.RecoveryTicketId,
+                    RejectReasons.Replay);
+            }
+
+            return CompleteRecovery_NoLock(
+                requestId,
+                recovery,
+                RouteResults.Expired,
+                RejectReasons.RecoveryExpired,
+                now);
+        }
+
+        if (now > recovery.PendingExpiresAtMs)
+        {
+            return CompleteRecovery_NoLock(
+                requestId,
+                recovery,
+                RouteResults.Expired,
+                RejectReasons.RecoveryExpired,
+                now);
+        }
+
+
+        // Pending is intentionally target-free. Delayed evidence of an earlier
+        // explicit open may still correct the durable first-opener binding. Each
+        // resolve therefore reads the current authoritative binding; a lone
+        // restore owner can never become the winner by itself.
+        if (currentBinding is null)
+        {
+            return RecoveringResponse(
+                requestId,
+                recovery,
+                RouteResults.OwnerUnresolved,
+                0);
+        }
+
+        var live = CollectLiveOwners_NoLock(session, now)
+            .Where(owner =>
+                string.Equals(
+                    owner.AdapterKey,
+                    currentBinding.AdapterKey,
+                    StringComparison.Ordinal) &&
+                _adapters.TryGetValue(owner.AdapterKey, out var boundAdapter) &&
+                BindingIdentityMatches(
+                    currentBinding.AdapterIdentity,
+                    boundAdapter))
+            .ToList();
+
+        // A transition may briefly publish zero or multiple bound pages. A
+        // recovery ticket waits for a unique target until its own deadline;
+        // unlike an initial ambiguous freeze, it never chooses arbitrarily.
+        if (live.Count != 1)
+        {
+            return RecoveringResponse(
+                requestId,
+                recovery,
+                live.Count > 1
+                    ? RouteResults.Ambiguous
+                    : RouteResults.OwnerUnresolved,
+                live.Count);
+        }
+
+        var owner = live[0];
+        if (!_adapters.TryGetValue(owner.AdapterKey, out var adapter) ||
+            adapter.LeaseExpiresAtMs < now)
+        {
+            return RecoveringResponse(
+                requestId,
+                recovery,
+                RejectReasons.AdapterUnknown,
+                0);
+        }
+
+        var response = CreateSnapshot_NoLock(
+            requestId,
+            recovery.NotificationId,
+            recovery.NotificationKind,
+            owner,
+            adapter,
+            now,
+            recovery.RecoveryTicketId);
+        if (string.Equals(
+                response.Result,
+                RouteResults.Ready,
+                StringComparison.Ordinal) &&
+            response.SnapshotId is not null)
+        {
+            recovery.ResolvedSnapshotId = response.SnapshotId;
+            if (_snapshotsById.TryGetValue(response.SnapshotId, out var snapshot))
+            {
+                recovery.RetainUntilMs = snapshot.ExpiresAtMs;
+            }
+
+            SafeLog.Info(
+                "recovery-resolved",
+                ("routeFp", RoutingKey.Fingerprint(recovery.RoutingKey)),
+                ("instanceFp", RoutingKey.FingerprintInstance(recovery.InstanceKey)),
+                ("ticketFp", RoutingKey.Fingerprint(recovery.RecoveryTicketId)),
+                ("ownerFp", SafeLog.OwnerFp(owner.OwnerKey)),
+                ("adapterKind", adapter.AdapterKind));
+            return response;
+        }
+
+        return CompleteRecovery_NoLock(
+            requestId,
+            recovery,
+            response.Result,
+            response.Reason ?? RejectReasons.Capacity,
+            now);
+    }
+
+    private RouteResponse CreateSnapshot_NoLock(
+        string requestId,
+        string notificationId,
+        string? notificationKind,
+        LiveOwner owner,
+        LiveAdapter adapter,
+        long now,
+        string? recoveryTicketId = null)
+    {
+        if (_snapshotsById.Count >= ProtocolConstants.MaxSnapshots &&
+            !_snapshotsByNotification.ContainsKey(notificationId))
+        {
             EvictOldestSnapshot_NoLock(now);
             if (_snapshotsById.Count >= ProtocolConstants.MaxSnapshots)
             {
-                return RouteResponse.Reject(msg.RequestId, RouteResults.Rejected, RejectReasons.Capacity);
+                return RouteResponse.Reject(
+                    requestId,
+                    RouteResults.Rejected,
+                    RejectReasons.Capacity);
             }
         }
 
         var snapshot = new NotificationSnapshot
         {
             SnapshotId = Guid.NewGuid().ToString("N"),
-            NotificationId = msg.NotificationId!,
-            NotificationKind = msg.NotificationKind,
+            NotificationId = notificationId,
+            NotificationKind = notificationKind,
             InstanceKey = owner.InstanceKey,
             RoutingKey = owner.RoutingKey,
             OwnerKey = owner.OwnerKey,
             AdapterKey = owner.AdapterKey,
+            AdapterGeneration = owner.AdapterGeneration,
             PageKey = owner.PageKey,
             PageFingerprint = owner.PageFingerprint,
             AdapterKind = adapter.AdapterKind,
             BrowserKind = owner.BrowserKind ?? adapter.BrowserKind,
+            AdapterIdentity = AdapterBindingIdentity.From(adapter),
             CreatedAtMs = now,
             ExpiresAtMs = now + ProtocolConstants.SnapshotTtlMs,
         };
@@ -726,25 +1503,101 @@ public sealed class RouteStateMachine
         _snapshotsByNotification[snapshot.NotificationId] = snapshot;
         _snapshotsById[snapshot.SnapshotId] = snapshot;
 
-        SafeLog.Info("freeze-ready",
+        SafeLog.Info(
+            "freeze-ready",
             ("routeFp", RoutingKey.Fingerprint(snapshot.RoutingKey)),
             ("instanceFp", RoutingKey.FingerprintInstance(snapshot.InstanceKey)),
             ("ownerFp", SafeLog.OwnerFp(snapshot.OwnerKey)),
             ("adapterKind", snapshot.AdapterKind),
             ("candidates", 1));
 
-        return new RouteResponse
+        return SnapshotReadyResponse(
+            requestId,
+            snapshot,
+            recoveryTicketId);
+    }
+
+    private static RouteResponse SnapshotReadyResponse(
+        string requestId,
+        NotificationSnapshot snapshot,
+        string? recoveryTicketId,
+        string? reason = null) =>
+        new()
         {
-            RequestId = msg.RequestId,
+            RequestId = requestId,
             Result = RouteResults.Ready,
+            Reason = reason,
             SnapshotId = snapshot.SnapshotId,
+            RecoveryTicketId = recoveryTicketId,
             CandidateCount = 1,
             AdapterKind = snapshot.AdapterKind,
             OwnerFingerprint = SafeLog.OwnerFp(snapshot.OwnerKey),
             RoutingFingerprint = RoutingKey.Fingerprint(snapshot.RoutingKey),
             InstanceFingerprint = RoutingKey.FingerprintInstance(snapshot.InstanceKey),
         };
+
+    private static RouteResponse RecoveringResponse(
+        string requestId,
+        NotificationRecoveryTicket recovery,
+        string reason,
+        int candidateCount) =>
+        new()
+        {
+            RequestId = requestId,
+            Result = RouteResults.Recovering,
+            Reason = reason,
+            RecoveryTicketId = recovery.RecoveryTicketId,
+            CandidateCount = candidateCount,
+            RoutingFingerprint = RoutingKey.Fingerprint(recovery.RoutingKey),
+            InstanceFingerprint = RoutingKey.FingerprintInstance(recovery.InstanceKey),
+        };
+
+    private static RouteResponse CompleteRecovery_NoLock(
+        string requestId,
+        NotificationRecoveryTicket recovery,
+        string result,
+        string reason,
+        long now)
+    {
+        recovery.TerminalResult = result;
+        recovery.TerminalReason = reason;
+        recovery.RetainUntilMs = now + ProtocolConstants.RecoveryResultTtlMs;
+        return RecoveryTerminalResponse(
+            requestId,
+            recovery.RecoveryTicketId,
+            result,
+            reason);
     }
+
+    private static RouteResponse RecoveryTerminalResponse(
+        string requestId,
+        string recoveryTicketId,
+        string result,
+        string reason) =>
+        new()
+        {
+            RequestId = requestId,
+            Result = result,
+            Reason = reason,
+            RecoveryTicketId = recoveryTicketId,
+        };
+
+    private static bool RecoveryFieldsMatch(
+        NotificationRecoveryTicket recovery,
+        RouteMessage msg) =>
+        string.Equals(
+            recovery.InstanceKey,
+            msg.InstanceKey,
+            StringComparison.Ordinal) &&
+        string.Equals(
+            recovery.RoutingKey,
+            msg.RoutingKey,
+            StringComparison.Ordinal) &&
+        string.Equals(
+            recovery.NotificationKind,
+            msg.NotificationKind,
+            StringComparison.Ordinal);
+
 
     /// <summary>
     /// Direct Handle path for activate: validate + enqueue pending command for external poll.
@@ -782,12 +1635,59 @@ public sealed class RouteStateMachine
             return (RouteResponse.Reject(msg.RequestId, RouteResults.Stale, RejectReasons.Expired), null, null);
         }
 
-        if (msg.DeadlineMs is long deadline && deadline > 0 && now > deadline)
+        // Claim identity outranks mutable live topology. Once any activation
+        // owns this snapshot, lost-response retries must observe that canonical
+        // operation even if its owner/page/binding rotates while it is pending
+        // or after it completes. Only an unclaimed snapshot is revalidated
+        // against current routing state below.
+        if (snap.ActivationRequestId is not null)
         {
-            return (RouteResponse.Reject(msg.RequestId, RouteResults.Timeout, RejectReasons.Expired), null, null);
+            return (
+                ExistingSnapshotActivationResponse_NoLock(
+                    msg.RequestId,
+                    snap),
+                null,
+                null);
         }
 
-        if (!_ownersByKey.TryGetValue(snap.OwnerKey, out var owner) || owner.LeaseExpiresAtMs < now)
+        var (targetError, adapter) =
+            ValidateSnapshotTargetForActivation_NoLock(msg, snap, now);
+        if (targetError is not null)
+        {
+            return (targetError, null, null);
+        }
+
+        // Claim the immutable snapshot before dispatch leaves the state lock.
+        // Different requestIds from duplicate popups can then only observe and
+        // await this one activation; they cannot enqueue a second focus side effect.
+        snap.ActivationRequestId = msg.RequestId;
+
+        return (null, snap, adapter);
+    }
+
+    private (RouteResponse? Error, LiveAdapter? Adapter)
+        ValidateSnapshotTargetForActivation_NoLock(
+            RouteMessage msg,
+            NotificationSnapshot snap,
+            long now)
+    {
+        if (!SnapshotMatchesCurrentBinding_NoLock(snap))
+        {
+            return (SnapshotBindingChangedResponse(msg.RequestId, snap), null);
+        }
+
+        if (msg.DeadlineMs is long deadline && deadline > 0 && now > deadline)
+        {
+            return (
+                RouteResponse.Reject(
+                    msg.RequestId,
+                    RouteResults.Timeout,
+                    RejectReasons.Expired),
+                null);
+        }
+
+        if (!_ownersByKey.TryGetValue(snap.OwnerKey, out var owner) ||
+            owner.LeaseExpiresAtMs < now)
         {
             return (new RouteResponse
             {
@@ -795,13 +1695,24 @@ public sealed class RouteStateMachine
                 Result = RouteResults.Stale,
                 Reason = RejectReasons.LeaseExpired,
                 SnapshotId = snap.SnapshotId,
-            }, null, null);
+                ActivationRequestId = snap.ActivationRequestId,
+            }, null);
         }
 
         if (!string.Equals(owner.PageKey, snap.PageKey, StringComparison.Ordinal) ||
             !string.Equals(owner.AdapterKey, snap.AdapterKey, StringComparison.Ordinal) ||
+            !string.Equals(
+                owner.AdapterGeneration,
+                snap.AdapterGeneration,
+                StringComparison.Ordinal) ||
             !string.Equals(owner.RoutingKey, snap.RoutingKey, StringComparison.Ordinal) ||
-            !string.Equals(owner.InstanceKey, snap.InstanceKey, StringComparison.Ordinal))
+            !string.Equals(owner.InstanceKey, snap.InstanceKey, StringComparison.Ordinal) ||
+            (snap.PageFingerprint is not null &&
+             owner.PageFingerprint is not null &&
+             !string.Equals(
+                 owner.PageFingerprint,
+                 snap.PageFingerprint,
+                 StringComparison.Ordinal)))
         {
             return (new RouteResponse
             {
@@ -809,23 +1720,16 @@ public sealed class RouteStateMachine
                 Result = RouteResults.Stale,
                 Reason = RejectReasons.OwnerChanged,
                 SnapshotId = snap.SnapshotId,
-            }, null, null);
+                ActivationRequestId = snap.ActivationRequestId,
+            }, null);
         }
 
-        if (snap.PageFingerprint is not null &&
-            owner.PageFingerprint is not null &&
-            !string.Equals(owner.PageFingerprint, snap.PageFingerprint, StringComparison.Ordinal))
-        {
-            return (new RouteResponse
-            {
-                RequestId = msg.RequestId,
-                Result = RouteResults.Stale,
-                Reason = RejectReasons.OwnerChanged,
-                SnapshotId = snap.SnapshotId,
-            }, null, null);
-        }
-
-        if (!_adapters.TryGetValue(snap.AdapterKey, out var adapter) || adapter.LeaseExpiresAtMs < now)
+        if (!_adapters.TryGetValue(snap.AdapterKey, out var adapter) ||
+            adapter.LeaseExpiresAtMs < now ||
+            !string.Equals(
+                adapter.AdapterGeneration,
+                snap.AdapterGeneration,
+                StringComparison.Ordinal))
         {
             return (new RouteResponse
             {
@@ -833,10 +1737,67 @@ public sealed class RouteStateMachine
                 Result = RouteResults.AdapterUnavailable,
                 Reason = RejectReasons.LeaseExpired,
                 SnapshotId = snap.SnapshotId,
-            }, null, null);
+                ActivationRequestId = snap.ActivationRequestId,
+            }, null);
         }
 
-        return (null, snap, adapter);
+        return (null, adapter);
+    }
+
+    private RouteResponse ExistingSnapshotActivationResponse_NoLock(
+        string requestId,
+        NotificationSnapshot snapshot)
+    {
+        var activationRequestId = snapshot.ActivationRequestId!;
+        if (_activations.TryGetValue(activationRequestId, out var pending))
+        {
+            return new RouteResponse
+            {
+                RequestId = requestId,
+                Result = pending.Completed
+                    ? pending.FinalResult ?? RouteResults.Stale
+                    : RouteResults.Accepted,
+                Reason = pending.Completed
+                    ? pending.FinalReason ?? RejectReasons.Replay
+                    : RejectReasons.PendingAdapterDelivery,
+                SnapshotId = snapshot.SnapshotId,
+                ActivationRequestId = activationRequestId,
+                AdapterKind = snapshot.AdapterKind,
+                OwnerFingerprint = SafeLog.OwnerFp(snapshot.OwnerKey),
+                RoutingFingerprint = RoutingKey.Fingerprint(snapshot.RoutingKey),
+                InstanceFingerprint = RoutingKey.FingerprintInstance(snapshot.InstanceKey),
+                ElapsedMs = pending.ElapsedMs,
+            };
+        }
+
+        if (snapshot.LastActivateResult is not null)
+        {
+            return new RouteResponse
+            {
+                RequestId = requestId,
+                Result = snapshot.LastActivateResult,
+                Reason = snapshot.LastActivateReason ?? RejectReasons.Replay,
+                SnapshotId = snapshot.SnapshotId,
+                ActivationRequestId = activationRequestId,
+                AdapterKind = snapshot.AdapterKind,
+                OwnerFingerprint = SafeLog.OwnerFp(snapshot.OwnerKey),
+                RoutingFingerprint = RoutingKey.Fingerprint(snapshot.RoutingKey),
+                InstanceFingerprint = RoutingKey.FingerprintInstance(snapshot.InstanceKey),
+            };
+        }
+
+        return new RouteResponse
+        {
+            RequestId = requestId,
+            Result = RouteResults.Pending,
+            Reason = RejectReasons.Replay,
+            SnapshotId = snapshot.SnapshotId,
+            ActivationRequestId = activationRequestId,
+            AdapterKind = snapshot.AdapterKind,
+            OwnerFingerprint = SafeLog.OwnerFp(snapshot.OwnerKey),
+            RoutingFingerprint = RoutingKey.Fingerprint(snapshot.RoutingKey),
+            InstanceFingerprint = RoutingKey.FingerprintInstance(snapshot.InstanceKey),
+        };
     }
 
     private RouteResponse HandleActivateResult_NoLock(RouteMessage msg, long now)
@@ -847,39 +1808,62 @@ public sealed class RouteStateMachine
             return RouteResponse.Reject(msg.RequestId, RouteResults.Rejected, RejectReasons.MissingField);
         }
 
-        if (!MessageValidator.IsOpaqueId(activationRequestId) || ExceedsLabel(msg.Result!))
+        if (!MessageValidator.IsOpaqueId(activationRequestId) ||
+            ExceedsLabel(msg.Result!) ||
+            !ProtocolConstants.AllowedActivateResults.Contains(msg.Result!) ||
+            msg.ElapsedMs is < 0 ||
+            (msg.SnapshotId is not null &&
+             !MessageValidator.IsOpaqueId(msg.SnapshotId)) ||
+            (msg.NotificationId is not null &&
+             !MessageValidator.IsOpaqueId(msg.NotificationId)))
         {
             return RouteResponse.Reject(msg.RequestId, RouteResults.Rejected, RejectReasons.InvalidField);
         }
 
-        // Optional adapter binding: wrong adapter cannot complete another adapter's activation.
-        if (!string.IsNullOrWhiteSpace(msg.AdapterKey) &&
-            _activations.TryGetValue(activationRequestId, out var existingCheck) &&
-            !string.Equals(existingCheck.AdapterKey, msg.AdapterKey, StringComparison.Ordinal))
-        {
-            return RouteResponse.Reject(msg.RequestId, RouteResults.Rejected, RejectReasons.WrongAdapter);
-        }
-
         if (!_activations.TryGetValue(activationRequestId, out var pending))
         {
-            // Unknown activation: accept idempotent write only if snapshot still known (legacy path).
-            if (!string.IsNullOrWhiteSpace(msg.SnapshotId) &&
-                _snapshotsById.TryGetValue(msg.SnapshotId!, out var orphanSnap))
-            {
-                orphanSnap.LastActivateResult = msg.Result;
-                orphanSnap.LastActivateReason = msg.Reason;
-                return new RouteResponse
-                {
-                    RequestId = msg.RequestId,
-                    Result = msg.Result!,
-                    Reason = msg.Reason,
-                    SnapshotId = msg.SnapshotId,
-                    ActivationRequestId = activationRequestId,
-                    ElapsedMs = msg.ElapsedMs,
-                };
-            }
-
+            // Snapshot knowledge is not activation authority. Accepting an
+            // orphan result would let any local adapter mutate another frozen
+            // notification without the enqueue/poll correlation.
             return RouteResponse.Reject(msg.RequestId, RouteResults.Stale, RejectReasons.ActivationUnknown);
+        }
+
+        if (!string.Equals(
+                pending.AdapterKey,
+                msg.AdapterKey,
+                StringComparison.Ordinal))
+        {
+            return RouteResponse.Reject(
+                msg.RequestId,
+                RouteResults.Rejected,
+                RejectReasons.WrongAdapter);
+        }
+
+        if (!string.Equals(
+                pending.AdapterGeneration,
+                msg.AdapterGeneration,
+                StringComparison.Ordinal))
+        {
+            return RejectAdapterGeneration_NoLock(msg.RequestId);
+        }
+
+        // Immutable activation correlation must be proven before target
+        // revalidation or completion can mutate the pending record.
+        if ((!string.IsNullOrWhiteSpace(msg.SnapshotId) &&
+             !string.Equals(
+                 msg.SnapshotId,
+                 pending.SnapshotId,
+                 StringComparison.Ordinal)) ||
+            (!string.IsNullOrWhiteSpace(msg.NotificationId) &&
+             !string.Equals(
+                 msg.NotificationId,
+                 pending.NotificationId,
+                 StringComparison.Ordinal)))
+        {
+            return RouteResponse.Reject(
+                msg.RequestId,
+                RouteResults.Rejected,
+                RejectReasons.SnapshotMismatch);
         }
 
         if (pending.Completed)
@@ -933,13 +1917,6 @@ public sealed class RouteStateMachine
             };
         }
 
-        // Snapshot id mismatch is rejected (cannot retarget).
-        if (!string.IsNullOrWhiteSpace(msg.SnapshotId) &&
-            !string.Equals(msg.SnapshotId, pending.SnapshotId, StringComparison.Ordinal))
-        {
-            return RouteResponse.Reject(msg.RequestId, RouteResults.Rejected, RejectReasons.SnapshotMismatch);
-        }
-
         CompleteActivation_NoLock(pending, msg.Result!, msg.Reason, msg.ElapsedMs, now);
 
         SafeLog.Info("activate-result",
@@ -970,9 +1947,15 @@ public sealed class RouteStateMachine
             return RouteResponse.Reject(msg.RequestId, RouteResults.Rejected, RejectReasons.MissingField);
         }
 
-        if (!_adapters.TryGetValue(msg.AdapterKey!, out var adapter) || adapter.LeaseExpiresAtMs < now)
+        if (!_adapters.TryGetValue(msg.AdapterKey!, out var adapter) ||
+            adapter.LeaseExpiresAtMs < now)
         {
             return RouteResponse.Reject(msg.RequestId, RouteResults.AdapterUnavailable, RejectReasons.AdapterUnknown);
+        }
+
+        if (!AdapterGenerationMatches(adapter, msg))
+        {
+            return RejectAdapterGeneration_NoLock(msg.RequestId);
         }
 
         // Refresh adapter lease on successful poll connection.
@@ -991,7 +1974,9 @@ public sealed class RouteStateMachine
             };
         }
 
-        // Dequeue until a still-valid undelivered command is found.
+        // Keep the head until a terminal result. Returning a poll response is
+        // not proof that the adapter received it; after a bounded delivery
+        // lease, re-offer the same immutable activation.
         while (queue.Count > 0)
         {
             var activationRequestId = queue.Peek();
@@ -1007,11 +1992,18 @@ public sealed class RouteStateMachine
                 continue;
             }
 
-            if (pending.Delivered)
+            if (pending.Delivered &&
+                pending.DeliveredAtMs is long deliveredAtMs &&
+                now >= deliveredAtMs &&
+                now - deliveredAtMs < ProtocolConstants.ActivationDeliveryRetryMs)
             {
-                // Already handed out; do not redeliver. Leave for status/result path.
-                queue.Dequeue();
-                continue;
+                return new RouteResponse
+                {
+                    RequestId = msg.RequestId,
+                    Result = RouteResults.Ok,
+                    Reason = RejectReasons.NoPending,
+                    AdapterKind = adapter.AdapterKind,
+                };
             }
 
             if (pending.ExpiresAtMs < now || pending.DeadlineMs < now)
@@ -1029,14 +2021,17 @@ public sealed class RouteStateMachine
                 continue;
             }
 
-            // Deliver exactly once.
-            queue.Dequeue();
+            // Delivery is leased, not terminal. CompleteActivation_NoLock
+            // removes the queue entry after the adapter result is accepted.
             pending.Delivered = true;
+            pending.DeliveredAtMs = now;
+            pending.DeliveryAttempts++;
 
             SafeLog.Info("poll-activation-deliver",
                 ("adapterKind", adapter.AdapterKind),
                 ("routeFp", RoutingKey.Fingerprint(pending.RoutingKey)),
-                ("ownerFp", SafeLog.OwnerFp(pending.OwnerKey)));
+                ("ownerFp", SafeLog.OwnerFp(pending.OwnerKey)),
+                ("attempt", pending.DeliveryAttempts));
 
             return new RouteResponse
             {
@@ -1132,11 +2127,101 @@ public sealed class RouteStateMachine
     /// </summary>
     public RouteResponse EnqueuePendingActivation(RouteMessage msg, NotificationSnapshot snap, LiveAdapter adapter)
     {
-        var now = _clock.UtcNowMs;
         lock (_gate)
         {
-            SweepExpired_NoLock();
-            return EnqueuePendingActivation_NoLock(msg, snap, adapter, now);
+            var clockError = ObserveRequestNow_NoLock(
+                msg.RequestId,
+                out var now);
+            if (clockError is not null)
+            {
+                return clockError;
+            }
+            var envelopeError = MessageValidator.ValidateEnvelope(
+                msg,
+                now,
+                ProtocolConstants.MaxMessageBytes);
+            if (envelopeError is not null)
+            {
+                return envelopeError;
+            }
+
+            if (!_snapshotsById.TryGetValue(msg.SnapshotId!, out var currentSnapshot) ||
+                !ReferenceEquals(currentSnapshot, snap) ||
+                !string.Equals(
+                    currentSnapshot.NotificationId,
+                    msg.NotificationId,
+                    StringComparison.Ordinal) ||
+                currentSnapshot.ExpiresAtMs < now)
+            {
+                var stale = RouteResponse.Reject(
+                    msg.RequestId,
+                    RouteResults.Stale,
+                    RejectReasons.OwnerChanged);
+                FinalizeSnapshotActivationFailure_NoLock(
+                    snap,
+                    msg.RequestId,
+                    stale);
+                return stale;
+            }
+
+            if (!string.Equals(
+                    currentSnapshot.ActivationRequestId,
+                    msg.RequestId,
+                    StringComparison.Ordinal))
+            {
+                if (currentSnapshot.ActivationRequestId is not null)
+                {
+                    return ExistingSnapshotActivationResponse_NoLock(
+                        msg.RequestId,
+                        currentSnapshot);
+                }
+
+                var stale = RouteResponse.Reject(
+                    msg.RequestId,
+                    RouteResults.Stale,
+                    RejectReasons.OwnerChanged);
+                FinalizeSnapshotActivationFailure_NoLock(
+                    snap,
+                    msg.RequestId,
+                    stale);
+                return stale;
+            }
+
+            // This is the commit phase for the request that already claimed
+            // the snapshot in BeginActivate. Revalidate mutable topology
+            // without treating that same canonical claim as a duplicate.
+            var (targetError, currentAdapter) =
+                ValidateSnapshotTargetForActivation_NoLock(
+                    msg,
+                    currentSnapshot,
+                    now);
+            if (targetError is not null)
+            {
+                FinalizeSnapshotActivationFailure_NoLock(
+                    snap,
+                    msg.RequestId,
+                    targetError);
+                return targetError;
+            }
+
+            if (!ReferenceEquals(currentAdapter, adapter))
+            {
+                var stale = RouteResponse.Reject(
+                    msg.RequestId,
+                    RouteResults.Stale,
+                    RejectReasons.OwnerChanged);
+                FinalizeSnapshotActivationFailure_NoLock(
+                    snap,
+                    msg.RequestId,
+                    stale);
+                return stale;
+            }
+
+            return EnqueuePendingActivation_NoLock(
+                msg,
+                currentSnapshot!,
+                currentAdapter!,
+                now);
         }
     }
 
@@ -1185,7 +2270,15 @@ public sealed class RouteStateMachine
             EvictOldestCompletedActivation_NoLock(now);
             if (_activations.Count >= ProtocolConstants.MaxPendingActivations)
             {
-                return RouteResponse.Reject(msg.RequestId, RouteResults.Rejected, RejectReasons.Capacity);
+                var capacity = RouteResponse.Reject(
+                    msg.RequestId,
+                    RouteResults.Rejected,
+                    RejectReasons.Capacity);
+                FinalizeSnapshotActivationFailure_NoLock(
+                    snap,
+                    msg.RequestId,
+                    capacity);
+                return capacity;
             }
         }
 
@@ -1197,7 +2290,15 @@ public sealed class RouteStateMachine
 
         if (queue.Count >= ProtocolConstants.MaxPendingPerAdapter)
         {
-            return RouteResponse.Reject(msg.RequestId, RouteResults.Rejected, RejectReasons.Capacity);
+            var capacity = RouteResponse.Reject(
+                msg.RequestId,
+                RouteResults.Rejected,
+                RejectReasons.Capacity);
+            FinalizeSnapshotActivationFailure_NoLock(
+                snap,
+                msg.RequestId,
+                capacity);
+            return capacity;
         }
 
         var deadline = msg.DeadlineMs is long d && d > 0
@@ -1213,7 +2314,15 @@ public sealed class RouteStateMachine
 
         if (deadline <= now)
         {
-            return RouteResponse.Reject(msg.RequestId, RouteResults.Timeout, RejectReasons.Expired);
+            var timeout = RouteResponse.Reject(
+                msg.RequestId,
+                RouteResults.Timeout,
+                RejectReasons.Expired);
+            FinalizeSnapshotActivationFailure_NoLock(
+                snap,
+                msg.RequestId,
+                timeout);
+            return timeout;
         }
 
         var pending = new PendingActivation
@@ -1222,6 +2331,7 @@ public sealed class RouteStateMachine
             NotificationId = snap.NotificationId,
             SnapshotId = snap.SnapshotId,
             AdapterKey = snap.AdapterKey,
+            AdapterGeneration = snap.AdapterGeneration,
             OwnerKey = snap.OwnerKey,
             PageKey = snap.PageKey,
             InstanceKey = snap.InstanceKey,
@@ -1232,6 +2342,8 @@ public sealed class RouteStateMachine
             DeadlineMs = deadline,
             ExpiresAtMs = Math.Max(deadline, now + ProtocolConstants.ActivationResultTtlMs),
             Delivered = false,
+            DeliveredAtMs = null,
+            DeliveryAttempts = 0,
             Completed = false,
         };
 
@@ -1255,6 +2367,23 @@ public sealed class RouteStateMachine
             RoutingFingerprint = RoutingKey.Fingerprint(snap.RoutingKey),
             InstanceFingerprint = RoutingKey.FingerprintInstance(snap.InstanceKey),
         };
+    }
+
+    private static void FinalizeSnapshotActivationFailure_NoLock(
+        NotificationSnapshot snapshot,
+        string activationRequestId,
+        RouteResponse failure)
+    {
+        if (!string.Equals(
+                snapshot.ActivationRequestId,
+                activationRequestId,
+                StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        snapshot.LastActivateResult = failure.Result;
+        snapshot.LastActivateReason = failure.Reason;
     }
 
     private void CompleteActivation_NoLock(
@@ -1314,6 +2443,13 @@ public sealed class RouteStateMachine
             return new RouteResponse { Result = RouteResults.Stale, Reason = RejectReasons.Expired };
         }
 
+        if (!SnapshotMatchesCurrentBinding_NoLock(snap))
+        {
+            return SnapshotBindingChangedResponse(
+                pending.ActivationRequestId,
+                snap);
+        }
+
         if (!_ownersByKey.TryGetValue(pending.OwnerKey, out var owner) || owner.LeaseExpiresAtMs < now)
         {
             return new RouteResponse { Result = RouteResults.Stale, Reason = RejectReasons.LeaseExpired };
@@ -1321,6 +2457,10 @@ public sealed class RouteStateMachine
 
         if (!string.Equals(owner.PageKey, pending.PageKey, StringComparison.Ordinal) ||
             !string.Equals(owner.AdapterKey, pending.AdapterKey, StringComparison.Ordinal) ||
+            !string.Equals(
+                owner.AdapterGeneration,
+                pending.AdapterGeneration,
+                StringComparison.Ordinal) ||
             !string.Equals(owner.RoutingKey, pending.RoutingKey, StringComparison.Ordinal) ||
             !string.Equals(owner.InstanceKey, pending.InstanceKey, StringComparison.Ordinal))
         {
@@ -1334,7 +2474,12 @@ public sealed class RouteStateMachine
             return new RouteResponse { Result = RouteResults.Stale, Reason = RejectReasons.OwnerChanged };
         }
 
-        if (!_adapters.TryGetValue(pending.AdapterKey, out var adapter) || adapter.LeaseExpiresAtMs < now)
+        if (!_adapters.TryGetValue(pending.AdapterKey, out var adapter) ||
+            adapter.LeaseExpiresAtMs < now ||
+            !string.Equals(
+                adapter.AdapterGeneration,
+                pending.AdapterGeneration,
+                StringComparison.Ordinal))
         {
             return new RouteResponse { Result = RouteResults.AdapterUnavailable, Reason = RejectReasons.LeaseExpired };
         }
@@ -1344,15 +2489,16 @@ public sealed class RouteStateMachine
 
     private void EvictOldestCompletedActivation_NoLock(long now)
     {
-        var victim = _activations.Values
-            .Where(a => a.Completed || a.ExpiresAtMs < now)
-            .OrderBy(a => a.CreatedAtMs)
-            .FirstOrDefault();
-
-        if (victim is null)
+        PendingActivation? victim = null;
+        foreach (var candidate in _activations.Values)
         {
-            // Fall back to oldest undelivered to free capacity fail-closed.
-            victim = _activations.Values.OrderBy(a => a.CreatedAtMs).FirstOrDefault();
+            if ((!candidate.Completed && candidate.ExpiresAtMs >= now) ||
+                (victim is not null && candidate.CreatedAtMs >= victim.CreatedAtMs))
+            {
+                continue;
+            }
+
+            victim = candidate;
         }
 
         if (victim is not null)
@@ -1360,15 +2506,117 @@ public sealed class RouteStateMachine
             _activations.Remove(victim.ActivationRequestId);
             if (_pendingByAdapter.TryGetValue(victim.AdapterKey, out var queue))
             {
-                var kept = new Queue<string>(queue.Where(id =>
-                    !string.Equals(id, victim.ActivationRequestId, StringComparison.Ordinal)));
-                _pendingByAdapter[victim.AdapterKey] = kept;
+                var kept = new Queue<string>(queue.Count);
+                while (queue.Count > 0)
+                {
+                    var id = queue.Dequeue();
+                    if (!string.Equals(id, victim.ActivationRequestId, StringComparison.Ordinal))
+                    {
+                        kept.Enqueue(id);
+                    }
+                }
+
+                if (kept.Count == 0)
+                {
+                    _pendingByAdapter.Remove(victim.AdapterKey);
+                }
+                else
+                {
+                    _pendingByAdapter[victim.AdapterKey] = kept;
+                }
             }
         }
     }
 
     private static bool ExceedsLabel(string value) =>
         value.Length > ProtocolConstants.MaxLabelLength;
+
+    private static bool AdapterIdentityMatches(LiveAdapter adapter, RouteMessage msg)
+        => string.Equals(
+               adapter.AdapterKind,
+               msg.AdapterKind,
+               StringComparison.OrdinalIgnoreCase) &&
+           string.Equals(
+               adapter.BrowserKind,
+               msg.BrowserKind,
+               StringComparison.OrdinalIgnoreCase) &&
+           string.Equals(
+               adapter.ProfileKey,
+               msg.ProfileKey,
+               StringComparison.Ordinal);
+
+    private static bool AdapterGenerationMatches(
+        LiveAdapter adapter,
+        RouteMessage msg) =>
+        string.Equals(
+            adapter.AdapterGeneration,
+            msg.AdapterGeneration,
+            StringComparison.Ordinal);
+
+    private void RememberAdapterGeneration_NoLock(
+        RouteMessage msg,
+        AdapterBindingIdentity identity)
+    {
+        _adapterGenerationFences[msg.AdapterKey!] = new AdapterGenerationFence(
+            msg.AdapterGeneration!,
+            msg.AdapterStartedAtMs!.Value,
+            identity);
+    }
+
+    private static RouteResponse RejectAdapterGeneration_NoLock(
+        string requestId) =>
+        RouteResponse.Reject(
+            requestId,
+            RouteResults.AdapterUnavailable,
+            RejectReasons.AdapterGenerationChanged);
+
+    private static bool BindingIdentityMatches(
+        AdapterBindingIdentity persisted,
+        LiveAdapter live) =>
+        RouteBindingStoreLogic.IdentityMatches(
+            persisted,
+            AdapterBindingIdentity.From(live));
+
+    private bool SnapshotMatchesCurrentBinding_NoLock(
+        NotificationSnapshot snapshot)
+    {
+        var binding = _bindings.GetBinding(
+            new SessionRouteKey(
+                snapshot.InstanceKey,
+                snapshot.RoutingKey));
+        if (binding is null)
+        {
+            // Memory-only callers historically allow a single restore owner
+            // without a durable binding. Production file stores fail closed.
+            return _bindings.AllowsUnboundSingleOwnerRouting;
+        }
+
+        return string.Equals(
+                   binding.AdapterKey,
+                   snapshot.AdapterKey,
+                   StringComparison.Ordinal) &&
+               RouteBindingStoreLogic.IdentityMatches(
+                   binding.AdapterIdentity,
+                   snapshot.AdapterIdentity);
+    }
+
+    private static RouteResponse SnapshotBindingChangedResponse(
+        string requestId,
+        NotificationSnapshot snapshot) =>
+        new()
+        {
+            RequestId = requestId,
+            Result = RouteResults.Stale,
+            Reason = RejectReasons.OwnerChanged,
+            SnapshotId = snapshot.SnapshotId,
+            ActivationRequestId = snapshot.ActivationRequestId,
+            AdapterKind = snapshot.AdapterKind,
+            OwnerFingerprint = SafeLog.OwnerFp(snapshot.OwnerKey),
+            RoutingFingerprint = RoutingKey.Fingerprint(
+                snapshot.RoutingKey),
+            InstanceFingerprint = RoutingKey.FingerprintInstance(
+                snapshot.InstanceKey),
+        };
 
     private List<LiveOwner> CollectLiveOwners_NoLock(SessionRouteKey key, long now)
     {
@@ -1433,9 +2681,53 @@ public sealed class RouteStateMachine
         }
     }
 
-    private void SweepExpired_NoLock()
+    private long ObserveNowAndSweep_NoLock()
     {
         var now = _clock.UtcNowMs;
+        SweepExpired_NoLock(now);
+        return now;
+    }
+
+    private RouteResponse? ObserveRequestNow_NoLock(
+        string requestId,
+        out long now)
+    {
+        now = _clock.UtcNowMs;
+        if (!_bindings.TryObserveReceiveClock(now))
+        {
+            return RouteResponse.Reject(
+                requestId,
+                RouteResults.Rejected,
+                RejectReasons.BindingPersistFailed);
+        }
+
+        SweepExpired_NoLock(now);
+        return null;
+    }
+
+    private void SweepExpired_NoLock(long now)
+    {
+        if (now < _lastObservedUtcMs &&
+            (decimal)_lastObservedUtcMs - now >
+                ProtocolConstants.MaxFutureClockSkewMs)
+        {
+            // Every runtime lease/deadline is wall-clock based. Keeping those
+            // absolute expiries after a material rollback could make dead
+            // adapters, owners, snapshots, and replay entries appear live for
+            // hours. Drop only ephemeral state; durable first-session bindings
+            // remain authoritative and clients republish current owners.
+            ClearRuntimeState_NoLock();
+            _lastObservedUtcMs = now;
+            SafeLog.Warn(
+                "clock-rollback-runtime-reset",
+                ("reason", "wall-clock-regressed"));
+            return;
+        }
+
+        if (now > _lastObservedUtcMs)
+        {
+            _lastObservedUtcMs = now;
+        }
 
         foreach (var key in _adapters.Where(kv => kv.Value.LeaseExpiresAtMs < now).Select(kv => kv.Key).ToList())
         {
@@ -1459,6 +2751,38 @@ public sealed class RouteStateMachine
             {
                 _snapshotsByNotification.Remove(snap.NotificationId);
             }
+        }
+
+        // Expiry is a state transition, not merely a retention deadline. Mark
+        // unresolved tickets terminal before capacity checks so a burst cannot
+        // reserve every recovery slot for the full result-retention window.
+        foreach (var recovery in _recoveriesById.Values
+                     .Where(recovery =>
+                         recovery.TerminalResult is null &&
+                         recovery.ResolvedSnapshotId is null &&
+                         recovery.PendingExpiresAtMs < now)
+                     .ToList())
+        {
+            recovery.TerminalResult = RouteResults.Expired;
+            recovery.TerminalReason = RejectReasons.RecoveryExpired;
+            recovery.RetainUntilMs = recovery.PendingExpiresAtMs +
+                ProtocolConstants.RecoveryResultTtlMs;
+        }
+
+        foreach (var key in _recoveriesById
+                     .Where(kv => kv.Value.RetainUntilMs < now)
+                     .Select(kv => kv.Key)
+                     .ToList())
+        {
+            RemoveRecovery_NoLock(key);
+        }
+
+        foreach (var key in _recoveryTombstones
+                     .Where(kv => kv.Value.RetainUntilMs < now)
+                     .Select(kv => kv.Key)
+                     .ToList())
+        {
+            _recoveryTombstones.Remove(key);
         }
 
         foreach (var key in _replay.Where(kv => kv.Value.ExpiresAtMs < now).Select(kv => kv.Key).ToList())
@@ -1486,9 +2810,40 @@ public sealed class RouteStateMachine
         }
     }
 
+    private void ClearRuntimeState_NoLock()
+    {
+        _adapters.Clear();
+        _ownersByKey.Clear();
+        _ownersBySession.Clear();
+        _snapshotsByNotification.Clear();
+        _snapshotsById.Clear();
+        _recoveriesByNotification.Clear();
+        _recoveriesById.Clear();
+        _recoveryTombstones.Clear();
+        _replay.Clear();
+        _activations.Clear();
+        _pendingByAdapter.Clear();
+    }
+
+    private sealed record AdapterGenerationFence(
+        string AdapterGeneration,
+        long AdapterStartedAtMs,
+        AdapterBindingIdentity Identity);
+
     private void EvictOldestSnapshot_NoLock(long now)
     {
-        var oldest = _snapshotsById.Values.OrderBy(s => s.CreatedAtMs).FirstOrDefault();
+        var activeSnapshotIds = _activations.Values
+            .Where(activation =>
+                !activation.Completed &&
+                activation.DeadlineMs >= now &&
+                activation.ExpiresAtMs >= now)
+            .Select(activation => activation.SnapshotId)
+            .ToHashSet(StringComparer.Ordinal);
+        var oldest = _snapshotsById.Values
+            .Where(snapshot => !activeSnapshotIds.Contains(snapshot.SnapshotId))
+            .OrderBy(snapshot => snapshot.CreatedAtMs)
+            .ThenBy(snapshot => snapshot.SnapshotId, StringComparer.Ordinal)
+            .FirstOrDefault();
         if (oldest is null)
         {
             return;
@@ -1498,31 +2853,239 @@ public sealed class RouteStateMachine
         _snapshotsByNotification.Remove(oldest.NotificationId);
     }
 
+    private void EvictOldestRecovery_NoLock(long now)
+    {
+        var victim = _recoveriesById.Values
+            .Where(recovery =>
+                recovery.RetainUntilMs < now ||
+                recovery.TerminalResult is not null ||
+                recovery.ResolvedSnapshotId is not null)
+            .OrderBy(recovery => recovery.CreatedAtMs)
+            .ThenBy(
+                recovery => recovery.RecoveryTicketId,
+                StringComparer.Ordinal)
+            .FirstOrDefault();
+        if (victim is not null)
+        {
+            RemoveRecovery_NoLock(
+                victim.RecoveryTicketId,
+                preserveTerminalTombstone:
+                    victim.TerminalResult is not null &&
+                    victim.RetainUntilMs >= now);
+        }
+    }
+
+    private void RemoveRecovery_NoLock(
+        string recoveryTicketId,
+        bool preserveTerminalTombstone = false)
+    {
+        if (!_recoveriesById.Remove(recoveryTicketId, out var recovery))
+        {
+            return;
+        }
+
+        if (preserveTerminalTombstone &&
+            recovery.TerminalResult is not null &&
+            recovery.TerminalReason is not null)
+        {
+            RememberRecoveryTombstone_NoLock(recovery);
+        }
+
+        if (_recoveriesByNotification.TryGetValue(
+                recovery.NotificationId,
+                out var current) &&
+            ReferenceEquals(current, recovery))
+        {
+            _recoveriesByNotification.Remove(recovery.NotificationId);
+        }
+    }
+
+    private void RememberRecoveryTombstone_NoLock(
+        NotificationRecoveryTicket recovery)
+    {
+        while (_recoveryTombstones.Count >=
+               ProtocolConstants.MaxRecoveryTombstones)
+        {
+            var victim = _recoveryTombstones.Values
+                .OrderBy(item => item.RetainUntilMs)
+                .ThenBy(item => item.RecoveryTicketId, StringComparer.Ordinal)
+                .First();
+            _recoveryTombstones.Remove(victim.RecoveryTicketId);
+        }
+
+        _recoveryTombstones[recovery.RecoveryTicketId] = new RecoveryTombstone(
+            recovery.RecoveryTicketId,
+            recovery.NotificationId,
+            recovery.TerminalResult!,
+            recovery.TerminalReason!,
+            recovery.RetainUntilMs);
+    }
+
     private RouteResponse Remember_NoLock(RouteMessage msg, RouteResponse response, long now)
     {
-        if (_replay.Count >= ProtocolConstants.MaxReplayEntries)
+        var requestFingerprint = MessageFingerprint(msg);
+        if (_replay.TryGetValue(msg.RequestId, out var existing) &&
+            existing.ExpiresAtMs >= now &&
+            !string.Equals(
+                existing.RequestFingerprint,
+                requestFingerprint,
+                StringComparison.Ordinal))
         {
-            var victim = _replay.OrderBy(kv => kv.Value.ExpiresAtMs).First().Key;
-            _replay.Remove(victim);
+            return RouteResponse.Reject(
+                msg.RequestId,
+                RouteResults.Rejected,
+                RejectReasons.RequestIdConflict);
         }
 
         var entry = new ReplayEntry
         {
             Response = CloneResponse(response),
             ExpiresAtMs = now + ProtocolConstants.ReplayCacheTtlMs,
+            RequestFingerprint = requestFingerprint,
         };
         _replay[msg.RequestId] = entry;
 
+        string? nonceKey = null;
         if (msg.Nonce is not null)
         {
-            _replay["nonce:" + msg.Nonce] = new ReplayEntry
+            nonceKey = "nonce:" + msg.Nonce;
+            _replay[nonceKey] = new ReplayEntry
             {
                 Response = CloneResponse(response),
                 ExpiresAtMs = now + ProtocolConstants.ReplayCacheTtlMs,
+                RequestFingerprint = requestFingerprint,
             };
         }
 
+        TrimReplayCache_NoLock(msg.RequestId, nonceKey);
         return response;
+    }
+
+    private RouteResponse? GetRequestReplay_NoLock(
+        RouteMessage msg,
+        long now,
+        bool markSuccessfulReplay)
+    {
+        if (!_replay.TryGetValue(msg.RequestId, out var existing) ||
+            existing.ExpiresAtMs < now)
+        {
+            return null;
+        }
+
+        if (!string.Equals(
+                existing.RequestFingerprint,
+                MessageFingerprint(msg),
+                StringComparison.Ordinal))
+        {
+            return RouteResponse.Reject(
+                msg.RequestId,
+                RouteResults.Rejected,
+                RejectReasons.RequestIdConflict);
+        }
+
+        return BuildReplayResponse(existing, markSuccessfulReplay);
+    }
+
+    private RouteResponse? GetNonceReplay_NoLock(
+        RouteMessage msg,
+        long now,
+        bool markSuccessfulReplay)
+    {
+        if (msg.Nonce is null)
+        {
+            return null;
+        }
+
+        var nonceKey = "nonce:" + msg.Nonce;
+        if (!_replay.TryGetValue(nonceKey, out var existing) ||
+            existing.ExpiresAtMs < now)
+        {
+            return null;
+        }
+
+        var requestFingerprint = MessageFingerprint(msg);
+        var response = string.Equals(
+            existing.RequestFingerprint,
+            requestFingerprint,
+            StringComparison.Ordinal)
+            ? BuildReplayResponse(existing, markSuccessfulReplay)
+            : RouteResponse.Reject(
+                msg.RequestId,
+                RouteResults.Replay,
+                RejectReasons.Replay);
+
+        // Recover/cache this request ID without replacing the authoritative
+        // nonce entry. A different body under the same nonce must never poison
+        // the original replay record or reach an activation side effect.
+        _replay[msg.RequestId] = new ReplayEntry
+        {
+            Response = CloneResponse(response),
+            ExpiresAtMs = existing.ExpiresAtMs,
+            RequestFingerprint = requestFingerprint,
+        };
+        TrimReplayCache_NoLock(msg.RequestId, nonceKey);
+        return response;
+    }
+
+    private static RouteResponse BuildReplayResponse(
+        ReplayEntry existing,
+        bool markSuccessfulReplay)
+    {
+        var cached = CloneResponse(existing.Response);
+        if (!markSuccessfulReplay)
+        {
+            return cached;
+        }
+
+        cached.Reason = existing.Response.Reason ?? RejectReasons.Replay;
+        if (cached.Result is RouteResults.Ready or RouteResults.Ok or
+            RouteResults.SessionUrlConfirmed or RouteResults.AlreadyActive or
+            RouteResults.Accepted or RouteResults.SessionConfirmed)
+        {
+            cached.Reason = RejectReasons.Replay;
+        }
+        else if (string.IsNullOrEmpty(cached.Result))
+        {
+            cached.Result = RouteResults.Replay;
+        }
+
+        return cached;
+    }
+
+    private static string MessageFingerprint(RouteMessage msg) =>
+        Convert.ToHexString(SHA256.HashData(msg.ToUtf8Bytes()));
+
+    private void TrimReplayCache_NoLock(string currentRequestId, string? currentNonceKey)
+    {
+        // A message can add two keys. Trim after both writes and protect that pair so the
+        // request we just accepted cannot lose replay protection at the capacity boundary.
+        while (_replay.Count > ProtocolConstants.MaxReplayEntries)
+        {
+            string? victim = null;
+            long oldestExpiry = long.MaxValue;
+
+            foreach (var candidate in _replay)
+            {
+                if (string.Equals(candidate.Key, currentRequestId, StringComparison.Ordinal) ||
+                    string.Equals(candidate.Key, currentNonceKey, StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                if (victim is null || candidate.Value.ExpiresAtMs < oldestExpiry)
+                {
+                    victim = candidate.Key;
+                    oldestExpiry = candidate.Value.ExpiresAtMs;
+                }
+            }
+
+            if (victim is null)
+            {
+                throw new InvalidOperationException("Replay cache capacity is smaller than one request/nonce pair.");
+            }
+
+            _replay.Remove(victim);
+        }
     }
 
     private static RouteResponse CloneResponse(RouteResponse src) => new()
@@ -1533,6 +3096,7 @@ public sealed class RouteStateMachine
         Result = src.Result,
         Reason = src.Reason,
         SnapshotId = src.SnapshotId,
+        RecoveryTicketId = src.RecoveryTicketId,
         CandidateCount = src.CandidateCount,
         AdapterKind = src.AdapterKind,
         OwnerFingerprint = src.OwnerFingerprint,
@@ -1557,5 +3121,13 @@ public sealed class RouteStateMachine
     {
         public required RouteResponse Response { get; init; }
         public long ExpiresAtMs { get; init; }
+        public required string RequestFingerprint { get; init; }
     }
+
+    private sealed record RecoveryTombstone(
+        string RecoveryTicketId,
+        string NotificationId,
+        string Result,
+        string Reason,
+        long RetainUntilMs);
 }

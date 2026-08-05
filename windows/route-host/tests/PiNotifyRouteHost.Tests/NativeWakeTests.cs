@@ -125,6 +125,51 @@ public class NativeWakeTests
         public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
     }
 
+    /// <summary>
+    /// Models an open stdout pipe whose reader stopped draining it. The write
+    /// completes only when the relay supplies a bounded cancellation token.
+    /// </summary>
+    private sealed class BlockingOutputStream : Stream
+    {
+        public TaskCompletionSource WriteEntered { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource WriteExited { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public override async ValueTask WriteAsync(
+            ReadOnlyMemory<byte> buffer,
+            CancellationToken cancellationToken = default)
+        {
+            WriteEntered.TrySetResult();
+            try
+            {
+                await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            }
+            finally
+            {
+                WriteExited.TrySetResult();
+            }
+        }
+
+        public override void Write(byte[] buffer, int offset, int count) =>
+            throw new NotSupportedException("Use WriteAsync");
+
+        public override bool CanRead => false;
+        public override bool CanSeek => false;
+        public override bool CanWrite => true;
+        public override long Length => throw new NotSupportedException();
+        public override long Position
+        {
+            get => throw new NotSupportedException();
+            set => throw new NotSupportedException();
+        }
+
+        public override void Flush() { }
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    }
+
     [Fact]
     public void Wake_frame_bytes_are_versioned_and_free_of_sensitive_fields()
     {
@@ -381,6 +426,67 @@ public class NativeWakeTests
     }
 
     [Fact]
+    public async Task Blocked_stdout_write_has_a_total_timeout_and_stops_the_relay()
+    {
+        await using var input = new ControllableInputStream();
+        await using var output = new BlockingOutputStream();
+        var terminationRequested = new TaskCompletionSource<int>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var relay = new NativeMessagingRelay(
+            callerOrigin: AllowedOrigin,
+            allowedOrigins: new[] { AllowedOrigin },
+            forward: (_, _) => Task.FromResult(RouteResponse.Ok("unused")),
+            input: input,
+            output: output,
+            wakeInterval: TimeSpan.FromMilliseconds(1),
+            delayAsync: (_, _) => Task.CompletedTask,
+            outputWriteTimeout: TimeSpan.FromMilliseconds(50),
+            terminateProcess: exitCode =>
+                terminationRequested.TrySetResult(exitCode));
+
+        var run = relay.RunAsync();
+        await output.WriteEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await run.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Equal(0, relay.WakeCount);
+        Assert.Equal(
+            1,
+            await terminationRequested.Task.WaitAsync(
+                TimeSpan.FromSeconds(5)));
+        await output.WriteExited.Task.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    [Fact]
+    public async Task External_cancellation_of_blocked_stdout_does_not_request_termination()
+    {
+        await using var input = new ControllableInputStream();
+        await using var output = new BlockingOutputStream();
+        using var cancellation = new CancellationTokenSource();
+        var terminationRequests = 0;
+
+        var relay = new NativeMessagingRelay(
+            callerOrigin: AllowedOrigin,
+            allowedOrigins: new[] { AllowedOrigin },
+            forward: (_, _) => Task.FromResult(RouteResponse.Ok("unused")),
+            input: input,
+            output: output,
+            wakeInterval: TimeSpan.FromMilliseconds(1),
+            delayAsync: (_, _) => Task.CompletedTask,
+            outputWriteTimeout: TimeSpan.FromSeconds(5),
+            terminateProcess: _ =>
+                Interlocked.Increment(ref terminationRequests));
+
+        var run = relay.RunAsync(cancellation.Token);
+        await output.WriteEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await cancellation.CancelAsync();
+        await run.WaitAsync(TimeSpan.FromSeconds(5));
+
+        await output.WriteExited.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(0, Volatile.Read(ref terminationRequests));
+    }
+
+    [Fact]
     public async Task Wake_delay_failure_is_observed_and_cancels_blocked_read()
     {
         await using var input = new ControllableInputStream();
@@ -455,6 +561,46 @@ public class NativeWakeTests
     }
 
     [Fact]
+    public async Task Cancellation_during_forward_is_a_clean_relay_shutdown()
+    {
+        await using var input = new ControllableInputStream();
+        await using var output = new MemoryStream();
+        using var cts = new CancellationTokenSource();
+        var forwardEntered = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var health = new RouteMessage
+        {
+            ProtocolVersion = ProtocolConstants.ProtocolVersion,
+            Type = MessageTypes.Health,
+            RequestId = "req-forward-cancel-01",
+            IssuedAtMs = 1_700_000_000_000,
+            ExpiresAtMs = 1_700_000_005_000,
+        };
+        input.EnqueueFrame(health.ToUtf8Bytes());
+
+        var relay = new NativeMessagingRelay(
+            callerOrigin: AllowedOrigin,
+            allowedOrigins: new[] { AllowedOrigin },
+            forward: async (_, ct) =>
+            {
+                forwardEntered.TrySetResult();
+                await Task.Delay(Timeout.InfiniteTimeSpan, ct);
+                return RouteResponse.Ok("unreachable");
+            },
+            input: input,
+            output: output,
+            wakeInterval: TimeSpan.Zero);
+
+        var run = relay.RunAsync(cts.Token);
+        await forwardEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await cts.CancelAsync();
+
+        await run.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(0, output.Length);
+    }
+
+    [Fact]
     public async Task Wake_stops_on_stdin_close()
     {
         await using var input = new ControllableInputStream();
@@ -508,7 +654,7 @@ public class NativeWakeTests
     }
 
     [Fact]
-    public async Task Inbound_wake_type_is_rejected_and_not_forwarded()
+    public async Task Inbound_wake_frame_is_rejected_by_the_closed_request_schema()
     {
         await using var input = new ControllableInputStream();
         await using var output = new MemoryStream();
@@ -541,7 +687,7 @@ public class NativeWakeTests
             CancellationToken.None);
         Assert.NotNull(body);
         var text = Encoding.UTF8.GetString(body!);
-        Assert.Contains(RejectReasons.UnknownType, text, StringComparison.Ordinal);
+        Assert.Contains(RejectReasons.InvalidField, text, StringComparison.Ordinal);
         Assert.Contains(RouteResults.Rejected, text, StringComparison.Ordinal);
     }
 }

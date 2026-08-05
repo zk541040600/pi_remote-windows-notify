@@ -30,6 +30,7 @@ $DisplayMode = $config.DisplayMode
 $PopupTimeoutSeconds = $config.PopupTimeoutSeconds
 $script:NotifyToastEventHandlers = New-Object System.Collections.ArrayList
 $script:NotifyActivationCleanupTimers = New-Object System.Collections.ArrayList
+$script:NotifyToastRecoveryWorkers = New-Object System.Collections.ArrayList
 $script:NotifyActivationScript = Join-Path $PSScriptRoot 'pi-notify-activate.ps1'
 $script:NotifyPopupScript = Join-Path $PSScriptRoot 'pi-notify-popup.ps1'
 $script:NotifyBrokerScript = Join-Path $PSScriptRoot 'pi-notify-broker.ps1'
@@ -425,7 +426,8 @@ function Save-NotifyToastActivationState {
         [string]$TabTitle,
         [string]$OriginKind = '',
         [string]$NotificationId = '',
-        [string]$SnapshotId = ''
+        [string]$SnapshotId = '',
+        [string]$RecoveryTicketId = ''
     )
 
     try {
@@ -446,6 +448,9 @@ function Save-NotifyToastActivationState {
         }
         if (-not [string]::IsNullOrWhiteSpace($SnapshotId)) {
             $payload['protectedSnapshotId'] = Protect-NotifyActivationValue -Value $SnapshotId
+        }
+        if (-not [string]::IsNullOrWhiteSpace($RecoveryTicketId)) {
+            $payload['protectedRecoveryTicketId'] = Protect-NotifyActivationValue -Value $RecoveryTicketId
         }
         $writtenPaths = @()
         foreach ($logDir in $logDirs) {
@@ -472,6 +477,138 @@ function Save-NotifyToastActivationState {
     }
     catch {
         Write-NotifyListenerLog -Message ('activation-cache-write-error "{0}"' -f $_.Exception.Message)
+    }
+}
+
+# Harvest completed system-toast recovery workers. Recovery runs outside the
+# listener request thread so a reconnect can never delay the HTTP response.
+function Clear-NotifyToastRecoveryWorkers {
+    for ($index = $script:NotifyToastRecoveryWorkers.Count - 1; $index -ge 0; $index--) {
+        $worker = $script:NotifyToastRecoveryWorkers[$index]
+        if (-not $worker.AsyncResult.IsCompleted) {
+            continue
+        }
+
+        try {
+            $result = @($worker.PowerShell.EndInvoke($worker.AsyncResult) | Select-Object -Last 1)
+            if ($result.Count -gt 0) {
+                $item = $result[0]
+                Write-NotifyListenerLog -Message ('toast-recovery-complete decision={0} result={1} notificationFp={2} ticketFp={3} snapshotFp={4}' -f [string]$item.Decision, [string]$item.Result, (Get-NotifyRouteFingerprint -Value $worker.NotificationId), (Get-NotifyRouteFingerprint -Value $worker.RecoveryTicketId), (Get-NotifyRouteFingerprint -Value ([string]$item.SnapshotId)))
+            }
+        }
+        catch {
+            Write-NotifyListenerLog -Message ('toast-recovery-error reason={0} notificationFp={1} ticketFp={2}' -f $_.Exception.GetType().Name, (Get-NotifyRouteFingerprint -Value $worker.NotificationId), (Get-NotifyRouteFingerprint -Value $worker.RecoveryTicketId))
+        }
+        finally {
+            try { $worker.PowerShell.Dispose() } catch {}
+            try { $worker.Runspace.Close(); $worker.Runspace.Dispose() } catch {}
+            $script:NotifyToastRecoveryWorkers.RemoveAt($index)
+        }
+    }
+}
+
+# Resolve a pre-snapshot recovery ticket as soon as its original owner returns,
+# then atomically upgrade the protected activation cache. A click racing this
+# write still carries the ticket and resolves through pi-notify-activate.ps1.
+function Start-NotifyToastRecoveryWorker {
+    param(
+        [Parameter(Mandatory = $true)][string]$ActivationId,
+        [Parameter(Mandatory = $true)][string]$NotificationId,
+        [Parameter(Mandatory = $true)][string]$RecoveryTicketId,
+        [Parameter(Mandatory = $true)][string[]]$ActivationPaths
+    )
+
+    if ($ActivationPaths.Count -eq 0) { return $false }
+    Clear-NotifyToastRecoveryWorkers
+
+    # Auto-resolution is best effort; click-time recovery remains authoritative.
+    # Keep an accidental notification burst from creating unbounded runspaces.
+    if ($script:NotifyToastRecoveryWorkers.Count -ge 32) {
+        Write-NotifyListenerLog -Message ('toast-recovery-skip reason=capacity notificationFp={0} ticketFp={1}' -f (Get-NotifyRouteFingerprint -Value $NotificationId), (Get-NotifyRouteFingerprint -Value $RecoveryTicketId))
+        return $false
+    }
+
+    $workerScript = {
+        param($commonPath, $configPath, $activationId, $notificationId, $recoveryTicketId, $activationPaths)
+
+        Set-StrictMode -Version Latest
+        $ErrorActionPreference = 'Stop'
+        . $commonPath
+        Add-Type -AssemblyName System.Security
+
+        $config = Ensure-NotifyBridgeConfig -ConfigPath $configPath
+        $outcome = Wait-NotifyExactRouteRecovery -NotificationId $notificationId -RecoveryTicketId $recoveryTicketId -Config $config -WaitMs 125000
+        $decision = [string]$outcome.Decision.Decision
+        $result = [string]$outcome.Decision.Result
+        $snapshotId = if ($decision -eq 'exact-ready') { [string]$outcome.Decision.SnapshotId } else { '' }
+
+        if (-not [string]::IsNullOrWhiteSpace($snapshotId)) {
+            $snapshotBytes = [System.Text.Encoding]::UTF8.GetBytes($snapshotId)
+            $protectedSnapshot = [Convert]::ToBase64String(
+                [System.Security.Cryptography.ProtectedData]::Protect(
+                    $snapshotBytes,
+                    $null,
+                    [System.Security.Cryptography.DataProtectionScope]::CurrentUser))
+
+            foreach ($path in @($activationPaths)) {
+                $tempPath = ''
+                try {
+                    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { continue }
+                    $payload = [System.IO.File]::ReadAllText($path, [System.Text.UTF8Encoding]::new($false)) | ConvertFrom-Json
+                    if (-not $payload.PSObject.Properties['activationId'] -or [string]$payload.activationId -ne $activationId) { continue }
+                    $payload | Add-Member -NotePropertyName protectedSnapshotId -NotePropertyValue $protectedSnapshot -Force
+                    $tempPath = Join-Path (Split-Path -Parent $path) ('.activation-{0}-{1}.tmp' -f $activationId, [Guid]::NewGuid().ToString('N'))
+                    [System.IO.File]::WriteAllText($tempPath, ($payload | ConvertTo-Json -Depth 4), [System.Text.UTF8Encoding]::new($false))
+                    [System.IO.File]::Replace($tempPath, $path, $null)
+                    $tempPath = ''
+                }
+                catch {
+                    # A click can consume/delete the cache while recovery is
+                    # completing. That race is safe because the click already
+                    # loaded the same recovery ticket.
+                }
+                finally {
+                    if (-not [string]::IsNullOrWhiteSpace($tempPath)) {
+                        try { Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue } catch {}
+                    }
+                }
+            }
+        }
+
+        [pscustomobject]@{
+            Decision = $decision
+            Result = $result
+            SnapshotId = $snapshotId
+        }
+    }
+
+    $runspace = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
+    $powerShell = [System.Management.Automation.PowerShell]::Create()
+    try {
+        $runspace.Open()
+        $powerShell.Runspace = $runspace
+        [void]$powerShell.AddScript($workerScript.ToString())
+        [void]$powerShell.AddArgument((Join-Path $PSScriptRoot 'NotifyBridge.Common.ps1'))
+        [void]$powerShell.AddArgument($ConfigPath)
+        [void]$powerShell.AddArgument($ActivationId)
+        [void]$powerShell.AddArgument($NotificationId)
+        [void]$powerShell.AddArgument($RecoveryTicketId)
+        [void]$powerShell.AddArgument(@($ActivationPaths))
+        $asyncResult = $powerShell.BeginInvoke()
+        [void]$script:NotifyToastRecoveryWorkers.Add([pscustomobject]@{
+            PowerShell = $powerShell
+            Runspace = $runspace
+            AsyncResult = $asyncResult
+            NotificationId = $NotificationId
+            RecoveryTicketId = $RecoveryTicketId
+        })
+        return $true
+    }
+    catch {
+        try { $powerShell.Dispose() } catch {}
+        try { $runspace.Close(); $runspace.Dispose() } catch {}
+        Write-NotifyListenerLog -Message ('toast-recovery-start-error reason={0} notificationFp={1} ticketFp={2}' -f $_.Exception.GetType().Name, (Get-NotifyRouteFingerprint -Value $NotificationId), (Get-NotifyRouteFingerprint -Value $RecoveryTicketId))
+        return $false
     }
 }
 
@@ -698,7 +835,8 @@ function Send-NotifyBrokerPopup {
         [string]$PopupPlacement,
         [string]$OriginKind = '',
         [string]$NotificationId = '',
-        [string]$SnapshotId = ''
+        [string]$SnapshotId = '',
+        [string]$RecoveryTicketId = ''
     )
 
     $payloadTable = @{
@@ -716,6 +854,7 @@ function Send-NotifyBrokerPopup {
     if (-not [string]::IsNullOrWhiteSpace($OriginKind)) { $payloadTable['originKind'] = $OriginKind }
     if (-not [string]::IsNullOrWhiteSpace($NotificationId)) { $payloadTable['notificationId'] = $NotificationId }
     if (-not [string]::IsNullOrWhiteSpace($SnapshotId)) { $payloadTable['snapshotId'] = $SnapshotId }
+    if (-not [string]::IsNullOrWhiteSpace($RecoveryTicketId)) { $payloadTable['recoveryTicketId'] = $RecoveryTicketId }
     $payload = $payloadTable | ConvertTo-Json -Depth 4 -Compress
     $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($payload)
 
@@ -786,7 +925,8 @@ function Invoke-NotifyBrokerPopup {
         [string]$PopupPlacement,
         [string]$OriginKind = '',
         [string]$NotificationId = '',
-        [string]$SnapshotId = ''
+        [string]$SnapshotId = '',
+        [string]$RecoveryTicketId = ''
     )
 
     $brokerEnabled = $false
@@ -814,7 +954,7 @@ function Invoke-NotifyBrokerPopup {
         return $false
     }
 
-    $sent = Send-NotifyBrokerPopup -Title $Title -Body $Body -FocusTarget $FocusTarget -CwdBase $CwdBase -TabTitle $TabTitle -SessionName $SessionName -TargetFingerprint $TargetFingerprint -StackIndex $StackIndex -TimeoutSeconds $TimeoutSeconds -PopupPlacement $PopupPlacement -OriginKind $OriginKind -NotificationId $NotificationId -SnapshotId $SnapshotId
+    $sent = Send-NotifyBrokerPopup -Title $Title -Body $Body -FocusTarget $FocusTarget -CwdBase $CwdBase -TabTitle $TabTitle -SessionName $SessionName -TargetFingerprint $TargetFingerprint -StackIndex $StackIndex -TimeoutSeconds $TimeoutSeconds -PopupPlacement $PopupPlacement -OriginKind $OriginKind -NotificationId $NotificationId -SnapshotId $SnapshotId -RecoveryTicketId $RecoveryTicketId
     if (-not $sent) {
         Write-NotifyListenerLog -Message 'broker-post-failed fallback=popup-process'
         return $false
@@ -837,7 +977,8 @@ function Start-NotifyPopupProcess {
         [int]$TimeoutSeconds,
         [string]$OriginKind = '',
         [string]$NotificationId = '',
-        [string]$SnapshotId = ''
+        [string]$SnapshotId = '',
+        [string]$RecoveryTicketId = ''
     )
 
     Clear-NotifyBridgePopupArtifacts -Aggressive
@@ -872,6 +1013,9 @@ function Start-NotifyPopupProcess {
     if (-not [string]::IsNullOrWhiteSpace($SnapshotId)) {
         $popupStartInfo.EnvironmentVariables['PI_NOTIFY_SNAPSHOT_ID'] = [string]$SnapshotId
     }
+    if (-not [string]::IsNullOrWhiteSpace($RecoveryTicketId)) {
+        $popupStartInfo.EnvironmentVariables['PI_NOTIFY_RECOVERY_TICKET_ID'] = [string]$RecoveryTicketId
+    }
     $popupProcess = [System.Diagnostics.Process]::Start($popupStartInfo)
     Write-NotifyListenerLog -Message ('popup-pid {0} slot={1} targetFingerprint="{2}" originKind={3} notificationFp={4} snapshotFp={5}' -f $popupProcess.Id, $StackIndex, $TargetFingerprint, $(if ([string]::IsNullOrWhiteSpace($OriginKind)) { 'none' } else { $OriginKind }), (Get-NotifyRouteFingerprint -Value $NotificationId), (Get-NotifyRouteFingerprint -Value $SnapshotId))
 }
@@ -891,7 +1035,8 @@ function Show-Toast {
         [string]$LaunchUri,
         [string]$OriginKind = '',
         [string]$NotificationId = '',
-        [string]$SnapshotId = ''
+        [string]$SnapshotId = '',
+        [string]$RecoveryTicketId = ''
     )
 
     if (-not [string]::IsNullOrWhiteSpace($TestDesktopSinkPath)) {
@@ -908,12 +1053,13 @@ function Show-Toast {
     $originKind = if ([string]::IsNullOrWhiteSpace($OriginKind)) { '' } else { [string]$OriginKind }
     $notificationId = if ([string]::IsNullOrWhiteSpace($NotificationId)) { '' } else { [string]$NotificationId }
     $snapshotId = if ([string]::IsNullOrWhiteSpace($SnapshotId)) { '' } else { [string]$SnapshotId }
+    $recoveryTicketId = if ([string]::IsNullOrWhiteSpace($RecoveryTicketId)) { '' } else { [string]$RecoveryTicketId }
 
     if ($DisplayMode -eq 'popup-focus' -and (Test-Path -LiteralPath $script:NotifyPopupScript)) {
         $targetKey = Get-NotifyPopupTargetKey -TargetHost $focusTarget -CwdBase $cwdBase -TabTitle $tabTitle
         $targetFingerprint = Get-NotifyPopupTargetFingerprint -TargetKey $targetKey
 
-        $brokerSent = Invoke-NotifyBrokerPopup -Title $Title -Body $Body -FocusTarget $focusTarget -CwdBase $cwdBase -TabTitle $tabTitle -SessionName $sessionName -TargetFingerprint $targetFingerprint -StackIndex -1 -TimeoutSeconds $PopupTimeoutSeconds -PopupPlacement ([string]$config.PopupPlacement) -OriginKind $originKind -NotificationId $notificationId -SnapshotId $snapshotId
+        $brokerSent = Invoke-NotifyBrokerPopup -Title $Title -Body $Body -FocusTarget $focusTarget -CwdBase $cwdBase -TabTitle $tabTitle -SessionName $sessionName -TargetFingerprint $targetFingerprint -StackIndex -1 -TimeoutSeconds $PopupTimeoutSeconds -PopupPlacement ([string]$config.PopupPlacement) -OriginKind $originKind -NotificationId $notificationId -SnapshotId $snapshotId -RecoveryTicketId $recoveryTicketId
         if ($brokerSent) {
             return
         }
@@ -922,7 +1068,7 @@ function Show-Toast {
         Clear-NotifyBridgePopupArtifacts -Aggressive
 
         Write-NotifyListenerLog -Message ('popup-launch targetFingerprint={0} slot={1} timeout={2} source=fallback originKind={3}' -f $targetFingerprint, $stackIndex, $PopupTimeoutSeconds, $(if ([string]::IsNullOrWhiteSpace($originKind)) { 'none' } else { $originKind }))
-        Start-NotifyPopupProcess -Title $Title -Body $Body -FocusTarget $focusTarget -CwdBase $cwdBase -TabTitle $tabTitle -SessionName $sessionName -TargetFingerprint $targetFingerprint -StackIndex $stackIndex -TimeoutSeconds $PopupTimeoutSeconds -OriginKind $originKind -NotificationId $notificationId -SnapshotId $snapshotId
+        Start-NotifyPopupProcess -Title $Title -Body $Body -FocusTarget $focusTarget -CwdBase $cwdBase -TabTitle $tabTitle -SessionName $sessionName -TargetFingerprint $targetFingerprint -StackIndex $stackIndex -TimeoutSeconds $PopupTimeoutSeconds -OriginKind $originKind -NotificationId $notificationId -SnapshotId $snapshotId -RecoveryTicketId $recoveryTicketId
         return
     }
 
@@ -936,17 +1082,33 @@ function Show-Toast {
     $texts.Item(1).AppendChild($xml.CreateTextNode($Body)) | Out-Null
 
     $activationId = [Guid]::NewGuid().ToString('N')
-    $activationPaths = @(Save-NotifyToastActivationState -ActivationId $activationId -FocusTarget $focusTarget -CwdBase $cwdBase -TabTitle $tabTitle -OriginKind $originKind -NotificationId $notificationId -SnapshotId $snapshotId)
+    $activationPaths = @(Save-NotifyToastActivationState -ActivationId $activationId -FocusTarget $focusTarget -CwdBase $cwdBase -TabTitle $tabTitle -OriginKind $originKind -NotificationId $notificationId -SnapshotId $snapshotId -RecoveryTicketId $recoveryTicketId)
     $safeLaunchUri = Get-NotifyBridgeActivationUri -ActivationId $activationId
     $xml.DocumentElement.SetAttribute('launch', $safeLaunchUri)
     $xml.DocumentElement.SetAttribute('activationType', 'protocol')
 
     Write-NotifyListenerLog -Message ('system-toast activationId={0} hasCwd={1} hasTab={2} originKind={3} notificationFp={4} snapshotFp={5}' -f $activationId, (-not [string]::IsNullOrWhiteSpace($cwdBase)), (-not [string]::IsNullOrWhiteSpace($tabTitle)), $(if ([string]::IsNullOrWhiteSpace($originKind)) { 'none' } else { $originKind }), (Get-NotifyRouteFingerprint -Value $notificationId), (Get-NotifyRouteFingerprint -Value $snapshotId))
     $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
-    $toast.ExpirationTime = [DateTimeOffset]::Now.AddMinutes(5)
+    $isPendingRecoveryToast = $originKind -eq 'pi-web' -and
+        [string]::IsNullOrWhiteSpace($snapshotId) -and
+        -not [string]::IsNullOrWhiteSpace($notificationId) -and
+        -not [string]::IsNullOrWhiteSpace($recoveryTicketId)
+    # A pending ticket is valid for 120 seconds from freeze. Expire the toast
+    # slightly earlier so Windows cannot leave a dead clickable notification
+    # behind after the Host has terminalized the ticket. Already-ready
+    # snapshots retain the normal five-minute visibility window.
+    $toast.ExpirationTime = if ($isPendingRecoveryToast) {
+        [DateTimeOffset]::Now.AddSeconds(115)
+    }
+    else {
+        [DateTimeOffset]::Now.AddMinutes(5)
+    }
     # Windows PowerShell 5.1 cannot reliably subscribe to WinRT toast events.
     # Click activation is handled by the protocol launch URI above.
     [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($ToastAppId).Show($toast)
+    if ($isPendingRecoveryToast) {
+        [void](Start-NotifyToastRecoveryWorker -ActivationId $activationId -NotificationId $notificationId -RecoveryTicketId $recoveryTicketId -ActivationPaths $activationPaths)
+    }
 }
 
 $ipAddress = [System.Net.IPAddress]::Parse($ListenHost)
@@ -1049,6 +1211,7 @@ try {
             $routeOriginKind = ''
             $routeNotificationId = ''
             $routeSnapshotId = ''
+            $routeRecoveryTicketId = ''
             $suppressTerminalFallback = $false
             if ($routeMeta.HasAnyRouteField) {
                 if ($routeMeta.IsValidPiWebExact) {
@@ -1059,6 +1222,14 @@ try {
                         $routeOriginKind = 'pi-web'
                         $routeNotificationId = $routeMeta.NotificationId
                         $routeSnapshotId = $freezeDecision.SnapshotId
+                    }
+                    elseif ($freezeDecision.Decision -eq 'exact-recovering') {
+                        $routeOriginKind = 'pi-web'
+                        $routeNotificationId = $routeMeta.NotificationId
+                        $routeSnapshotId = ''
+                        $routeRecoveryTicketId = $freezeDecision.RecoveryTicketId
+                        $suppressTerminalFallback = $true
+                        Write-NotifyListenerLog -Message ('route-freeze-recovering notificationFp={0} ticketFp={1}' -f (Get-NotifyRouteFingerprint -Value $routeMeta.NotificationId), (Get-NotifyRouteFingerprint -Value $routeRecoveryTicketId))
                     }
                     else {
                         # Preserve the declared origin so every Pi Web route failure is a click no-op.
@@ -1094,7 +1265,7 @@ try {
             $launchUri = Get-NotifyBridgeActivationUri -ActivationId ([Guid]::NewGuid().ToString('N'))
 
             Write-NotifyListenerLog -Message ('notify targetFingerprint="{0}" hasCwd={1} hasTab={2} originKind={3} notificationFp={4} snapshotFp={5}' -f (Get-NotifyPopupTargetFingerprint -TargetKey $focusTarget), (-not [string]::IsNullOrWhiteSpace($cwdBase)), (-not [string]::IsNullOrWhiteSpace($tabTitle)), $(if ([string]::IsNullOrWhiteSpace($routeOriginKind)) { 'none' } else { $routeOriginKind }), (Get-NotifyRouteFingerprint -Value $routeNotificationId), (Get-NotifyRouteFingerprint -Value $routeSnapshotId))
-            Show-Toast -Title $title -Body $body -ToastAppId $AppId -FocusTarget $focusTarget -CwdBase $cwdBase -TabTitle $tabTitle -SessionName $sessionName -LaunchUri $launchUri -OriginKind $routeOriginKind -NotificationId $routeNotificationId -SnapshotId $routeSnapshotId
+            Show-Toast -Title $title -Body $body -ToastAppId $AppId -FocusTarget $focusTarget -CwdBase $cwdBase -TabTitle $tabTitle -SessionName $sessionName -LaunchUri $launchUri -OriginKind $routeOriginKind -NotificationId $routeNotificationId -SnapshotId $routeSnapshotId -RecoveryTicketId $routeRecoveryTicketId
             $notified = $true
             try {
                 Start-NotifyQqDispatch -Title $title -Body $body
@@ -1138,4 +1309,11 @@ finally {
     }
     catch {
     }
+    Clear-NotifyToastRecoveryWorkers
+    foreach ($worker in @($script:NotifyToastRecoveryWorkers)) {
+        try { $worker.PowerShell.Stop() } catch {}
+        try { $worker.PowerShell.Dispose() } catch {}
+        try { $worker.Runspace.Close(); $worker.Runspace.Dispose() } catch {}
+    }
+    $script:NotifyToastRecoveryWorkers.Clear()
 }

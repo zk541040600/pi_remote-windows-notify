@@ -1109,6 +1109,91 @@ function Test-NotifyRouteHexKey {
     return ($Value -match '^[0-9a-fA-F]+$')
 }
 
+function Test-NotifyRouteInstanceKey {
+    [CmdletBinding()]
+    param([string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
+    if ($Value.Length -lt 8 -or $Value.Length -gt 128) { return $false }
+    return ($Value -match '^[A-Za-z0-9._+-]+$')
+}
+
+function Resolve-NotifyBridgePiWebInstanceKey {
+    [CmdletBinding()]
+    param(
+        [string]$InstanceKey,
+        [string]$RouteConfigPath
+    )
+
+    if (-not [string]::IsNullOrEmpty($InstanceKey)) {
+        $normalized = $InstanceKey -replace '^[\x09-\x0D\x20]+|[\x09-\x0D\x20]+$', ''
+        if (-not (Test-NotifyRouteInstanceKey -Value $normalized)) {
+            throw 'Pi Web instanceKey is invalid.'
+        }
+        return $normalized
+    }
+
+    if ([string]::IsNullOrWhiteSpace($RouteConfigPath)) {
+        if ([string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+            return ''
+        }
+        $RouteConfigPath = [System.IO.Path]::Combine(
+            $env:LOCALAPPDATA,
+            'PiWebDesktop',
+            'route-config.json')
+    }
+
+    if (-not (Test-Path -LiteralPath $RouteConfigPath -PathType Leaf)) {
+        return ''
+    }
+
+    try {
+        $routeConfig = [System.IO.File]::ReadAllText($RouteConfigPath) |
+            ConvertFrom-Json -ErrorAction Stop
+    }
+    catch {
+        throw "PiWebDesktop route config is unreadable: $RouteConfigPath"
+    }
+
+    if ($null -eq $routeConfig -or
+        -not $routeConfig.PSObject.Properties['instanceKey'] -or
+        -not (Test-NotifyRouteInstanceKey -Value ([string]$routeConfig.instanceKey))) {
+        throw 'PiWebDesktop route config contains an invalid instanceKey.'
+    }
+
+    return [string]$routeConfig.instanceKey
+}
+
+function New-NotifyBridgeRemoteConfig {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Endpoint,
+        [Parameter(Mandatory = $true)][string]$Token,
+        [Parameter(Mandatory = $true)][string]$RemoteHostAlias,
+        [string]$PiWebInstanceKey
+    )
+
+    $remoteConfig = [ordered]@{
+        enabled         = $true
+        endpoint        = $Endpoint
+        token           = $Token
+        timeoutMs       = 4000
+        title           = 'Pi'
+        bodyTemplate    = 'host: {host} | cwd: {cwdBase}'
+        messageMode     = 'dynamic'
+        remoteHostAlias = $RemoteHostAlias
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($PiWebInstanceKey)) {
+        if (-not (Test-NotifyRouteInstanceKey -Value $PiWebInstanceKey)) {
+            throw 'Pi Web instanceKey is invalid.'
+        }
+        $remoteConfig['originKind'] = 'pi-web'
+        $remoteConfig['instanceKey'] = $PiWebInstanceKey
+    }
+
+    return $remoteConfig
+}
+
 function Get-NotifyPayloadStringField {
     [CmdletBinding()]
     param(
@@ -1200,7 +1285,7 @@ function Resolve-NotifyExactRouteMetadata {
         $result.InvalidReason = 'notification-id'
         return $result
     }
-    if ($instanceKey.Length -lt 8 -or $instanceKey.Length -gt 128 -or $instanceKey -notmatch '^[A-Za-z0-9._+-]+$') {
+    if (-not (Test-NotifyRouteInstanceKey -Value $instanceKey)) {
         $result.InvalidReason = 'instance-key'
         return $result
     }
@@ -1368,6 +1453,7 @@ function Invoke-NotifyRouteHostClient {
         $result = 'rejected'
         $reason = 'malformed-response'
         $snapshotId = ''
+        $recoveryTicketId = ''
         $activationRequestId = ''
         $rawLen = if ($null -eq $stdout) { 0 } else { $stdout.Length }
 
@@ -1386,6 +1472,9 @@ function Invoke-NotifyRouteHostClient {
                 }
                 if ($parsed.PSObject.Properties['snapshotId'] -and -not [string]::IsNullOrWhiteSpace([string]$parsed.snapshotId)) {
                     $snapshotId = ([string]$parsed.snapshotId).Trim()
+                }
+                if ($parsed.PSObject.Properties['recoveryTicketId'] -and -not [string]::IsNullOrWhiteSpace([string]$parsed.recoveryTicketId)) {
+                    $recoveryTicketId = ([string]$parsed.recoveryTicketId).Trim()
                 }
                 if ($parsed.PSObject.Properties['activationRequestId'] -and -not [string]::IsNullOrWhiteSpace([string]$parsed.activationRequestId)) {
                     $activationRequestId = ([string]$parsed.activationRequestId).Trim()
@@ -1424,6 +1513,7 @@ function Invoke-NotifyRouteHostClient {
             Result              = $result
             Reason              = $reason
             SnapshotId          = $snapshotId
+            RecoveryTicketId    = $recoveryTicketId
             ActivationRequestId = $activationRequestId
             RawLength           = $rawLen
             TypeFingerprint     = $typeFp
@@ -1436,6 +1526,7 @@ function Invoke-NotifyRouteHostClient {
             Result              = 'adapter-unavailable'
             Reason              = 'client-error'
             SnapshotId          = ''
+            RecoveryTicketId    = ''
             ActivationRequestId = ''
             RawLength           = 0
             TypeFingerprint     = $typeFp
@@ -1459,6 +1550,7 @@ function Get-NotifyRouteFreezeDecision {
     # Pi Web exact routing never falls back across origins. Any non-ready result fails closed.
     $resultName = if ($null -ne $ClientResult -and $ClientResult.PSObject.Properties['Result']) { [string]$ClientResult.Result } else { '' }
     $snapshotId = if ($null -ne $ClientResult -and $ClientResult.PSObject.Properties['SnapshotId']) { [string]$ClientResult.SnapshotId } else { '' }
+    $recoveryTicketId = if ($null -ne $ClientResult -and $ClientResult.PSObject.Properties['RecoveryTicketId']) { [string]$ClientResult.RecoveryTicketId } else { '' }
     $available = if ($null -ne $ClientResult -and $ClientResult.PSObject.Properties['Available']) { [bool]$ClientResult.Available } else { $false }
     $reason = if ($null -ne $ClientResult -and $ClientResult.PSObject.Properties['Reason']) { [string]$ClientResult.Reason } else { '' }
 
@@ -1468,6 +1560,7 @@ function Get-NotifyRouteFreezeDecision {
             OriginKind     = 'pi-web'
             NotificationId = $NotificationId
             SnapshotId     = ''
+            RecoveryTicketId = ''
             Result         = if ($resultName) { $resultName } else { 'adapter-unavailable' }
             Reason         = if ($reason) { $reason } else { 'adapter-unavailable' }
         }
@@ -1479,6 +1572,7 @@ function Get-NotifyRouteFreezeDecision {
             OriginKind     = 'pi-web'
             NotificationId = $NotificationId
             SnapshotId     = $snapshotId
+            RecoveryTicketId = ''
             Result         = 'ready'
             Reason         = $reason
         }
@@ -1490,8 +1584,21 @@ function Get-NotifyRouteFreezeDecision {
             OriginKind     = 'pi-web'
             NotificationId = $NotificationId
             SnapshotId     = ''
+            RecoveryTicketId = ''
             Result         = $resultName
             Reason         = $reason
+        }
+    }
+
+    if ($resultName -eq 'recovering' -and -not [string]::IsNullOrWhiteSpace($recoveryTicketId)) {
+        return [pscustomobject]@{
+            Decision         = 'exact-recovering'
+            OriginKind       = 'pi-web'
+            NotificationId   = $NotificationId
+            SnapshotId       = ''
+            RecoveryTicketId = $recoveryTicketId
+            Result           = 'recovering'
+            Reason           = $reason
         }
     }
 
@@ -1501,6 +1608,7 @@ function Get-NotifyRouteFreezeDecision {
         OriginKind     = 'pi-web'
         NotificationId = $NotificationId
         SnapshotId     = ''
+        RecoveryTicketId = ''
         Result         = if ($resultName) { $resultName } else { 'rejected' }
         Reason         = $reason
     }
@@ -1590,6 +1698,7 @@ function Invoke-NotifyExactRouteFreeze {
         notificationId = $NotificationId
         instanceKey    = $InstanceKey
         routingKey     = $RoutingKey
+        recoveryTtlMs  = 120000
     }
     if (-not [string]::IsNullOrWhiteSpace($NotificationKind)) {
         $fields['notificationKind'] = $NotificationKind
@@ -1600,6 +1709,167 @@ function Invoke-NotifyExactRouteFreeze {
 
     $clientResult = Invoke-NotifyRouteHostClient -Request $request -WaitMs 0 -TimeoutMs $TimeoutMs -Config $Config
     return Get-NotifyRouteFreezeDecision -ClientResult $clientResult -NotificationId $NotificationId
+}
+
+function Get-NotifyRouteRecoveryDecision {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$ClientResult,
+        [Parameter(Mandatory = $true)][string]$NotificationId,
+        [Parameter(Mandatory = $true)][string]$RecoveryTicketId
+    )
+
+    $resultName = if ($ClientResult.PSObject.Properties['Result']) { [string]$ClientResult.Result } else { '' }
+    $reason = if ($ClientResult.PSObject.Properties['Reason']) { [string]$ClientResult.Reason } else { '' }
+    $available = if ($ClientResult.PSObject.Properties['Available']) { [bool]$ClientResult.Available } else { $false }
+    $snapshotId = if ($ClientResult.PSObject.Properties['SnapshotId']) { [string]$ClientResult.SnapshotId } else { '' }
+    $ticketId = if ($ClientResult.PSObject.Properties['RecoveryTicketId']) { [string]$ClientResult.RecoveryTicketId } else { '' }
+
+    if ($resultName -eq 'ready' -and
+        -not [string]::IsNullOrWhiteSpace($snapshotId) -and
+        $ticketId -eq $RecoveryTicketId) {
+        return [pscustomobject]@{
+            Decision         = 'exact-ready'
+            NotificationId   = $NotificationId
+            SnapshotId       = $snapshotId
+            RecoveryTicketId = $RecoveryTicketId
+            Result           = 'ready'
+            Reason           = $reason
+        }
+    }
+
+    if ($resultName -eq 'recovering' -and $ticketId -eq $RecoveryTicketId) {
+        return [pscustomobject]@{
+            Decision         = 'exact-recovering'
+            NotificationId   = $NotificationId
+            SnapshotId       = ''
+            RecoveryTicketId = $RecoveryTicketId
+            Result           = 'recovering'
+            Reason           = $reason
+        }
+    }
+
+    if (-not $available -or
+        $resultName -eq 'adapter-unavailable' -or
+        $reason -in @('client-error', 'empty-response', 'client-timeout')) {
+        return [pscustomobject]@{
+            Decision         = 'retry'
+            NotificationId   = $NotificationId
+            SnapshotId       = ''
+            RecoveryTicketId = $RecoveryTicketId
+            Result           = if ($resultName) { $resultName } else { 'adapter-unavailable' }
+            Reason           = if ($reason) { $reason } else { 'adapter-unavailable' }
+        }
+    }
+
+    return [pscustomobject]@{
+        Decision         = 'fail-closed'
+        NotificationId   = $NotificationId
+        SnapshotId       = ''
+        RecoveryTicketId = $RecoveryTicketId
+        Result           = if ($resultName) { $resultName } else { 'rejected' }
+        Reason           = if ($reason) { $reason } else { 'recovery-failed' }
+    }
+}
+
+function Invoke-NotifyExactRouteRecovery {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$NotificationId,
+        [Parameter(Mandatory = $true)][string]$RecoveryTicketId,
+        $Config = $null,
+        [int]$TimeoutMs = 3000
+    )
+
+    $envelope = New-NotifyRouteRequestEnvelope -Type 'resolve-recovery' -Fields @{
+        notificationId   = $NotificationId
+        recoveryTicketId = $RecoveryTicketId
+    } -TtlMs 5000
+    $request = @{}
+    foreach ($key in $envelope.Keys) { $request[$key] = $envelope[$key] }
+    $clientResult = Invoke-NotifyRouteHostClient -Request $request -WaitMs 0 -TimeoutMs $TimeoutMs -Config $Config
+    return [pscustomobject]@{
+        ClientResult = $clientResult
+        Decision = Get-NotifyRouteRecoveryDecision -ClientResult $clientResult -NotificationId $NotificationId -RecoveryTicketId $RecoveryTicketId
+    }
+}
+
+function Wait-NotifyExactRouteRecovery {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$NotificationId,
+        [Parameter(Mandatory = $true)][string]$RecoveryTicketId,
+        $Config = $null,
+        [int]$WaitMs = 125000,
+        [int]$PollMs = 500
+    )
+
+    $started = [System.Diagnostics.Stopwatch]::StartNew()
+    try {
+        while ($started.ElapsedMilliseconds -lt $WaitMs) {
+            $remaining = [Math]::Max(250, $WaitMs - [int]$started.ElapsedMilliseconds)
+            $outcome = Invoke-NotifyExactRouteRecovery -NotificationId $NotificationId -RecoveryTicketId $RecoveryTicketId -Config $Config -TimeoutMs ([Math]::Min(3000, $remaining))
+            if ($outcome.Decision.Decision -eq 'exact-ready' -or
+                $outcome.Decision.Decision -eq 'fail-closed') {
+                return $outcome
+            }
+            Start-Sleep -Milliseconds ([Math]::Max(100, [Math]::Min($PollMs, $remaining)))
+        }
+    }
+    finally {
+        $started.Stop()
+    }
+
+    $decision = [pscustomobject]@{
+        Decision         = 'fail-closed'
+        NotificationId   = $NotificationId
+        SnapshotId       = ''
+        RecoveryTicketId = $RecoveryTicketId
+        Result           = 'expired'
+        Reason           = 'recovery-expired'
+    }
+    return [pscustomobject]@{ ClientResult = $null; Decision = $decision }
+}
+
+function Invoke-NotifyExactRouteRecoveryAndActivate {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$NotificationId,
+        [string]$SnapshotId = '',
+        [string]$RecoveryTicketId = '',
+        $Config = $null,
+        [int]$RecoveryWaitMs = 125000,
+        [int]$ActivateWaitMs = 15000,
+        [int]$ActivateTimeoutMs = 18000
+    )
+
+    $resolvedSnapshotId = $SnapshotId
+    if ([string]::IsNullOrWhiteSpace($resolvedSnapshotId)) {
+        if ([string]::IsNullOrWhiteSpace($RecoveryTicketId)) {
+            return [pscustomobject]@{
+                Decision = [pscustomobject]@{ Decision = 'fail-closed'; Result = 'owner-unresolved'; Reason = 'missing-recovery-ticket' }
+                SnapshotId = ''
+                RecoveryTicketId = ''
+            }
+        }
+        $recovery = Wait-NotifyExactRouteRecovery -NotificationId $NotificationId -RecoveryTicketId $RecoveryTicketId -Config $Config -WaitMs $RecoveryWaitMs
+        if ($recovery.Decision.Decision -ne 'exact-ready') {
+            return [pscustomobject]@{
+                Decision = $recovery.Decision
+                SnapshotId = ''
+                RecoveryTicketId = $RecoveryTicketId
+            }
+        }
+        $resolvedSnapshotId = [string]$recovery.Decision.SnapshotId
+    }
+
+    $activation = Invoke-NotifyExactRouteActivate -NotificationId $NotificationId -SnapshotId $resolvedSnapshotId -Config $Config -WaitMs $ActivateWaitMs -TimeoutMs $ActivateTimeoutMs
+    return [pscustomobject]@{
+        Decision = $activation.Decision
+        SnapshotId = $resolvedSnapshotId
+        RecoveryTicketId = $RecoveryTicketId
+        ClientResult = $activation.ClientResult
+    }
 }
 
 function Invoke-NotifyExactRouteActivate {

@@ -40,7 +40,7 @@ public static class MessageValidator
         }
 
         // Clock skew: issued far in the future is rejected.
-        if (msg.IssuedAtMs > nowMs + 60_000)
+        if (msg.IssuedAtMs > nowMs + ProtocolConstants.MaxFutureClockSkewMs)
         {
             return RouteResponse.Reject(msg.RequestId, RouteResults.Rejected, RejectReasons.InvalidField);
         }
@@ -51,9 +51,11 @@ public static class MessageValidator
         }
 
         // Field length guards (no raw session / URL fields exist on the wire by design).
-        if (Exceeds(msg.AdapterKey) || Exceeds(msg.OwnerKey) || Exceeds(msg.PageKey) ||
+        if (Exceeds(msg.AdapterKey) || Exceeds(msg.AdapterGeneration) ||
+            Exceeds(msg.OwnerKey) || Exceeds(msg.ReplacesOwnerKey) || Exceeds(msg.PageKey) ||
             Exceeds(msg.InstanceKey) || Exceeds(msg.RoutingKey) || Exceeds(msg.NotificationId) ||
-            Exceeds(msg.SnapshotId) || Exceeds(msg.ProfileKey) || Exceeds(msg.PageFingerprint) ||
+            Exceeds(msg.SnapshotId) || Exceeds(msg.RecoveryTicketId) ||
+            Exceeds(msg.ProfileKey) || Exceeds(msg.PageFingerprint) ||
             Exceeds(msg.ActivationRequestId) || Exceeds(msg.OpenEventId))
         {
             return RouteResponse.Reject(msg.RequestId, RouteResults.Rejected, RejectReasons.InvalidField);
@@ -73,6 +75,101 @@ public static class MessageValidator
             }
         }
 
+        if (ProtocolConstants.AdapterGenerationMessageTypes.Contains(msg.Type))
+        {
+            if (string.IsNullOrWhiteSpace(msg.AdapterKey) ||
+                string.IsNullOrWhiteSpace(msg.AdapterGeneration))
+            {
+                return RouteResponse.Reject(
+                    msg.RequestId,
+                    RouteResults.Rejected,
+                    RejectReasons.MissingField);
+            }
+
+            if (!IsOpaqueId(msg.AdapterKey) ||
+                !IsOpaqueId(msg.AdapterGeneration))
+            {
+                return RouteResponse.Reject(
+                    msg.RequestId,
+                    RouteResults.Rejected,
+                    RejectReasons.InvalidField);
+            }
+
+            if (string.Equals(
+                    msg.Type,
+                    MessageTypes.RegisterAdapter,
+                    StringComparison.Ordinal))
+            {
+                if (msg.AdapterStartedAtMs is not long startedAtMs ||
+                    startedAtMs <= 0)
+                {
+                    return RouteResponse.Reject(
+                        msg.RequestId,
+                        RouteResults.Rejected,
+                        RejectReasons.MissingField);
+                }
+
+                // This is durable runtime-generation metadata, not transport
+                // freshness. Comparing it with a newly issued envelope would
+                // strand the same live generation after a system-clock rollback.
+            }
+            else if (msg.AdapterStartedAtMs is not null)
+            {
+                return RouteResponse.Reject(
+                    msg.RequestId,
+                    RouteResults.Rejected,
+                    RejectReasons.InvalidField);
+            }
+        }
+        else if (msg.AdapterGeneration is not null ||
+                 msg.AdapterStartedAtMs is not null)
+        {
+            return RouteResponse.Reject(
+                msg.RequestId,
+                RouteResults.Rejected,
+                RejectReasons.InvalidField);
+        }
+
+        if (msg.RecoveryTtlMs is int recoveryTtlMs &&
+            (recoveryTtlMs < ProtocolConstants.MinRecoveryTicketTtlMs ||
+             recoveryTtlMs > ProtocolConstants.MaxRecoveryTicketTtlMs))
+        {
+            return RouteResponse.Reject(
+                msg.RequestId,
+                RouteResults.Rejected,
+                RejectReasons.InvalidField);
+        }
+
+        if (msg.RecoveryTtlMs is not null &&
+            !string.Equals(msg.Type, MessageTypes.Freeze, StringComparison.Ordinal))
+        {
+            return RouteResponse.Reject(
+                msg.RequestId,
+                RouteResults.Rejected,
+                RejectReasons.InvalidField);
+        }
+
+        if (msg.RecoveryTicketId is not null &&
+            !string.Equals(msg.Type, MessageTypes.ResolveRecovery, StringComparison.Ordinal))
+        {
+            return RouteResponse.Reject(
+                msg.RequestId,
+                RouteResults.Rejected,
+                RejectReasons.InvalidField);
+        }
+
+        if (msg.ReplacesOwnerKey is not null &&
+            !string.Equals(
+                msg.Type,
+                MessageTypes.RegisterOwner,
+                StringComparison.Ordinal))
+        {
+            return RouteResponse.Reject(
+                msg.RequestId,
+                RouteResults.Rejected,
+                RejectReasons.InvalidField);
+        }
+
         _ = maxMessageBytes; // size checked before parse
         return null;
     }
@@ -90,6 +187,70 @@ public static class MessageValidator
             return RouteResponse.Reject(msg.RequestId, RouteResults.Rejected, RejectReasons.InvalidField);
         }
 
+        return ValidateCompleteAdapterIdentity(msg);
+    }
+
+    public static RouteResponse? ValidateRegisterOpenIntent(RouteMessage msg)
+    {
+        if (string.IsNullOrWhiteSpace(msg.AdapterKey) ||
+            string.IsNullOrWhiteSpace(msg.AdapterGeneration) ||
+            string.IsNullOrWhiteSpace(msg.InstanceKey) ||
+            string.IsNullOrWhiteSpace(msg.RoutingKey) ||
+            string.IsNullOrWhiteSpace(msg.OpenEventId) ||
+            msg.OpenedAtMs is null)
+        {
+            return RouteResponse.Reject(
+                msg.RequestId,
+                RouteResults.Rejected,
+                RejectReasons.MissingField);
+        }
+
+        if (!IsOpaqueId(msg.AdapterKey) ||
+            !IsOpaqueId(msg.AdapterGeneration) ||
+            !InstanceKeyContract.IsValid(msg.InstanceKey) ||
+            !IsRoutingKey(msg.RoutingKey) ||
+            !IsOpaqueId(msg.OpenEventId) ||
+            msg.OpenedAtMs <= 0)
+        {
+            return RouteResponse.Reject(
+                msg.RequestId,
+                RouteResults.Rejected,
+                RejectReasons.InvalidField);
+        }
+
+        var identityError = ValidateCompleteAdapterIdentity(msg);
+        if (identityError is not null)
+        {
+            return identityError;
+        }
+
+        // This message records only durable first-open evidence. It must never
+        // become an alternate owner, lease, notification, or activation path.
+        if (msg.OwnerKey is not null ||
+            msg.ReplacesOwnerKey is not null ||
+            msg.PageKey is not null ||
+            msg.PageFingerprint is not null ||
+            msg.OwnerEvent is not null ||
+            msg.LeaseTtlMs is not null ||
+            msg.AdapterStartedAtMs is not null ||
+            msg.NotificationId is not null ||
+            msg.NotificationKind is not null ||
+            msg.SnapshotId is not null ||
+            msg.ActivationRequestId is not null ||
+            msg.Result is not null ||
+            msg.Reason is not null ||
+            msg.DeadlineMs is not null ||
+            msg.ElapsedMs is not null)
+        {
+            return RouteResponse.Reject(
+                msg.RequestId,
+                RouteResults.Rejected,
+                RejectReasons.InvalidField);
+        }
+
+        // An intent may be retained while the host is unavailable. Its event
+        // time is durable ordering evidence and is not transport freshness, so
+        // do not compare it with this request's newly issued envelope.
         return null;
     }
 
@@ -109,15 +270,29 @@ public static class MessageValidator
             return RouteResponse.Reject(msg.RequestId, RouteResults.Rejected, RejectReasons.InvalidField);
         }
 
-        if (!IsHexOrOpaqueKey(msg.InstanceKey!) || !IsHexOrOpaqueKey(msg.RoutingKey!))
+        if (msg.ReplacesOwnerKey is not null &&
+            (!IsOpaqueId(msg.ReplacesOwnerKey) ||
+             string.Equals(
+                 msg.ReplacesOwnerKey,
+                 msg.OwnerKey,
+                 StringComparison.Ordinal)))
+        {
+            return RouteResponse.Reject(
+                msg.RequestId,
+                RouteResults.Rejected,
+                RejectReasons.InvalidField);
+        }
+
+        if (!InstanceKeyContract.IsValid(msg.InstanceKey) ||
+            !IsRoutingKey(msg.RoutingKey))
         {
             return RouteResponse.Reject(msg.RequestId, RouteResults.Rejected, RejectReasons.InvalidField);
         }
 
-        // routingKey must be full SHA-256 hex (64 chars) or base64url-ish opaque of similar length.
-        if (msg.RoutingKey!.Length < 32 || msg.RoutingKey.Length > ProtocolConstants.MaxOpaqueFieldLength)
+        var identityError = ValidateCompleteAdapterIdentity(msg);
+        if (identityError is not null)
         {
-            return RouteResponse.Reject(msg.RequestId, RouteResults.Rejected, RejectReasons.InvalidField);
+            return identityError;
         }
 
         if (msg.OwnerEvent is not null &&
@@ -136,17 +311,14 @@ public static class MessageValidator
                 return RouteResponse.Reject(msg.RequestId, RouteResults.Rejected, RejectReasons.MissingField);
             }
 
-            // Both clients and daemon run in the same Windows user session. Bound bad/future
-            // metadata so a corrupt client clock cannot permanently dominate routing.
-            if (openedAtMs > msg.IssuedAtMs + 60_000 ||
-                openedAtMs < msg.IssuedAtMs - 24 * 60 * 60_000L)
-            {
-                return RouteResponse.Reject(msg.RequestId, RouteResults.Rejected, RejectReasons.InvalidField);
-            }
+            // The clients may retain an unacknowledged explicit-open while Route Host is
+            // unavailable and retry it days later. Do not compare this durable event time
+            // with the fresh transport envelope: a system-clock rollback can legitimately
+            // make the original open appear to be in the future.
         }
         else if (msg.OpenEventId is not null || msg.OpenedAtMs is not null)
         {
-            // Restore/legacy publications never carry ordering metadata.
+            // Restore/legacy publications never carry first-binding candidate metadata.
             return RouteResponse.Reject(msg.RequestId, RouteResults.Rejected, RejectReasons.InvalidField);
         }
 
@@ -163,8 +335,8 @@ public static class MessageValidator
         }
 
         if (!IsOpaqueId(msg.NotificationId!) ||
-            !IsHexOrOpaqueKey(msg.InstanceKey!) ||
-            !IsHexOrOpaqueKey(msg.RoutingKey!))
+            !InstanceKeyContract.IsValid(msg.InstanceKey) ||
+            !IsRoutingKey(msg.RoutingKey))
         {
             return RouteResponse.Reject(msg.RequestId, RouteResults.Rejected, RejectReasons.InvalidField);
         }
@@ -193,9 +365,45 @@ public static class MessageValidator
         return null;
     }
 
-    public static bool IsOpaqueId(string value)
+    public static RouteResponse? ValidateResolveRecovery(RouteMessage msg)
     {
-        if (value.Length is < 8 or > ProtocolConstants.MaxOpaqueFieldLength)
+        if (string.IsNullOrWhiteSpace(msg.NotificationId) ||
+            string.IsNullOrWhiteSpace(msg.RecoveryTicketId))
+        {
+            return RouteResponse.Reject(
+                msg.RequestId,
+                RouteResults.Rejected,
+                RejectReasons.MissingField);
+        }
+
+        if (!IsOpaqueId(msg.NotificationId) ||
+            !IsOpaqueId(msg.RecoveryTicketId))
+        {
+            return RouteResponse.Reject(
+                msg.RequestId,
+                RouteResults.Rejected,
+                RejectReasons.InvalidField);
+        }
+
+        if (msg.InstanceKey is not null ||
+            msg.RoutingKey is not null ||
+            msg.SnapshotId is not null ||
+            msg.NotificationKind is not null ||
+            msg.DeadlineMs is not null)
+        {
+            return RouteResponse.Reject(
+                msg.RequestId,
+                RouteResults.Rejected,
+                RejectReasons.InvalidField);
+        }
+
+        return null;
+    }
+
+    public static bool IsOpaqueId(string? value)
+    {
+        if (value is null ||
+            value.Length is < 8 or > ProtocolConstants.MaxOpaqueFieldLength)
         {
             return false;
         }
@@ -211,16 +419,16 @@ public static class MessageValidator
         return true;
     }
 
-    public static bool IsHexOrOpaqueKey(string value)
+    public static bool IsRoutingKey(string? value)
     {
-        if (value.Length is < 8 or > ProtocolConstants.MaxOpaqueFieldLength)
+        if (value is null || value.Length != 64)
         {
             return false;
         }
 
         foreach (var c in value)
         {
-            if (!(char.IsAsciiLetterOrDigit(c) || c is '-' or '_' or '.' or '+' or '/' or '='))
+            if (!(c is >= '0' and <= '9' or >= 'a' and <= 'f'))
             {
                 return false;
             }
@@ -234,4 +442,33 @@ public static class MessageValidator
 
     private static bool ExceedsLabel(string? value) =>
         value is not null && value.Length > ProtocolConstants.MaxLabelLength;
+
+    private static RouteResponse? ValidateCompleteAdapterIdentity(RouteMessage msg)
+    {
+        if (string.IsNullOrWhiteSpace(msg.AdapterKind) ||
+            string.IsNullOrWhiteSpace(msg.BrowserKind) ||
+            string.IsNullOrWhiteSpace(msg.ProfileKey))
+        {
+            return RouteResponse.Reject(
+                msg.RequestId,
+                RouteResults.Rejected,
+                RejectReasons.MissingField);
+        }
+
+        if (!ProtocolConstants.AllowedSurfaceAdapterKinds.Contains(msg.AdapterKind) ||
+            !ProtocolConstants.AllowedSurfaceAdapterKinds.Contains(msg.BrowserKind) ||
+            !string.Equals(
+                msg.AdapterKind,
+                msg.BrowserKind,
+                StringComparison.OrdinalIgnoreCase) ||
+            !IsOpaqueId(msg.ProfileKey))
+        {
+            return RouteResponse.Reject(
+                msg.RequestId,
+                RouteResults.Rejected,
+                RejectReasons.InvalidField);
+        }
+
+        return null;
+    }
 }

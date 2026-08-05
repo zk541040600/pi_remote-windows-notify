@@ -140,6 +140,7 @@ function Resolve-NotifyActivationState {
         $originKind = if ($payload.PSObject.Properties['originKind'] -and -not [string]::IsNullOrWhiteSpace([string]$payload.originKind)) { ([string]$payload.originKind).Trim() } else { '' }
         $notificationId = if ($payload.PSObject.Properties['protectedNotificationId'] -and -not [string]::IsNullOrWhiteSpace([string]$payload.protectedNotificationId)) { Unprotect-NotifyActivationValue -Value ([string]$payload.protectedNotificationId) } else { '' }
         $snapshotId = if ($payload.PSObject.Properties['protectedSnapshotId'] -and -not [string]::IsNullOrWhiteSpace([string]$payload.protectedSnapshotId)) { Unprotect-NotifyActivationValue -Value ([string]$payload.protectedSnapshotId) } else { '' }
+        $recoveryTicketId = if ($payload.PSObject.Properties['protectedRecoveryTicketId'] -and -not [string]::IsNullOrWhiteSpace([string]$payload.protectedRecoveryTicketId)) { Unprotect-NotifyActivationValue -Value ([string]$payload.protectedRecoveryTicketId) } else { '' }
         return [pscustomobject]@{
             FocusTarget    = if ($payload.PSObject.Properties['protectedHost']) { Unprotect-NotifyActivationValue -Value ([string]$payload.protectedHost) } else { '' }
             CwdBase        = if ($payload.PSObject.Properties['protectedCwd']) { Unprotect-NotifyActivationValue -Value ([string]$payload.protectedCwd) } else { '' }
@@ -147,6 +148,7 @@ function Resolve-NotifyActivationState {
             OriginKind     = $originKind
             NotificationId = $notificationId
             SnapshotId     = $snapshotId
+            RecoveryTicketId = $recoveryTicketId
         }
     }
     catch {
@@ -380,6 +382,7 @@ $tabTitle = ''
 $originKind = ''
 $notificationId = ''
 $snapshotId = ''
+$recoveryTicketId = ''
 if (-not [string]::IsNullOrWhiteSpace($Uri)) {
     try {
         $parsedUri = [Uri]$Uri
@@ -392,6 +395,7 @@ if (-not [string]::IsNullOrWhiteSpace($Uri)) {
             if ($state.PSObject.Properties['OriginKind'] -and -not [string]::IsNullOrWhiteSpace([string]$state.OriginKind)) { $originKind = ([string]$state.OriginKind).Trim() }
             if ($state.PSObject.Properties['NotificationId'] -and -not [string]::IsNullOrWhiteSpace([string]$state.NotificationId)) { $notificationId = ([string]$state.NotificationId).Trim() }
             if ($state.PSObject.Properties['SnapshotId'] -and -not [string]::IsNullOrWhiteSpace([string]$state.SnapshotId)) { $snapshotId = ([string]$state.SnapshotId).Trim() }
+            if ($state.PSObject.Properties['RecoveryTicketId'] -and -not [string]::IsNullOrWhiteSpace([string]$state.RecoveryTicketId)) { $recoveryTicketId = ([string]$state.RecoveryTicketId).Trim() }
         }
         else {
             $hostValue = Get-NotifyQueryValue -ParsedUri $parsedUri -Name 'host'
@@ -412,18 +416,19 @@ if (-not [string]::IsNullOrWhiteSpace($env:PI_NOTIFY_TAB_TITLE)) { $tabTitle = $
 if (-not [string]::IsNullOrWhiteSpace($env:PI_NOTIFY_ORIGIN_KIND)) { $originKind = $env:PI_NOTIFY_ORIGIN_KIND.Trim() }
 if (-not [string]::IsNullOrWhiteSpace($env:PI_NOTIFY_NOTIFICATION_ID)) { $notificationId = $env:PI_NOTIFY_NOTIFICATION_ID.Trim() }
 if (-not [string]::IsNullOrWhiteSpace($env:PI_NOTIFY_SNAPSHOT_ID)) { $snapshotId = $env:PI_NOTIFY_SNAPSHOT_ID.Trim() }
+if (-not [string]::IsNullOrWhiteSpace($env:PI_NOTIFY_RECOVERY_TICKET_ID)) { $recoveryTicketId = $env:PI_NOTIFY_RECOVERY_TICKET_ID.Trim() }
 
 if ($originKind -eq 'pi-web') {
     Write-NotifyActivateLog -Message ('activate-route originKind=pi-web notificationFp={0} snapshotFp={1}' -f (Get-NotifyRouteFingerprint -Value $notificationId), (Get-NotifyRouteFingerprint -Value $snapshotId))
-    if ([string]::IsNullOrWhiteSpace($notificationId) -or [string]::IsNullOrWhiteSpace($snapshotId)) {
-        Write-NotifyActivateLog -Message ('activate-route fail-closed result=owner-unresolved reason=missing-snapshot notificationFp={0}' -f (Get-NotifyRouteFingerprint -Value $notificationId))
+    if ([string]::IsNullOrWhiteSpace($notificationId) -or
+        ([string]::IsNullOrWhiteSpace($snapshotId) -and [string]::IsNullOrWhiteSpace($recoveryTicketId))) {
+        Write-NotifyActivateLog -Message ('activate-route fail-closed result=owner-unresolved reason=missing-route-handle notificationFp={0}' -f (Get-NotifyRouteFingerprint -Value $notificationId))
         exit 1
     }
-    # Standalone/hotkey activation uses the same bounded budget as a popup
-    # click so Desktop can complete fresh-document session proof before focus.
-    $activateOutcome = Invoke-NotifyExactRouteActivate -NotificationId $notificationId -SnapshotId $snapshotId -Config $config -WaitMs 15000 -TimeoutMs 18000
+    $activateOutcome = Invoke-NotifyExactRouteRecoveryAndActivate -NotificationId $notificationId -SnapshotId $snapshotId -RecoveryTicketId $recoveryTicketId -Config $config -RecoveryWaitMs 125000 -ActivateWaitMs 15000 -ActivateTimeoutMs 18000
     $decision = $activateOutcome.Decision
-    Write-NotifyActivateLog -Message ('activate-route decision={0} result={1} reason={2} notificationFp={3} snapshotFp={4}' -f $decision.Decision, $decision.Result, $(if ([string]::IsNullOrWhiteSpace($decision.Reason)) { 'none' } else { $decision.Reason }), (Get-NotifyRouteFingerprint -Value $notificationId), (Get-NotifyRouteFingerprint -Value $snapshotId))
+    $resolvedSnapshotId = if ($activateOutcome.PSObject.Properties['SnapshotId']) { [string]$activateOutcome.SnapshotId } else { $snapshotId }
+    Write-NotifyActivateLog -Message ('activate-route decision={0} result={1} reason={2} notificationFp={3} snapshotFp={4} ticketFp={5}' -f $decision.Decision, $decision.Result, $(if ([string]::IsNullOrWhiteSpace($decision.Reason)) { 'none' } else { $decision.Reason }), (Get-NotifyRouteFingerprint -Value $notificationId), (Get-NotifyRouteFingerprint -Value $resolvedSnapshotId), (Get-NotifyRouteFingerprint -Value $recoveryTicketId))
     if ($decision.Decision -eq 'handled') {
         Write-NotifyActivateLog -Message 'activate-route-success'
         exit 0
@@ -432,7 +437,11 @@ if ($originKind -eq 'pi-web') {
         Write-NotifyActivateLog -Message ('activate-route-fail-closed result={0}' -f $decision.Result)
         exit 1
     }
-    Write-NotifyActivateLog -Message ('activate-route-downgrade result={0} reason={1}' -f $decision.Result, $(if ([string]::IsNullOrWhiteSpace($decision.Reason)) { 'none' } else { $decision.Reason }))
+    # Exact Pi Web metadata is an authority boundary. A transient recovery
+    # result (including client timeout/retry) must never fall through to the
+    # Terminal title/cwd heuristic and focus a different surface.
+    Write-NotifyActivateLog -Message ('activate-route-fail-closed result={0} reason={1}' -f $decision.Result, $(if ([string]::IsNullOrWhiteSpace($decision.Reason)) { 'none' } else { $decision.Reason }))
+    exit 1
 }
 
 $requiredText = if (-not [string]::IsNullOrWhiteSpace($tabTitle)) { $tabTitle } else { $cwdBase }

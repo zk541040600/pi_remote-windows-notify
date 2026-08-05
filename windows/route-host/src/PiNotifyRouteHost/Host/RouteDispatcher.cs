@@ -42,8 +42,7 @@ public sealed class RouteDispatcher
         if (snapshot is null || adapter is null)
         {
             var reject = RouteResponse.Reject(msg.RequestId, RouteResults.Stale, RejectReasons.SnapshotUnknown);
-            _state.RememberActivateResponse(msg, reject);
-            return reject;
+            return _state.RememberActivateResponse(msg, reject);
         }
 
         var deadline = msg.DeadlineMs is long d && d > 0
@@ -69,8 +68,7 @@ public sealed class RouteDispatcher
             // External adapter (Chrome/Edge/Desktop): enqueue one bounded command for poll-activation.
             // Final ack arrives via activate-result; callers poll activation-status for the terminal result.
             var pending = _state.EnqueuePendingActivation(msg, snapshot, adapter);
-            _state.RememberActivateResponse(msg, pending);
-            return pending;
+            return _state.RememberActivateResponse(msg, pending);
         }
 
         try
@@ -79,9 +77,18 @@ public sealed class RouteDispatcher
             var remaining = deadline - _clock.UtcNowMs;
             if (remaining <= 0)
             {
-                var timeout = RouteResponse.Reject(msg.RequestId, RouteResults.Timeout, RejectReasons.Expired);
-                _state.RememberActivateResponse(msg, timeout);
-                return timeout;
+                adapterResult = new AdapterActivateResult
+                {
+                    Result = RouteResults.Timeout,
+                    Reason = RejectReasons.Expired,
+                    ElapsedMs = 0,
+                };
+                var completed = _state.CompleteActivate(
+                    msg.RequestId,
+                    snapshot.NotificationId,
+                    snapshot.SnapshotId,
+                    adapterResult);
+                return _state.RememberActivateResponse(msg, completed);
             }
 
             cts.CancelAfter(TimeSpan.FromMilliseconds(Math.Min(remaining, ProtocolConstants.MaxRequestTtlMs)));
@@ -89,9 +96,12 @@ public sealed class RouteDispatcher
         }
         catch (OperationCanceledException)
         {
-            var timeout = RouteResponse.Reject(msg.RequestId, RouteResults.Timeout, RejectReasons.Expired);
-            _state.RememberActivateResponse(msg, timeout);
-            return timeout;
+            adapterResult = new AdapterActivateResult
+            {
+                Result = RouteResults.Timeout,
+                Reason = RejectReasons.Expired,
+                ElapsedMs = 0,
+            };
         }
         catch (Exception ex)
         {
@@ -107,8 +117,7 @@ public sealed class RouteDispatcher
         }
 
         var response = _state.CompleteActivate(msg.RequestId, snapshot.NotificationId, snapshot.SnapshotId, adapterResult);
-        _state.RememberActivateResponse(msg, response);
-        return response;
+        return _state.RememberActivateResponse(msg, response);
     }
 
     /// <summary>Attach an in-process activator to a registered adapter (tests / mock mode).</summary>

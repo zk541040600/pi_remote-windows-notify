@@ -50,7 +50,69 @@ public sealed class NamedPipeRouteClient : IAsyncDisposable
         }
 
         var response = System.Text.Json.JsonSerializer.Deserialize<RouteResponse>(responseBody, JsonDefaults.Options);
-        return response ?? RouteResponse.Reject(message.RequestId, RouteResults.Rejected, RejectReasons.InvalidField);
+        if (response is null ||
+            response.ProtocolVersion != ProtocolConstants.ProtocolVersion ||
+            !string.Equals(response.Type, MessageTypes.Result, StringComparison.Ordinal) ||
+            !string.Equals(response.RequestId, message.RequestId, StringComparison.Ordinal))
+        {
+            return RouteResponse.Reject(
+                message.RequestId,
+                RouteResults.Rejected,
+                RejectReasons.InvalidField);
+        }
+
+        return response;
+    }
+
+    /// <summary>
+    /// Connect and exchange one request under a single bounded transport budget.
+    /// External cancellation still propagates; a local timeout is a structured
+    /// adapter-unavailable response so native and CLI callers can keep running.
+    /// </summary>
+    public async Task<RouteResponse> SendRequestAsync(
+        RouteMessage message,
+        int timeoutMs = ProtocolConstants.DefaultRequestTtlMs,
+        CancellationToken cancellationToken = default)
+    {
+        if (timeoutMs <= 0)
+        {
+            return RouteResponse.Reject(
+                message.RequestId,
+                RouteResults.AdapterUnavailable,
+                "pipe-timeout");
+        }
+
+        var boundedTimeoutMs = Math.Min(
+            timeoutMs,
+            ProtocolConstants.MaxRequestTtlMs);
+        using var requestCts =
+            CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        requestCts.CancelAfter(boundedTimeoutMs);
+
+        try
+        {
+            await ConnectAsync(
+                    Math.Min(2000, boundedTimeoutMs),
+                    requestCts.Token)
+                .ConfigureAwait(false);
+            return await SendAsync(message, requestCts.Token)
+                .ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+            when (!cancellationToken.IsCancellationRequested)
+        {
+            return RouteResponse.Reject(
+                message.RequestId,
+                RouteResults.AdapterUnavailable,
+                "pipe-timeout");
+        }
+        catch (TimeoutException)
+        {
+            return RouteResponse.Reject(
+                message.RequestId,
+                RouteResults.AdapterUnavailable,
+                "pipe-timeout");
+        }
     }
 
     public async ValueTask DisposeAsync()

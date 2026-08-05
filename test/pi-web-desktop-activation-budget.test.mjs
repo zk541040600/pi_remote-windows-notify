@@ -14,8 +14,8 @@ test("Pi Web popup activation allows bounded fresh-document proof", () => {
     const source = readFileSync(new URL(name, windowsRoot), "utf8");
     assert.match(
       source,
-      /Invoke-NotifyExactRouteActivate[^\r\n]*-WaitMs 15000 -TimeoutMs 18000/,
-      `${name} must preserve the Desktop proof budget`,
+      /Invoke-NotifyExactRouteRecoveryAndActivate[^\r\n]*-RecoveryWaitMs 125000 -ActivateWaitMs 15000 -ActivateTimeoutMs 18000/,
+      `${name} must preserve both reconnect and fresh-document proof budgets`,
     );
     assert.doesNotMatch(
       source,

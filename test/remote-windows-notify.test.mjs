@@ -291,6 +291,30 @@ test("runtime config accepts explicit pi-web origin and instance key", async (t)
   assert.equal(config.instanceKey, "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
 });
 
+test("runtime config normalizes only portable ASCII instance-key padding", async (t) => {
+  process.env.PI_WEB_NO_OPEN = "1";
+  writeConfig(t, {
+    endpoint: "http://127.0.0.1:23118/notify",
+    token: "test-token",
+    originKind: "pi-web",
+    instanceKey: ` \t${KNOWN_INSTANCE}\r\n`,
+  });
+
+  let config = await getRuntimeConfig();
+  assert.equal(config.instanceKey, KNOWN_INSTANCE);
+
+  for (const padding of ["\u0085", "\u00a0", "\ufeff"]) {
+    writeConfig(t, {
+      endpoint: "http://127.0.0.1:23118/notify",
+      token: "test-token",
+      originKind: "pi-web",
+      instanceKey: `${padding}${KNOWN_INSTANCE}${padding}`,
+    });
+    config = await getRuntimeConfig();
+    assert.equal(config.instanceKey, "");
+  }
+});
+
 test("runtime config rejects invalid originKind/instanceKey shape", async (t) => {
   writeConfig(t, {
     endpoint: "http://127.0.0.1:23118/notify",
@@ -768,6 +792,14 @@ test("worker processes do not register notification handlers", () => {
 
 test("computePiWebRoutingKey matches shared algorithm vectors", () => {
   assert.equal(computePiWebRoutingKey(KNOWN_INSTANCE, KNOWN_SESSION), KNOWN_ROUTING_KEY);
+  assert.equal(
+    computePiWebRoutingKey(KNOWN_INSTANCE, " padded "),
+    "687e3332585d90c6d0a6d0f615738fa80e251932ceee0acb061a24fada3b3433",
+  );
+  assert.equal(
+    computePiWebRoutingKey(KNOWN_INSTANCE, "valid-🚀"),
+    "18a9bdd83e4a6bf02686680349a490077bd4db3cb05e418e04d9225447df3ba0",
+  );
   assert.equal(computePiWebRoutingKey(KNOWN_INSTANCE, KNOWN_SESSION).length, 64);
   assert.equal(
     computePiWebRoutingKey("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "stable-session"),
@@ -778,12 +810,33 @@ test("computePiWebRoutingKey matches shared algorithm vectors", () => {
     computePiWebRoutingKey(KNOWN_INSTANCE, "sess-two"),
   );
   assert.notEqual(
-    computePiWebRoutingKey("a", "bc"),
-    computePiWebRoutingKey("ab", "c"),
+    computePiWebRoutingKey("abcdefgh", "ij"),
+    computePiWebRoutingKey("abcdefghi", "j"),
     "NUL separators must prevent concatenation collisions",
   );
   assert.throws(() => computePiWebRoutingKey("", "s"));
-  assert.throws(() => computePiWebRoutingKey("i", ""));
+});
+
+test("computePiWebRoutingKey rejects non-portable instance keys before hashing", () => {
+  for (const instanceKey of [
+    "short",
+    "bad/path",
+    "bad=value",
+    " padded-instance ",
+    "x".repeat(129),
+  ]) {
+    assert.throws(() => computePiWebRoutingKey(instanceKey, KNOWN_SESSION));
+  }
+});
+
+test("computePiWebRoutingKey rejects non-portable session identities before hashing", () => {
+  assert.throws(() => computePiWebRoutingKey(KNOWN_INSTANCE, ""));
+  assert.throws(() => computePiWebRoutingKey(KNOWN_INSTANCE, "bad\u0085id"));
+  assert.throws(() => computePiWebRoutingKey(KNOWN_INSTANCE, "\uFEFF"));
+  assert.throws(() => computePiWebRoutingKey(KNOWN_INSTANCE, "\uD800"));
+  assert.throws(() => computePiWebRoutingKey(KNOWN_INSTANCE, "\uDC00"));
+  assert.throws(() => computePiWebRoutingKey(KNOWN_INSTANCE, "https://not-a-session"));
+  assert.throws(() => computePiWebRoutingKey(KNOWN_INSTANCE, "a".repeat(257)));
 });
 
 test("buildNotifyRouteFields distinguishes TUI, plain RPC, and configured Pi Web", () => {
@@ -823,6 +876,24 @@ test("buildNotifyRouteFields distinguishes TUI, plain RPC, and configured Pi Web
   );
   assert.equal(invalidInstance.originKind, "terminal");
   assert.equal(invalidInstance.routingKey, undefined);
+
+  for (const invalidSession of [
+    "bad\u0085id",
+    "\uFEFF",
+    "\uD800",
+    "\uDC00",
+    "https://not-a-session",
+    "a".repeat(257),
+  ]) {
+    const invalidSessionRoute = buildNotifyRouteFields(
+      "rpc",
+      piWebConfig,
+      invalidSession,
+      "turn-complete",
+    );
+    assert.equal(invalidSessionRoute.originKind, "terminal");
+    assert.equal(invalidSessionRoute.routingKey, undefined);
+  }
 
   const idA = buildNotifyRouteFields("tui", noConfig, undefined, "ask-user").notificationId;
   const idB = buildNotifyRouteFields("tui", noConfig, undefined, "ask-user").notificationId;
