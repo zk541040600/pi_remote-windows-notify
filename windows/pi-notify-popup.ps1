@@ -644,7 +644,9 @@ function Invoke-NotifyPopupActivation {
                 Write-NotifyPopupLog -Message ('popup-route-activate fail-closed result=owner-unresolved reason=missing-snapshot notificationFp={0} elapsedMs={1}' -f (Get-NotifyRouteFingerprint -Value $NotificationId), [int]([DateTime]::UtcNow - $startedAt).TotalMilliseconds)
                 return
             }
-            $activateOutcome = Invoke-NotifyExactRouteActivate -NotificationId $NotificationId -SnapshotId $SnapshotId -Config $config -WaitMs 5000 -TimeoutMs 8000
+            # Match the broker path: a fresh Pi Web Desktop document can take
+            # longer than five seconds to produce its exact session proof.
+            $activateOutcome = Invoke-NotifyExactRouteActivate -NotificationId $NotificationId -SnapshotId $SnapshotId -Config $config -WaitMs 15000 -TimeoutMs 18000
             $decision = $activateOutcome.Decision
             Write-NotifyPopupLog -Message ('popup-route-activate decision={0} result={1} reason={2} notificationFp={3} snapshotFp={4} elapsedMs={5}' -f $decision.Decision, $decision.Result, $(if ([string]::IsNullOrWhiteSpace($decision.Reason)) { 'none' } else { $decision.Reason }), (Get-NotifyRouteFingerprint -Value $NotificationId), (Get-NotifyRouteFingerprint -Value $SnapshotId), [int]([DateTime]::UtcNow - $startedAt).TotalMilliseconds)
             if ($decision.Decision -eq 'handled') {

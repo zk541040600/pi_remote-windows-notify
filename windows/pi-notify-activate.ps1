@@ -419,7 +419,9 @@ if ($originKind -eq 'pi-web') {
         Write-NotifyActivateLog -Message ('activate-route fail-closed result=owner-unresolved reason=missing-snapshot notificationFp={0}' -f (Get-NotifyRouteFingerprint -Value $notificationId))
         exit 1
     }
-    $activateOutcome = Invoke-NotifyExactRouteActivate -NotificationId $notificationId -SnapshotId $snapshotId -Config $config -WaitMs 5000 -TimeoutMs 8000
+    # Standalone/hotkey activation uses the same bounded budget as a popup
+    # click so Desktop can complete fresh-document session proof before focus.
+    $activateOutcome = Invoke-NotifyExactRouteActivate -NotificationId $notificationId -SnapshotId $snapshotId -Config $config -WaitMs 15000 -TimeoutMs 18000
     $decision = $activateOutcome.Decision
     Write-NotifyActivateLog -Message ('activate-route decision={0} result={1} reason={2} notificationFp={3} snapshotFp={4}' -f $decision.Decision, $decision.Result, $(if ([string]::IsNullOrWhiteSpace($decision.Reason)) { 'none' } else { $decision.Reason }), (Get-NotifyRouteFingerprint -Value $notificationId), (Get-NotifyRouteFingerprint -Value $snapshotId))
     if ($decision.Decision -eq 'handled') {

@@ -920,7 +920,10 @@ function Invoke-NotifyBrokerActivation {
                 Write-NotifyBrokerLog -Message ('broker-route-activate fail-closed result=owner-unresolved reason=missing-snapshot notificationFp={0} elapsedMs={1}' -f (Get-NotifyRouteFingerprint -Value $NotificationId), [int]([DateTime]::UtcNow - $startedAt).TotalMilliseconds)
                 return
             }
-            $activateOutcome = Invoke-NotifyExactRouteActivate -NotificationId $NotificationId -SnapshotId $SnapshotId -Config $config -WaitMs 5000 -TimeoutMs 8000
+            # Pi Web Desktop may need a fresh WebView document plus an exact
+            # selected-session API proof before it can focus safely. Keep this
+            # bounded, but allow normal LAN/WebView cold loads to finish.
+            $activateOutcome = Invoke-NotifyExactRouteActivate -NotificationId $NotificationId -SnapshotId $SnapshotId -Config $config -WaitMs 15000 -TimeoutMs 18000
             $decision = $activateOutcome.Decision
             Write-NotifyBrokerLog -Message ('broker-route-activate decision={0} result={1} reason={2} notificationFp={3} snapshotFp={4} elapsedMs={5}' -f $decision.Decision, $decision.Result, $(if ([string]::IsNullOrWhiteSpace($decision.Reason)) { 'none' } else { $decision.Reason }), (Get-NotifyRouteFingerprint -Value $NotificationId), (Get-NotifyRouteFingerprint -Value $SnapshotId), [int]([DateTime]::UtcNow - $startedAt).TotalMilliseconds)
             if ($decision.Decision -eq 'handled') {
