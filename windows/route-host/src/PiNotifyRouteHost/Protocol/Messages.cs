@@ -143,6 +143,13 @@ public sealed class RouteMessage
     [JsonPropertyName("activationRequestId")]
     public string? ActivationRequestId { get; set; }
 
+    /// <summary>
+    /// Non-terminal adapter progress. Accepted only on activate-progress and
+    /// never treated as proof of the final activation result.
+    /// </summary>
+    [JsonPropertyName("activationPhase")]
+    public string? ActivationPhase { get; set; }
+
     // --- activate result from adapter ---
 
     [JsonPropertyName("result")]
@@ -260,6 +267,10 @@ public sealed class RouteResponse
     /// <summary>Pending/completed external activation id (equals activate requestId).</summary>
     [JsonPropertyName("activationRequestId")]
     public string? ActivationRequestId { get; set; }
+
+    /// <summary>Latest non-terminal activation phase, when one was reported.</summary>
+    [JsonPropertyName("activationPhase")]
+    public string? ActivationPhase { get; set; }
 
     /// <summary>Frozen owner key when delivering a polled activate command.</summary>
     [JsonPropertyName("ownerKey")]

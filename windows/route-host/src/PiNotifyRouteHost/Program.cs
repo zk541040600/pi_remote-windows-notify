@@ -58,6 +58,7 @@ public static class Program
               PiNotifyRouteHost --native [--allowed-origin <chrome-extension://id/>]...
                                        [--allowed-origins-file <native-host-manifest.json>]
               PiNotifyRouteHost --client --json <file-or--> [--wait-ms <ms>]
+                                [--return-on-progress]
               PiNotifyRouteHost --self-test
 
             Modes:
@@ -66,6 +67,8 @@ public static class Program
               --client   One-shot JSON request/response over the daemon pipe
                          For type=activate, --wait-ms polls activation-status until
                          terminal result or deadline (for PowerShell exact-ack).
+                         --return-on-progress may be combined with that wait to
+                         return trusted desktop focus progress before final proof.
               --self-test In-process unique/miss/ambiguous/stale smoke (no pipe)
             """);
         return 0;
@@ -183,6 +186,10 @@ public static class Program
         {
             return WriteClientReject(string.Empty, RejectReasons.InvalidField);
         }
+        if (!TryGetClientReturnOnProgress(args, out var returnOnProgress))
+        {
+            return WriteClientReject(string.Empty, RejectReasons.InvalidField);
+        }
 
         string json;
         if (jsonPath is null || jsonPath == "-")
@@ -208,11 +215,12 @@ public static class Program
             return 1;
         }
 
-        if (waitMs is not null &&
-            !string.Equals(
-                msg.Type,
-                MessageTypes.Activate,
-                StringComparison.Ordinal))
+        if ((waitMs is not null || returnOnProgress) &&
+            (!string.Equals(
+                 msg.Type,
+                 MessageTypes.Activate,
+                 StringComparison.Ordinal) ||
+             (returnOnProgress && waitMs is null)))
         {
             return WriteClientReject(msg.RequestId, RejectReasons.InvalidField);
         }
@@ -256,18 +264,27 @@ public static class Program
                         .SendAsync(msg, clientWaitToken)
                         .ConfigureAwait(false);
 
-                    if (string.Equals(
+                    var accepted = string.Equals(
+                        response.Result,
+                        RouteResults.Accepted,
+                        StringComparison.Ordinal);
+                    var resumablePending = string.Equals(
                             response.Result,
-                            RouteResults.Accepted,
-                            StringComparison.Ordinal))
+                            RouteResults.Pending,
+                            StringComparison.Ordinal) &&
+                        MessageValidator.IsOpaqueId(
+                            response.ActivationRequestId);
+                    if (accepted || resumablePending)
                     {
-                        var activationRequestId =
-                            response.ActivationRequestId ?? msg.RequestId;
+                        var activationRequestId = resumablePending
+                            ? response.ActivationRequestId!
+                            : response.ActivationRequestId ?? msg.RequestId;
                         response = await WaitForActivationAsync(
                                 client,
                                 activationRequestId,
                                 effectiveWaitMs,
                                 clientWaitStarted,
+                                returnOnProgress,
                                 clientWaitToken)
                             .ConfigureAwait(false);
                     }
@@ -332,12 +349,38 @@ public static class Program
                 CultureInfo.InvariantCulture,
                 out var parsedWait) ||
             parsedWait <= 0 ||
-            parsedWait > ProtocolConstants.MaxRequestTtlMs)
+            parsedWait > ProtocolConstants.MaxActivationExecutionMs)
         {
             return false;
         }
 
         waitMs = parsedWait;
+        return true;
+    }
+
+    private static bool TryGetClientReturnOnProgress(
+        string[] args,
+        out bool returnOnProgress)
+    {
+        returnOnProgress = false;
+        for (var i = 1; i < args.Length; i++)
+        {
+            if (!string.Equals(
+                    args[i],
+                    "--return-on-progress",
+                    StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            if (returnOnProgress)
+            {
+                return false;
+            }
+
+            returnOnProgress = true;
+        }
+
         return true;
     }
 
@@ -363,6 +406,7 @@ public static class Program
         string activationRequestId,
         int waitBudgetMs,
         long clientWaitStarted,
+        bool returnOnProgress,
         CancellationToken clientWaitToken)
     {
         var clock = new SystemClock();
@@ -405,6 +449,16 @@ public static class Program
                         StringComparison.Ordinal))
                 {
                     // Preserve activationRequestId on the final response for callers.
+                    last.ActivationRequestId ??= activationRequestId;
+                    return last;
+                }
+
+                if (returnOnProgress &&
+                    string.Equals(
+                        last.ActivationPhase,
+                        ActivationPhases.DesktopRowFocusedAwaitingProof,
+                        StringComparison.Ordinal))
+                {
                     last.ActivationRequestId ??= activationRequestId;
                     return last;
                 }

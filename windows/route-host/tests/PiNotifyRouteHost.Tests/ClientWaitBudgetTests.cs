@@ -132,7 +132,7 @@ public sealed class ClientWaitBudgetTests
     [InlineData("invalid")]
     [InlineData("0")]
     [InlineData("-1")]
-    [InlineData("30001")]
+    [InlineData("60001")]
     public async Task Client_rejects_invalid_wait_budget_instead_of_falling_back_to_one_shot(
         string waitValue)
     {
@@ -258,6 +258,146 @@ public sealed class ClientWaitBudgetTests
         }
     }
 
+    [Fact]
+    public async Task Client_return_on_progress_exits_on_the_trusted_phase()
+    {
+        var pipeName = NewPipeName();
+        var requestPath = WriteActivateRequest();
+        using var serverCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var serverTask = RunProgressResponseServerAsync(
+            pipeName,
+            includeTerminalResponse: false,
+            initialPendingResponse: false,
+            serverCts.Token);
+
+        try
+        {
+            var exitCode = await Program.Main(
+            [
+                "--client",
+                "--pipe",
+                pipeName,
+                "--json",
+                requestPath,
+                "--wait-ms",
+                "45000",
+                "--return-on-progress"
+            ]);
+
+            Assert.Equal(0, exitCode);
+            Assert.Equal(2, await serverTask);
+        }
+        finally
+        {
+            serverCts.Cancel();
+            await IgnoreCancellationAsync(serverTask);
+            File.Delete(requestPath);
+        }
+    }
+
+    [Fact]
+    public async Task Client_default_wait_ignores_progress_until_terminal_result()
+    {
+        var pipeName = NewPipeName();
+        var requestPath = WriteActivateRequest();
+        using var serverCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var serverTask = RunProgressResponseServerAsync(
+            pipeName,
+            includeTerminalResponse: true,
+            initialPendingResponse: false,
+            serverCts.Token);
+
+        try
+        {
+            var exitCode = await Program.Main(
+            [
+                "--client",
+                "--pipe",
+                pipeName,
+                "--json",
+                requestPath,
+                "--wait-ms",
+                "1000"
+            ]);
+
+            Assert.Equal(0, exitCode);
+            Assert.Equal(3, await serverTask);
+        }
+        finally
+        {
+            serverCts.Cancel();
+            await IgnoreCancellationAsync(serverTask);
+            File.Delete(requestPath);
+        }
+    }
+
+    [Fact]
+    public async Task Client_rejects_return_on_progress_without_an_activate_wait()
+    {
+        var pipeName = NewPipeName();
+        var requestPath = WriteActivateRequest();
+        using var serverCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var serverTask = RunAcceptedResponseServerAsync(pipeName, serverCts.Token);
+
+        try
+        {
+            var exitCode = await Program.Main(
+            [
+                "--client",
+                "--pipe",
+                pipeName,
+                "--json",
+                requestPath,
+                "--return-on-progress"
+            ]);
+
+            Assert.Equal(1, exitCode);
+        }
+        finally
+        {
+            serverCts.Cancel();
+            await IgnoreCancellationAsync(serverTask);
+            File.Delete(requestPath);
+        }
+    }
+
+    [Fact]
+    public async Task Client_resumes_an_idempotent_pending_activation_before_returning_progress()
+    {
+        var pipeName = NewPipeName();
+        var requestPath = WriteActivateRequest();
+        using var serverCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var serverTask = RunProgressResponseServerAsync(
+            pipeName,
+            includeTerminalResponse: false,
+            initialPendingResponse: true,
+            serverCts.Token);
+
+        try
+        {
+            var exitCode = await Program.Main(
+            [
+                "--client",
+                "--pipe",
+                pipeName,
+                "--json",
+                requestPath,
+                "--wait-ms",
+                "45000",
+                "--return-on-progress"
+            ]);
+
+            Assert.Equal(0, exitCode);
+            Assert.Equal(2, await serverTask);
+        }
+        finally
+        {
+            serverCts.Cancel();
+            await IgnoreCancellationAsync(serverTask);
+            File.Delete(requestPath);
+        }
+    }
+
     private static async Task<(int ExitCode, TimeSpan Elapsed)>
         RunBoundedClientAsync(
             string pipeName,
@@ -355,6 +495,84 @@ public sealed class ClientWaitBudgetTests
                 return;
             }
         }
+    }
+
+    private static async Task<int> RunProgressResponseServerAsync(
+        string pipeName,
+        bool includeTerminalResponse,
+        bool initialPendingResponse,
+        CancellationToken cancellationToken)
+    {
+        await using var server = new NamedPipeServerStream(
+            pipeName,
+            PipeDirection.InOut,
+            1,
+            PipeTransmissionMode.Byte,
+            PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
+        await server.WaitForConnectionAsync(cancellationToken);
+        var requestCount = 0;
+        var expectedRequests = includeTerminalResponse ? 3 : 2;
+        string? activationRequestId = null;
+        while (requestCount < expectedRequests)
+        {
+            var body = await LengthPrefixedJson.ReadAsync(
+                server,
+                ProtocolConstants.MaxMessageBytes,
+                cancellationToken);
+            Assert.NotNull(body);
+            var request = RouteMessage.TryParse(body!, out var parseError);
+            Assert.Null(parseError);
+            Assert.NotNull(request);
+            requestCount++;
+
+            RouteResponse response;
+            if (requestCount == 1)
+            {
+                Assert.Equal(MessageTypes.Activate, request!.Type);
+                response = RouteResponse.Ok(
+                    request.RequestId,
+                    initialPendingResponse
+                        ? RouteResults.Pending
+                        : RouteResults.Accepted);
+                response.Reason = initialPendingResponse
+                    ? "delivered-awaiting-result"
+                    : null;
+                activationRequestId = initialPendingResponse
+                    ? "activation-existing-wait-budget"
+                    : request.RequestId;
+                response.ActivationRequestId = activationRequestId;
+                response.SnapshotId = request.SnapshotId;
+            }
+            else if (requestCount == 2)
+            {
+                Assert.Equal(MessageTypes.ActivationStatus, request!.Type);
+                Assert.Equal(activationRequestId, request.ActivationRequestId);
+                response = RouteResponse.Ok(
+                    request.RequestId,
+                    RouteResults.Pending);
+                response.Reason = "delivered-awaiting-result";
+                response.ActivationRequestId = request.ActivationRequestId;
+                response.SnapshotId = "snapshot-wait-budget";
+                response.ActivationPhase =
+                    ActivationPhases.DesktopRowFocusedAwaitingProof;
+            }
+            else
+            {
+                Assert.Equal(MessageTypes.ActivationStatus, request!.Type);
+                response = RouteResponse.Ok(
+                    request.RequestId,
+                    RouteResults.SessionUrlConfirmed);
+                response.ActivationRequestId = request.ActivationRequestId;
+                response.SnapshotId = "snapshot-wait-budget";
+            }
+
+            await LengthPrefixedJson.WriteAsync(
+                server,
+                response.ToUtf8Bytes(),
+                cancellationToken);
+        }
+
+        return requestCount;
     }
 
     private static async Task IgnoreCancellationAsync(Task task)

@@ -425,12 +425,16 @@ if ($originKind -eq 'pi-web') {
         Write-NotifyActivateLog -Message ('activate-route fail-closed result=owner-unresolved reason=missing-route-handle notificationFp={0}' -f (Get-NotifyRouteFingerprint -Value $notificationId))
         exit 1
     }
-    $activateOutcome = Invoke-NotifyExactRouteRecoveryAndActivate -NotificationId $notificationId -SnapshotId $snapshotId -RecoveryTicketId $recoveryTicketId -Config $config -RecoveryWaitMs 125000 -ActivateWaitMs 15000 -ActivateTimeoutMs 18000
+    $activateOutcome = Invoke-NotifyExactRouteRecoveryAndActivate -NotificationId $notificationId -SnapshotId $snapshotId -RecoveryTicketId $recoveryTicketId -Config $config -RecoveryWaitMs 125000 -ActivateWaitMs 45000 -ActivateTimeoutMs 48000
     $decision = $activateOutcome.Decision
     $resolvedSnapshotId = if ($activateOutcome.PSObject.Properties['SnapshotId']) { [string]$activateOutcome.SnapshotId } else { $snapshotId }
     Write-NotifyActivateLog -Message ('activate-route decision={0} result={1} reason={2} notificationFp={3} snapshotFp={4} ticketFp={5}' -f $decision.Decision, $decision.Result, $(if ([string]::IsNullOrWhiteSpace($decision.Reason)) { 'none' } else { $decision.Reason }), (Get-NotifyRouteFingerprint -Value $notificationId), (Get-NotifyRouteFingerprint -Value $resolvedSnapshotId), (Get-NotifyRouteFingerprint -Value $recoveryTicketId))
     if ($decision.Decision -eq 'handled') {
         Write-NotifyActivateLog -Message 'activate-route-success'
+        exit 0
+    }
+    if ($decision.Decision -eq 'focused') {
+        Write-NotifyActivateLog -Message 'activate-route-focused background-proof=pending'
         exit 0
     }
     if ($decision.Decision -eq 'fail-closed') {

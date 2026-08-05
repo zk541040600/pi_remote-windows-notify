@@ -184,6 +184,28 @@ public static class MessageFactory
         return msg;
     }
 
+    public static RouteMessage ActivateProgress(
+        IClock clock,
+        string activationRequestId,
+        string notificationId,
+        string snapshotId,
+        string adapterKey,
+        string activationPhase = ActivationPhases.DesktopRowFocusedAwaitingProof,
+        long? elapsedMs = null,
+        string? adapterGeneration = null)
+    {
+        var msg = Create(MessageTypes.ActivateProgress, clock);
+        msg.ActivationRequestId = activationRequestId;
+        msg.NotificationId = notificationId;
+        msg.SnapshotId = snapshotId;
+        msg.AdapterKey = adapterKey;
+        msg.AdapterGeneration =
+            adapterGeneration ?? DefaultAdapterGeneration(adapterKey);
+        msg.ActivationPhase = activationPhase;
+        msg.ElapsedMs = elapsedMs;
+        return msg;
+    }
+
     public static RouteMessage ActivateResult(
         IClock clock,
         string activationRequestId,

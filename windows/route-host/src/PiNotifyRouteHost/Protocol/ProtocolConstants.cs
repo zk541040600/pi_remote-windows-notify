@@ -36,6 +36,12 @@ public static class ProtocolConstants
     /// <summary>Hard upper bound on request TTL (ms).</summary>
     public const int MaxRequestTtlMs = 30_000;
 
+    /// <summary>
+    /// Hard upper bound for one already-accepted activation execution. This is
+    /// intentionally separate from request-envelope freshness.
+    /// </summary>
+    public const int MaxActivationExecutionMs = 60_000;
+
     /// <summary>Maximum accepted client timestamp lead over the host clock (ms).</summary>
     public const int MaxFutureClockSkewMs = 60_000;
 
@@ -141,6 +147,7 @@ public static class ProtocolConstants
         MessageTypes.Freeze,
         MessageTypes.ResolveRecovery,
         MessageTypes.Activate,
+        MessageTypes.ActivateProgress,
         MessageTypes.ActivateResult,
         MessageTypes.PollActivation,
         MessageTypes.ActivationStatus,
@@ -162,6 +169,7 @@ public static class ProtocolConstants
             MessageTypes.UnregisterOwner,
             MessageTypes.Heartbeat,
             MessageTypes.PollActivation,
+            MessageTypes.ActivateProgress,
             MessageTypes.ActivateResult,
         };
 
@@ -180,6 +188,7 @@ public static class ProtocolConstants
             MessageTypes.UnregisterOwner,
             MessageTypes.Heartbeat,
             MessageTypes.PollActivation,
+            MessageTypes.ActivateProgress,
             MessageTypes.ActivateResult,
             MessageTypes.Ping,
         };
@@ -228,6 +237,15 @@ public static class ProtocolConstants
         RouteResults.ForegroundDenied,
         RouteResults.SelectFailed,
     };
+
+    /// <summary>
+    /// Non-terminal activation progress accepted from a trusted adapter. A
+    /// phase is UX evidence only and never completes or dequeues an activation.
+    /// </summary>
+    public static readonly HashSet<string> AllowedActivationPhases = new(StringComparer.Ordinal)
+    {
+        ActivationPhases.DesktopRowFocusedAwaitingProof,
+    };
 }
 
 public static class MessageTypes
@@ -242,6 +260,7 @@ public static class MessageTypes
     public const string Freeze = "freeze";
     public const string ResolveRecovery = "resolve-recovery";
     public const string Activate = "activate";
+    public const string ActivateProgress = "activate-progress";
     public const string ActivateResult = "activate-result";
     public const string PollActivation = "poll-activation";
     public const string ActivationStatus = "activation-status";
@@ -253,6 +272,12 @@ public static class MessageTypes
     /// to the daemon, and must not carry session/URL/routing/token fields.
     /// </summary>
     public const string Wake = "wake";
+}
+
+public static class ActivationPhases
+{
+    public const string DesktopRowFocusedAwaitingProof =
+        "desktop-row-focused-awaiting-proof";
 }
 
 public static class OwnerEvents

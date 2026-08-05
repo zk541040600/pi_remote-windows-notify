@@ -163,6 +163,38 @@ Assert-equal 'handled' $handled2.Decision 'activate-already-active-handled'
 $handled3 = Get-NotifyRouteActivateDecision -OriginKind 'pi-web' -NotificationId 'n1' -SnapshotId 's1' -ClientResult ([pscustomobject]@{ Available = $true; Result = 'session-confirmed'; Reason = '' })
 Assert-equal 'handled' $handled3.Decision 'activate-session-confirmed-handled'
 
+$focused = Get-NotifyRouteActivateDecision -OriginKind 'pi-web' -NotificationId 'n1' -SnapshotId 'snapshot-focused-1' -ClientResult ([pscustomobject]@{
+    Available = $true
+    Result = 'pending'
+    Reason = 'delivered-awaiting-result'
+    SnapshotId = 'snapshot-focused-1'
+    ActivationRequestId = 'activation-focused-1'
+    ActivationPhase = 'desktop-row-focused-awaiting-proof'
+})
+Assert-Equal 'focused' $focused.Decision 'activate-desktop-focus-progress'
+Assert-Equal 'pending' $focused.Result 'activate-desktop-focus-keeps-pending'
+Assert-Equal 'background-proof-pending' $focused.Reason 'activate-desktop-focus-background-proof'
+
+$focusedWrongSnapshot = Get-NotifyRouteActivateDecision -OriginKind 'pi-web' -NotificationId 'n1' -SnapshotId 'snapshot-focused-1' -ClientResult ([pscustomobject]@{
+    Available = $true
+    Result = 'pending'
+    Reason = 'delivered-awaiting-result'
+    SnapshotId = 'snapshot-focused-wrong'
+    ActivationRequestId = 'activation-focused-1'
+    ActivationPhase = 'desktop-row-focused-awaiting-proof'
+})
+Assert-Equal 'fail-closed' $focusedWrongSnapshot.Decision 'activate-focus-progress-requires-exact-snapshot'
+
+$focusedMissingActivation = Get-NotifyRouteActivateDecision -OriginKind 'pi-web' -NotificationId 'n1' -SnapshotId 'snapshot-focused-1' -ClientResult ([pscustomobject]@{
+    Available = $true
+    Result = 'pending'
+    Reason = 'delivered-awaiting-result'
+    SnapshotId = 'snapshot-focused-1'
+    ActivationRequestId = ''
+    ActivationPhase = 'desktop-row-focused-awaiting-proof'
+})
+Assert-Equal 'fail-closed' $focusedMissingActivation.Decision 'activate-focus-progress-requires-activation-id'
+
 $fallback = Get-NotifyRouteActivateDecision -OriginKind 'pi-web' -NotificationId 'n1' -SnapshotId 's1' -ClientResult ([pscustomobject]@{ Available = $true; Result = 'miss'; Reason = '' })
 Assert-equal 'fail-closed' $fallback.Decision 'activate-miss-fail-closed'
 
@@ -217,6 +249,30 @@ Assert-equal 'snap-mock-001' $freeze.SnapshotId 'mock-freeze-snapshot'
 $activate = Invoke-NotifyExactRouteActivate -NotificationId '11111111-1111-4111-8111-111111111111' -SnapshotId 'snap-mock-001' -WaitMs 100 -TimeoutMs 500
 Assert-equal 'handled' $activate.Decision.Decision 'mock-activate-handled'
 Assert-equal 'session-url-confirmed' $activate.Decision.Result 'mock-activate-result'
+
+$script:MockReturnOnProgress = $false
+$script:MockActivationEnvelopeTtlMs = 0
+$script:NotifyRouteHostClientMock = {
+    param($Request, $WaitMs, $ReturnOnProgress)
+    $script:MockReturnOnProgress = [bool]$ReturnOnProgress
+    $script:MockActivationEnvelopeTtlMs = [long]$Request['expiresAtMs'] - [long]$Request['issuedAtMs']
+    return [pscustomobject]@{
+        Available = $true
+        ExitCode  = 0
+        Result    = 'pending'
+        Reason    = 'delivered-awaiting-result'
+        SnapshotId = [string]$Request['snapshotId']
+        ActivationRequestId = 'activation-mock-focused'
+        ActivationPhase = 'desktop-row-focused-awaiting-proof'
+        RawLength = 20
+        TypeFingerprint = (Get-NotifyRouteFingerprint -Value 'activate')
+    }
+}
+$focusedActivate = Invoke-NotifyExactRouteActivate -NotificationId '11111111-1111-4111-8111-111111111111' -SnapshotId 'snapshot-mock-focused' -WaitMs 45000 -TimeoutMs 48000
+Assert-True $script:MockReturnOnProgress 'mock-activate-requests-progress-return'
+Assert-Equal 5000 $script:MockActivationEnvelopeTtlMs 'mock-activate-keeps-short-transport-ttl'
+Assert-Equal 'focused' $focusedActivate.Decision.Decision 'mock-activate-focused'
+Assert-Equal 'background-proof-pending' $focusedActivate.Decision.Reason 'mock-activate-focused-background-proof'
 
 # Unavailable mock
 $script:NotifyRouteHostClientMock = {

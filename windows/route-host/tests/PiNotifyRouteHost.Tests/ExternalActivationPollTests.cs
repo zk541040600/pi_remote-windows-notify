@@ -98,6 +98,348 @@ public class ExternalActivationPollTests
     }
 
     [Fact]
+    public async Task Desktop_focus_progress_is_pending_idempotent_and_keeps_work_queued()
+    {
+        var d = CreateDispatcher();
+        const string adapterKey = "adapter-desktop-progress";
+        await d.DispatchAsync(MessageFactory.RegisterAdapter(
+            _clock,
+            adapterKey,
+            "pi-web-desktop"));
+        await d.DispatchAsync(MessageFactory.RegisterOwner(
+            _clock,
+            adapterKey,
+            "pi-web-desktop",
+            "owner-desktop-progress",
+            "page-desktop-progress",
+            _instance,
+            _routing,
+            pageFingerprint: "fp-desktop-progress"));
+
+        var freeze = await d.DispatchAsync(MessageFactory.Freeze(
+            _clock,
+            "notif-desktop-progress",
+            _instance,
+            _routing));
+        var activationDeadline = _clock.UtcNowMs + 45_000;
+        var activate = await d.DispatchAsync(MessageFactory.Activate(
+            _clock,
+            "notif-desktop-progress",
+            freeze.SnapshotId!,
+            deadlineMs: activationDeadline));
+        var poll = await d.DispatchAsync(MessageFactory.PollActivation(
+            _clock,
+            adapterKey));
+        Assert.Equal(RouteResults.Ready, poll.Result);
+        Assert.Equal(activationDeadline, poll.DeadlineMs);
+
+        var progressMessage = MessageFactory.ActivateProgress(
+            _clock,
+            activate.ActivationRequestId!,
+            "notif-desktop-progress",
+            freeze.SnapshotId!,
+            adapterKey,
+            elapsedMs: 17);
+        progressMessage.OwnerKey = poll.OwnerKey;
+        progressMessage.PageKey = poll.PageKey;
+        progressMessage.InstanceKey = poll.InstanceKey;
+        progressMessage.RoutingKey = poll.RoutingKey;
+        progressMessage.PageFingerprint = poll.PageFingerprint;
+        progressMessage.AdapterKind = "pi-web-desktop";
+
+        var progress = await d.DispatchAsync(progressMessage);
+        Assert.Equal(RouteResults.Pending, progress.Result);
+        Assert.Equal("delivered-awaiting-result", progress.Reason);
+        Assert.Equal(
+            ActivationPhases.DesktopRowFocusedAwaitingProof,
+            progress.ActivationPhase);
+        Assert.Equal(activate.ActivationRequestId, progress.ActivationRequestId);
+        Assert.Equal(freeze.SnapshotId, progress.SnapshotId);
+
+        var duplicate = await d.DispatchAsync(MessageFactory.ActivateProgress(
+            _clock,
+            activate.ActivationRequestId!,
+            "notif-desktop-progress",
+            freeze.SnapshotId!,
+            adapterKey,
+            elapsedMs: 23));
+        Assert.Equal(RouteResults.Pending, duplicate.Result);
+        Assert.Equal(progress.ActivationPhase, duplicate.ActivationPhase);
+
+        var status = await d.DispatchAsync(MessageFactory.ActivationStatus(
+            _clock,
+            activate.ActivationRequestId!));
+        Assert.Equal(RouteResults.Pending, status.Result);
+        Assert.Equal("delivered-awaiting-result", status.Reason);
+        Assert.Equal(progress.ActivationPhase, status.ActivationPhase);
+
+        var snapshot = d.State.GetSnapshot(freeze.SnapshotId!);
+        Assert.NotNull(snapshot);
+        Assert.Null(snapshot!.LastActivateResult);
+        Assert.Null(snapshot.LastActivateReason);
+
+        // Progress neither dequeues the command nor extends its delivery
+        // lease; the immutable command remains eligible for normal redelivery.
+        _clock.AdvanceMs(ProtocolConstants.ActivationDeliveryRetryMs + 1);
+        var redelivered = await d.DispatchAsync(MessageFactory.PollActivation(
+            _clock,
+            adapterKey));
+        Assert.Equal(RouteResults.Ready, redelivered.Result);
+        Assert.Equal(activate.ActivationRequestId, redelivered.ActivationRequestId);
+
+        var final = await d.DispatchAsync(MessageFactory.ActivateResult(
+            _clock,
+            activate.ActivationRequestId!,
+            RouteResults.SessionUrlConfirmed,
+            snapshotId: freeze.SnapshotId,
+            adapterKey: adapterKey));
+        Assert.Equal(RouteResults.SessionUrlConfirmed, final.Result);
+
+        var finalStatus = await d.DispatchAsync(MessageFactory.ActivationStatus(
+            _clock,
+            activate.ActivationRequestId!));
+        Assert.Equal(RouteResults.SessionUrlConfirmed, finalStatus.Result);
+        Assert.Null(finalStatus.ActivationPhase);
+    }
+
+    [Fact]
+    public async Task Focus_progress_requires_exact_desktop_delivery_correlation()
+    {
+        var d = CreateDispatcher();
+        const string adapterKey = "adapter-desktop-progress-correlation";
+        await d.DispatchAsync(MessageFactory.RegisterAdapter(
+            _clock,
+            adapterKey,
+            "pi-web-desktop"));
+        await d.DispatchAsync(MessageFactory.RegisterOwner(
+            _clock,
+            adapterKey,
+            "pi-web-desktop",
+            "owner-progress-correlation",
+            "page-progress-correlation",
+            _instance,
+            _routing));
+        var freeze = await d.DispatchAsync(MessageFactory.Freeze(
+            _clock,
+            "notif-progress-correlation",
+            _instance,
+            _routing));
+        var activate = await d.DispatchAsync(MessageFactory.Activate(
+            _clock,
+            "notif-progress-correlation",
+            freeze.SnapshotId!));
+
+        var beforeDelivery = await d.DispatchAsync(MessageFactory.ActivateProgress(
+            _clock,
+            activate.ActivationRequestId!,
+            "notif-progress-correlation",
+            freeze.SnapshotId!,
+            adapterKey));
+        Assert.Equal(RouteResults.Rejected, beforeDelivery.Result);
+        Assert.Equal(RejectReasons.PendingAdapterDelivery, beforeDelivery.Reason);
+
+        await d.DispatchAsync(MessageFactory.PollActivation(_clock, adapterKey));
+
+        var wrongSnapshot = await d.DispatchAsync(MessageFactory.ActivateProgress(
+            _clock,
+            activate.ActivationRequestId!,
+            "notif-progress-correlation",
+            "snapshot-progress-wrong",
+            adapterKey));
+        Assert.Equal(RouteResults.Rejected, wrongSnapshot.Result);
+        Assert.Equal(RejectReasons.SnapshotMismatch, wrongSnapshot.Reason);
+
+        var wrongNotification = await d.DispatchAsync(MessageFactory.ActivateProgress(
+            _clock,
+            activate.ActivationRequestId!,
+            "notif-progress-wrong",
+            freeze.SnapshotId!,
+            adapterKey));
+        Assert.Equal(RouteResults.Rejected, wrongNotification.Result);
+        Assert.Equal(RejectReasons.SnapshotMismatch, wrongNotification.Reason);
+
+        var wrongGeneration = await d.DispatchAsync(MessageFactory.ActivateProgress(
+            _clock,
+            activate.ActivationRequestId!,
+            "notif-progress-correlation",
+            freeze.SnapshotId!,
+            adapterKey,
+            adapterGeneration: "generation-progress-wrong"));
+        Assert.Equal(RouteResults.AdapterUnavailable, wrongGeneration.Result);
+        Assert.Equal(RejectReasons.AdapterGenerationChanged, wrongGeneration.Reason);
+
+        var invalidPhase = await d.DispatchAsync(MessageFactory.ActivateProgress(
+            _clock,
+            activate.ActivationRequestId!,
+            "notif-progress-correlation",
+            freeze.SnapshotId!,
+            adapterKey,
+            activationPhase: "desktop-window-seen"));
+        Assert.Equal(RouteResults.Rejected, invalidPhase.Result);
+        Assert.Equal(RejectReasons.InvalidField, invalidPhase.Reason);
+
+        var status = await d.DispatchAsync(MessageFactory.ActivationStatus(
+            _clock,
+            activate.ActivationRequestId!));
+        Assert.Equal(RouteResults.Pending, status.Result);
+        Assert.Null(status.ActivationPhase);
+        var snapshot = d.State.GetSnapshot(freeze.SnapshotId!);
+        Assert.NotNull(snapshot);
+        Assert.Null(snapshot!.LastActivateResult);
+    }
+
+    [Fact]
+    public async Task Focus_progress_is_desktop_only_and_stale_observation_is_non_terminal()
+    {
+        var chromeDispatcher = CreateDispatcher();
+        const string chromeAdapter = "adapter-chrome-progress-denied";
+        await chromeDispatcher.DispatchAsync(MessageFactory.RegisterAdapter(
+            _clock,
+            chromeAdapter,
+            "chrome"));
+        await chromeDispatcher.DispatchAsync(MessageFactory.RegisterOwner(
+            _clock,
+            chromeAdapter,
+            "chrome",
+            "owner-chrome-progress-denied",
+            "page-chrome-progress-denied",
+            _instance,
+            _routing));
+        var chromeFreeze = await chromeDispatcher.DispatchAsync(MessageFactory.Freeze(
+            _clock,
+            "notif-chrome-progress-denied",
+            _instance,
+            _routing));
+        var chromeActivate = await chromeDispatcher.DispatchAsync(MessageFactory.Activate(
+            _clock,
+            "notif-chrome-progress-denied",
+            chromeFreeze.SnapshotId!));
+        await chromeDispatcher.DispatchAsync(MessageFactory.PollActivation(
+            _clock,
+            chromeAdapter));
+        var chromeProgress = await chromeDispatcher.DispatchAsync(
+            MessageFactory.ActivateProgress(
+                _clock,
+                chromeActivate.ActivationRequestId!,
+                "notif-chrome-progress-denied",
+                chromeFreeze.SnapshotId!,
+                chromeAdapter));
+        Assert.Equal(RouteResults.Rejected, chromeProgress.Result);
+        Assert.Equal(RejectReasons.WrongAdapter, chromeProgress.Reason);
+
+        var desktopDispatcher = CreateDispatcher();
+        const string desktopAdapter = "adapter-desktop-progress-stale";
+        const string desktopOwner = "owner-desktop-progress-stale";
+        await desktopDispatcher.DispatchAsync(MessageFactory.RegisterAdapter(
+            _clock,
+            desktopAdapter,
+            "pi-web-desktop"));
+        await desktopDispatcher.DispatchAsync(MessageFactory.RegisterOwner(
+            _clock,
+            desktopAdapter,
+            "pi-web-desktop",
+            desktopOwner,
+            "page-desktop-progress-stale",
+            _instance,
+            _routing));
+        var desktopFreeze = await desktopDispatcher.DispatchAsync(MessageFactory.Freeze(
+            _clock,
+            "notif-desktop-progress-stale",
+            _instance,
+            _routing));
+        var desktopActivate = await desktopDispatcher.DispatchAsync(MessageFactory.Activate(
+            _clock,
+            "notif-desktop-progress-stale",
+            desktopFreeze.SnapshotId!));
+        await desktopDispatcher.DispatchAsync(MessageFactory.PollActivation(
+            _clock,
+            desktopAdapter));
+        await desktopDispatcher.DispatchAsync(MessageFactory.UnregisterOwner(
+            _clock,
+            desktopAdapter,
+            desktopOwner));
+
+        var staleProgress = await desktopDispatcher.DispatchAsync(
+            MessageFactory.ActivateProgress(
+                _clock,
+                desktopActivate.ActivationRequestId!,
+                "notif-desktop-progress-stale",
+                desktopFreeze.SnapshotId!,
+                desktopAdapter));
+        Assert.Equal(RouteResults.Stale, staleProgress.Result);
+        Assert.Equal(RejectReasons.LeaseExpired, staleProgress.Reason);
+
+        var desktopSnapshot = desktopDispatcher.State.GetSnapshot(
+            desktopFreeze.SnapshotId!);
+        Assert.NotNull(desktopSnapshot);
+        Assert.Null(desktopSnapshot!.LastActivateResult);
+
+        // Normal status owns the terminal transition after progress merely
+        // observed the stale target.
+        var terminalStatus = await desktopDispatcher.DispatchAsync(
+            MessageFactory.ActivationStatus(
+                _clock,
+                desktopActivate.ActivationRequestId!));
+        Assert.Equal(RouteResults.Stale, terminalStatus.Result);
+        Assert.Equal(RejectReasons.LeaseExpired, terminalStatus.Reason);
+    }
+
+    [Fact]
+    public async Task Expired_focus_progress_reports_timeout_without_owning_completion()
+    {
+        var d = CreateDispatcher();
+        const string adapterKey = "adapter-desktop-progress-expired";
+        await d.DispatchAsync(MessageFactory.RegisterAdapter(
+            _clock,
+            adapterKey,
+            "pi-web-desktop"));
+        await d.DispatchAsync(MessageFactory.RegisterOwner(
+            _clock,
+            adapterKey,
+            "pi-web-desktop",
+            "owner-desktop-progress-expired",
+            "page-desktop-progress-expired",
+            _instance,
+            _routing));
+        var freeze = await d.DispatchAsync(MessageFactory.Freeze(
+            _clock,
+            "notif-desktop-progress-expired",
+            _instance,
+            _routing));
+        var activate = await d.DispatchAsync(MessageFactory.Activate(
+            _clock,
+            "notif-desktop-progress-expired",
+            freeze.SnapshotId!,
+            deadlineMs: _clock.UtcNowMs + 1_000));
+        var frozenSnapshot = d.State.GetSnapshot(freeze.SnapshotId!);
+        Assert.NotNull(frozenSnapshot);
+        await d.DispatchAsync(MessageFactory.PollActivation(
+            _clock,
+            adapterKey));
+        _clock.AdvanceMs(1_001);
+
+        var progress = await d.DispatchAsync(MessageFactory.ActivateProgress(
+            _clock,
+            activate.ActivationRequestId!,
+            "notif-desktop-progress-expired",
+            freeze.SnapshotId!,
+            adapterKey));
+        Assert.Equal(RouteResults.Timeout, progress.Result);
+        Assert.Equal(RejectReasons.Expired, progress.Reason);
+
+        Assert.Null(frozenSnapshot!.LastActivateResult);
+
+        var status = await d.DispatchAsync(MessageFactory.ActivationStatus(
+            _clock,
+            activate.ActivationRequestId!));
+        Assert.Equal(RouteResults.Timeout, status.Result);
+        Assert.Equal(RejectReasons.Expired, status.Reason);
+        Assert.Equal(
+            RouteResults.Timeout,
+            d.State.GetSnapshot(freeze.SnapshotId!)!.LastActivateResult);
+    }
+
+    [Fact]
     public async Task Lost_poll_response_is_redelivered_after_delivery_retry_lease()
     {
         var d = CreateDispatcher();

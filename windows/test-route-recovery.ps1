@@ -88,8 +88,8 @@ $activation = Invoke-NotifyExactRouteRecoveryAndActivate `
     -NotificationId $notificationId `
     -RecoveryTicketId $script:RecoveryTestTicket `
     -RecoveryWaitMs 2000 `
-    -ActivateWaitMs 15000 `
-    -ActivateTimeoutMs 18000
+    -ActivateWaitMs 45000 `
+    -ActivateTimeoutMs 48000
 if ($activation.Decision.Decision -ne 'handled') {
     throw "recovered activation was not handled: $($activation.Decision.Decision)"
 }

@@ -103,6 +103,10 @@ $config = Ensure-NotifyBridgeConfig @configArgs
 $PopupPlacement = if ([string]::IsNullOrWhiteSpace([string]$config.PopupPlacement)) { 'cursor' } else { [string]$config.PopupPlacement }
 $script:NotifyPopupHwndTopMost = [IntPtr](-1)
 $script:NotifyPopupSwpShowNoActivate = [uint32](0x0010 -bor 0x0040)
+$script:NotifyPopupFailureCloseDelayMs = 2500
+$script:NotifyPopupActivationRecoveryWaitMs = 10000
+$script:NotifyPopupRecoveringActivationWatchdogMs = 12000
+$script:NotifyPopupReadyActivationWatchdogMs = 20000
 if ([string]::IsNullOrWhiteSpace($Title) -and -not [string]::IsNullOrWhiteSpace($env:PI_NOTIFY_TITLE)) { $Title = $env:PI_NOTIFY_TITLE }
 if ([string]::IsNullOrWhiteSpace($Body) -and -not [string]::IsNullOrWhiteSpace($env:PI_NOTIFY_BODY)) { $Body = $env:PI_NOTIFY_BODY }
 if ([string]::IsNullOrWhiteSpace($FocusTarget) -and -not [string]::IsNullOrWhiteSpace($env:PI_NOTIFY_FOCUS_TARGET)) { $FocusTarget = $env:PI_NOTIFY_FOCUS_TARGET }
@@ -133,15 +137,36 @@ function Write-NotifyPopupLog {
 }
 
 function Get-NotifyPopupRecoveryUiText {
-    param([Parameter(Mandatory = $true)][ValidateSet('recovering-title', 'recovering-body', 'unavailable-title', 'unavailable-body')][string]$Name)
+    param([Parameter(Mandatory = $true)][ValidateSet('recovering-title', 'recovering-body', 'opening-title', 'opening-body', 'unavailable-title', 'unavailable-body')][string]$Name)
 
     $points = switch ($Name) {
         'recovering-title' { @(0x6b63,0x5728,0x6062,0x590d,0x4f1a,0x8bdd,0x2026) }
         'recovering-body' { @(0x8fde,0x63a5,0x6062,0x590d,0x540e,0x5373,0x53ef,0x70b9,0x51fb,0x3002) }
+        'opening-title' { @(0x6b63,0x5728,0x6253,0x5f00,0x4f1a,0x8bdd,0x2026) }
+        'opening-body' { @(0x6b63,0x5728,0x6253,0x5f00,0x7ed1,0x5b9a,0x4f1a,0x8bdd,0xff0c,0x8bf7,0x7a0d,0x5019,0x3002) }
         'unavailable-title' { @(0x76ee,0x6807,0x6682,0x65f6,0x4e0d,0x53ef,0x7528) }
         default { @(0x4e3a,0x907f,0x514d,0x8df3,0x9519,0x4f1a,0x8bdd,0xff0c,0x6b64,0x901a,0x77e5,0x5df2,0x505c,0x7528,0x3002) }
     }
     return -join @($points | ForEach-Object { [char]$_ })
+}
+
+function Reset-NotifyPopupFeedbackVisuals {
+    $script:NotifyPopupForm.Opacity = $script:NotifyPopupOriginalOpacity
+    $script:NotifyPopupForm.BackColor = $script:NotifyPopupOriginalCardColor
+    $script:NotifyPopupForm.Cursor = [System.Windows.Forms.Cursors]::Hand
+    $script:NotifyPopupPanel.BackColor = $script:NotifyPopupOriginalPanelColor
+    $script:NotifyPopupPanel.Cursor = [System.Windows.Forms.Cursors]::Hand
+    $script:NotifyPopupAppLabel.Text = $script:NotifyPopupOriginalAppText
+    $script:NotifyPopupAppLabel.ForeColor = $script:NotifyPopupOriginalAppForeColor
+    $script:NotifyPopupAppLabel.Cursor = [System.Windows.Forms.Cursors]::Hand
+    $script:NotifyPopupSessionLabel.Text = $script:NotifyPopupOriginalSessionText
+    $script:NotifyPopupSessionLabel.ForeColor = $script:NotifyPopupOriginalSessionForeColor
+    $script:NotifyPopupSessionLabel.Cursor = [System.Windows.Forms.Cursors]::Hand
+    $script:NotifyPopupTitleLabel.ForeColor = $script:NotifyPopupOriginalTitleForeColor
+    $script:NotifyPopupBodyLabel.ForeColor = $script:NotifyPopupOriginalBodyForeColor
+    $script:NotifyPopupCloseLabel.Text = $script:NotifyPopupOriginalCloseText
+    $script:NotifyPopupCloseLabel.ForeColor = $script:NotifyPopupOriginalCloseForeColor
+    $script:NotifyPopupCloseLabel.Cursor = [System.Windows.Forms.Cursors]::Hand
 }
 
 function Set-NotifyPopupRecoveryUiState {
@@ -157,6 +182,7 @@ function Set-NotifyPopupRecoveryUiState {
         return
     }
     if ($State -eq 'ready') {
+        Reset-NotifyPopupFeedbackVisuals
         $script:NotifyPopupTitleLabel.Text = $script:NotifyPopupOriginalTitle
         $script:NotifyPopupBodyLabel.Text = $script:NotifyPopupOriginalBody
         foreach ($control in @($script:NotifyPopupForm, $script:NotifyPopupPanel, $script:NotifyPopupAppLabel, $script:NotifyPopupSessionLabel, $script:NotifyPopupTitleLabel, $script:NotifyPopupBodyLabel)) {
@@ -165,6 +191,7 @@ function Set-NotifyPopupRecoveryUiState {
         return
     }
 
+    Reset-NotifyPopupFeedbackVisuals
     $script:NotifyPopupTitleLabel.Text = Get-NotifyPopupRecoveryUiText -Name 'unavailable-title'
     $script:NotifyPopupBodyLabel.Text = Get-NotifyPopupRecoveryUiText -Name 'unavailable-body'
     foreach ($control in @($script:NotifyPopupForm, $script:NotifyPopupPanel, $script:NotifyPopupAppLabel, $script:NotifyPopupSessionLabel, $script:NotifyPopupTitleLabel, $script:NotifyPopupBodyLabel)) {
@@ -172,16 +199,126 @@ function Set-NotifyPopupRecoveryUiState {
     }
 }
 
+function Complete-NotifyPopupLifecycle {
+    param(
+        [Parameter(Mandatory = $true)][ValidateSet('focused', 'handled', 'failed', 'dismissed')][string]$Outcome,
+        [Parameter(Mandatory = $true)][string]$Reason
+    )
+
+    if ($null -eq $script:NotifyPopupForm -or $script:NotifyPopupForm.IsDisposed) { return $false }
+    $alreadyTerminal = $script:NotifyPopupTerminalState
+    if (-not $alreadyTerminal) {
+        $script:NotifyPopupTerminalState = $true
+        $script:NotifyPopupTerminalOutcome = $Outcome
+        $script:NotifyPopupTerminalReason = $Reason
+        $script:NotifyPopupActivating = $false
+        $script:NotifyPopupTimer.Stop()
+        $script:NotifyPopupFocusWatchTimer.Stop()
+        $script:NotifyPopupActivationWatchdogTimer.Stop()
+        Write-NotifyPopupLog -Message ('popup-terminal outcome={0} reason={1}' -f $Outcome, $Reason)
+    }
+
+    if ($Outcome -eq 'failed') {
+        if ($alreadyTerminal) { return $false }
+        Set-NotifyPopupRecoveryUiState -State 'unavailable'
+        $script:NotifyPopupFailureCloseTimer.Stop()
+        $script:NotifyPopupFailureCloseTimer.Start()
+        return $true
+    }
+
+    $script:NotifyPopupFailureCloseTimer.Stop()
+    if (-not $script:NotifyPopupCloseRequested) {
+        $script:NotifyPopupCloseRequested = $true
+        $script:NotifyPopupForm.Close()
+        return $true
+    }
+    return $false
+}
+
+function Set-NotifyPopupActivating {
+    if ($script:NotifyPopupTerminalState -or $script:NotifyPopupActivating) { return $false }
+
+    try {
+        $script:NotifyPopupActivating = $true
+        $script:NotifyPopupTimer.Stop()
+        $script:NotifyPopupFocusWatchTimer.Stop()
+        $inactiveCardColor = [System.Drawing.Color]::FromArgb(48, 52, 60)
+        $inactiveTextColor = [System.Drawing.Color]::FromArgb(190, 198, 210)
+        $inactiveAccentColor = [System.Drawing.Color]::FromArgb(148, 163, 184)
+        $jumpingText = (-join @([char]0x8df3, [char]0x8f6c, [char]0x4e2d, '.', '.', '.'))
+
+        $script:NotifyPopupForm.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+        $script:NotifyPopupForm.Opacity = 0.90
+        $script:NotifyPopupForm.BackColor = $inactiveCardColor
+        $script:NotifyPopupPanel.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+        $script:NotifyPopupPanel.BackColor = $inactiveCardColor
+        $script:NotifyPopupAppLabel.Text = ('Pi Remote - {0}' -f $jumpingText)
+        $script:NotifyPopupAppLabel.ForeColor = $inactiveTextColor
+        $script:NotifyPopupAppLabel.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+        $script:NotifyPopupSessionLabel.Text = $jumpingText
+        $script:NotifyPopupSessionLabel.ForeColor = $inactiveAccentColor
+        $script:NotifyPopupSessionLabel.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+        $script:NotifyPopupTitleLabel.Text = Get-NotifyPopupRecoveryUiText -Name 'opening-title'
+        $script:NotifyPopupTitleLabel.ForeColor = $inactiveTextColor
+        $script:NotifyPopupTitleLabel.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+        $script:NotifyPopupBodyLabel.Text = Get-NotifyPopupRecoveryUiText -Name 'opening-body'
+        $script:NotifyPopupBodyLabel.ForeColor = $inactiveTextColor
+        $script:NotifyPopupBodyLabel.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+
+        $watchdogMs = if ([string]::IsNullOrWhiteSpace([string]$script:NotifyPopupTargetSnapshotId)) { $script:NotifyPopupRecoveringActivationWatchdogMs } else { $script:NotifyPopupReadyActivationWatchdogMs }
+        $script:NotifyPopupActivationWatchdogTimer.Stop()
+        $script:NotifyPopupActivationWatchdogTimer.Interval = $watchdogMs
+        $script:NotifyPopupActivationWatchdogTimer.Start()
+        Write-NotifyPopupLog -Message ('popup-activation-feedback watchdogMs={0}' -f $watchdogMs)
+        $script:NotifyPopupForm.Invalidate($true)
+        $script:NotifyPopupForm.Refresh()
+        [System.Windows.Forms.Application]::DoEvents()
+        return $true
+    }
+    catch {
+        Write-NotifyPopupLog -Message ('popup-activation-feedback-error "{0}"' -f $_.Exception.Message)
+        [void](Complete-NotifyPopupLifecycle -Outcome 'failed' -Reason 'activation-feedback-error')
+        return $false
+    }
+}
+
+function Request-NotifyPopupExactWorkerStop {
+    param([Parameter(Mandatory = $true)][string]$Reason)
+
+    $worker = $script:NotifyPopupExactWorker
+    if ($null -eq $worker) { return $true }
+    if (-not [string]::IsNullOrWhiteSpace([string]$worker.CancelReason) -or $null -ne $worker.StopAsync) { return $true }
+    $worker.CancelReason = $Reason
+    if ($worker.Async.IsCompleted) { return $true }
+    try {
+        $worker.StopAsync = $worker.PowerShell.BeginStop($null, $null)
+        $script:NotifyPopupExactWorkerTimer.Start()
+        Write-NotifyPopupLog -Message ('popup-exact-worker-cancel-requested mode={0} reason={1}' -f $worker.Mode, $Reason)
+        return $true
+    }
+    catch {
+        $worker.CancelReason = ''
+        Write-NotifyPopupLog -Message ('popup-exact-worker-cancel-error mode={0} reason={1}' -f $worker.Mode, $Reason)
+        return $false
+    }
+}
+
+function Invoke-NotifyPopupActivationWatchdog {
+    if ($script:NotifyPopupTerminalState) { return $false }
+    Write-NotifyPopupLog -Message 'popup-activation-watchdog'
+    [void](Complete-NotifyPopupLifecycle -Outcome 'failed' -Reason 'activation-watchdog')
+    [void](Request-NotifyPopupExactWorkerStop -Reason 'activation-watchdog')
+    return $true
+}
+
 function Start-NotifyPopupExactWorker {
     param([Parameter(Mandatory = $true)][ValidateSet('resolve', 'activate')][string]$Mode)
 
-    if ($null -ne $script:NotifyPopupExactWorker) { return $false }
-    $runspace = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
-    $runspace.Open()
-    $powerShell = [System.Management.Automation.PowerShell]::Create()
-    $powerShell.Runspace = $runspace
+    if ($script:NotifyPopupTerminalState -or $null -ne $script:NotifyPopupExactWorker) { return $false }
+    $runspace = $null
+    $powerShell = $null
     $workerScript = @'
-param($CommonPath, $ConfigPath, $Mode, $NotificationId, $SnapshotId, $RecoveryTicketId)
+param($CommonPath, $ConfigPath, $Mode, $NotificationId, $SnapshotId, $RecoveryTicketId, $ActivationRecoveryWaitMs)
 $ErrorActionPreference = 'Stop'
 . $CommonPath
 $configArgs = @{}
@@ -192,7 +329,7 @@ if ($Mode -eq 'resolve') {
     $decision = $outcome.Decision
 }
 else {
-    $outcome = Invoke-NotifyExactRouteRecoveryAndActivate -NotificationId $NotificationId -SnapshotId $SnapshotId -RecoveryTicketId $RecoveryTicketId -Config $workerConfig -RecoveryWaitMs 125000 -ActivateWaitMs 15000 -ActivateTimeoutMs 18000
+    $outcome = Invoke-NotifyExactRouteRecoveryAndActivate -NotificationId $NotificationId -SnapshotId $SnapshotId -RecoveryTicketId $RecoveryTicketId -Config $workerConfig -RecoveryWaitMs $ActivationRecoveryWaitMs -ActivateWaitMs 45000 -ActivateTimeoutMs 48000
     $decision = $outcome.Decision
 }
 [pscustomobject]@{
@@ -202,20 +339,41 @@ else {
     SnapshotId = if ($outcome.PSObject.Properties['SnapshotId']) { [string]$outcome.SnapshotId } elseif ($decision.PSObject.Properties['SnapshotId']) { [string]$decision.SnapshotId } else { '' }
 }
 '@
-    [void]$powerShell.AddScript($workerScript)
-    [void]$powerShell.AddParameter('CommonPath', (Join-Path $PSScriptRoot 'NotifyBridge.Common.ps1'))
-    [void]$powerShell.AddParameter('ConfigPath', $ConfigPath)
-    [void]$powerShell.AddParameter('Mode', $Mode)
-    [void]$powerShell.AddParameter('NotificationId', $script:NotifyPopupTargetNotificationId)
-    [void]$powerShell.AddParameter('SnapshotId', $script:NotifyPopupTargetSnapshotId)
-    [void]$powerShell.AddParameter('RecoveryTicketId', $script:NotifyPopupTargetRecoveryTicketId)
-    $script:NotifyPopupExactWorker = [pscustomobject]@{
-        Mode = $Mode
-        PowerShell = $powerShell
-        Runspace = $runspace
-        Async = $powerShell.BeginInvoke()
-        StartedAtUtc = [DateTime]::UtcNow
+    try {
+        $runspace = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
+        $runspace.Open()
+        $powerShell = [System.Management.Automation.PowerShell]::Create()
+        $powerShell.Runspace = $runspace
+        [void]$powerShell.AddScript($workerScript)
+        [void]$powerShell.AddParameter('CommonPath', (Join-Path $PSScriptRoot 'NotifyBridge.Common.ps1'))
+        [void]$powerShell.AddParameter('ConfigPath', $ConfigPath)
+        [void]$powerShell.AddParameter('Mode', $Mode)
+        [void]$powerShell.AddParameter('NotificationId', $script:NotifyPopupTargetNotificationId)
+        [void]$powerShell.AddParameter('SnapshotId', $script:NotifyPopupTargetSnapshotId)
+        [void]$powerShell.AddParameter('RecoveryTicketId', $script:NotifyPopupTargetRecoveryTicketId)
+        [void]$powerShell.AddParameter('ActivationRecoveryWaitMs', $script:NotifyPopupActivationRecoveryWaitMs)
+        $async = $powerShell.BeginInvoke()
+        $script:NotifyPopupExactWorker = [pscustomobject]@{
+            Mode = $Mode
+            PowerShell = $powerShell
+            Runspace = $runspace
+            Async = $async
+            StartedAtUtc = [DateTime]::UtcNow
+            StopAsync = $null
+            CancelReason = ''
+        }
     }
+    catch {
+        if ($null -ne $powerShell) { try { $powerShell.Dispose() } catch {} }
+        if ($null -ne $runspace) {
+            try { $runspace.Close() } catch {}
+            try { $runspace.Dispose() } catch {}
+        }
+        Write-NotifyPopupLog -Message ('popup-exact-worker-start-error mode={0} "{1}"' -f $Mode, $_.Exception.Message)
+        [void](Complete-NotifyPopupLifecycle -Outcome 'failed' -Reason 'worker-start-error')
+        return $false
+    }
+    Write-NotifyPopupLog -Message ('popup-exact-worker-start mode={0}' -f $Mode)
     $script:NotifyPopupExactWorkerTimer.Start()
     return $true
 }
@@ -1060,29 +1218,54 @@ $shouldActivate = $false
 $script:NotifyPopupForm = $form
 $script:NotifyPopupPanel = $panel
 $script:NotifyPopupAppLabel = $appLabel
+$script:NotifyPopupCloseLabel = $closeLabel
 $script:NotifyPopupSessionLabel = $sessionLabel
 $script:NotifyPopupTitleLabel = $titleLabel
 $script:NotifyPopupBodyLabel = $bodyLabel
 $script:NotifyPopupOriginalTitle = $Title
 $script:NotifyPopupOriginalBody = $Body
+$script:NotifyPopupOriginalAppText = $appLabel.Text
+$script:NotifyPopupOriginalSessionText = $sessionLabel.Text
+$script:NotifyPopupOriginalCloseText = $closeLabel.Text
+$script:NotifyPopupOriginalOpacity = $form.Opacity
+$script:NotifyPopupOriginalCardColor = $form.BackColor
+$script:NotifyPopupOriginalPanelColor = $panel.BackColor
+$script:NotifyPopupOriginalAppForeColor = $appLabel.ForeColor
+$script:NotifyPopupOriginalSessionForeColor = $sessionLabel.ForeColor
+$script:NotifyPopupOriginalTitleForeColor = $titleLabel.ForeColor
+$script:NotifyPopupOriginalBodyForeColor = $bodyLabel.ForeColor
+$script:NotifyPopupOriginalCloseForeColor = $closeLabel.ForeColor
 $script:NotifyPopupTargetNotificationId = $targetNotificationId
 $script:NotifyPopupTargetSnapshotId = $targetSnapshotId
 $script:NotifyPopupTargetRecoveryTicketId = $targetRecoveryTicketId
 $script:NotifyPopupRecoveryState = if ($targetOriginKind -eq 'pi-web' -and [string]::IsNullOrWhiteSpace($targetSnapshotId) -and -not [string]::IsNullOrWhiteSpace($targetRecoveryTicketId)) { 'recovering' } elseif ($targetOriginKind -eq 'pi-web' -and [string]::IsNullOrWhiteSpace($targetSnapshotId)) { 'unavailable' } else { 'ready' }
 $script:NotifyPopupExactWorker = $null
 $script:NotifyPopupActivateAfterResolve = $false
+$script:NotifyPopupTerminalState = $false
+$script:NotifyPopupTerminalOutcome = ''
+$script:NotifyPopupTerminalReason = ''
+$script:NotifyPopupCloseRequested = $false
+$script:NotifyPopupActivating = $false
 $script:NotifyPopupExactWorkerTimer = New-Object System.Windows.Forms.Timer
 $script:NotifyPopupExactWorkerTimer.Interval = 100
 $script:NotifyPopupExactWorkerTimer.Add_Tick({
     $worker = $script:NotifyPopupExactWorker
-    if ($null -eq $worker -or -not $worker.Async.IsCompleted) { return }
+    if ($null -eq $worker) { return }
+    $completionReady = if ($null -ne $worker.StopAsync) { $worker.StopAsync.IsCompleted } else { $worker.Async.IsCompleted }
+    if (-not $completionReady) { return }
+    $cancelReason = [string]$worker.CancelReason
     $result = $null
     try {
-        $rows = @($worker.PowerShell.EndInvoke($worker.Async))
-        if ($rows.Count -gt 0) { $result = $rows[-1] }
+        if ($null -ne $worker.StopAsync) { $worker.PowerShell.EndStop($worker.StopAsync) }
+        if ($worker.Async.IsCompleted) {
+            $rows = @($worker.PowerShell.EndInvoke($worker.Async))
+            if ($rows.Count -gt 0) { $result = $rows[-1] }
+        }
     }
     catch {
-        $result = [pscustomobject]@{ Decision = 'fail-closed'; Result = 'adapter-unavailable'; Reason = 'worker-error'; SnapshotId = '' }
+        if ([string]::IsNullOrWhiteSpace($cancelReason)) {
+            $result = [pscustomobject]@{ Decision = 'fail-closed'; Result = 'adapter-unavailable'; Reason = 'worker-error'; SnapshotId = '' }
+        }
     }
     finally {
         try { $worker.PowerShell.Dispose() } catch {}
@@ -1090,35 +1273,47 @@ $script:NotifyPopupExactWorkerTimer.Add_Tick({
         $script:NotifyPopupExactWorker = $null
         $this.Stop()
     }
+    if (-not [string]::IsNullOrWhiteSpace($cancelReason)) {
+        Write-NotifyPopupLog -Message ('popup-exact-worker-cancelled mode={0} reason={1} elapsedMs={2}' -f $worker.Mode, $cancelReason, [int]([DateTime]::UtcNow - $worker.StartedAtUtc).TotalMilliseconds)
+        if ($cancelReason -eq 'superseded-by-activation' -and $script:NotifyPopupActivateAfterResolve -and -not $script:NotifyPopupTerminalState) {
+            $script:NotifyPopupActivateAfterResolve = $false
+            [void](Start-NotifyPopupExactWorker -Mode 'activate')
+        }
+        return
+    }
     if ($null -eq $result) {
         $result = [pscustomobject]@{ Decision = 'fail-closed'; Result = 'adapter-unavailable'; Reason = 'worker-empty'; SnapshotId = '' }
     }
     Write-NotifyPopupLog -Message ('popup-exact-worker-complete mode={0} decision={1} result={2} reason={3} snapshotFp={4} elapsedMs={5}' -f $worker.Mode, $result.Decision, $result.Result, $(if ([string]::IsNullOrWhiteSpace([string]$result.Reason)) { 'none' } else { [string]$result.Reason }), (Get-NotifyRouteFingerprint -Value ([string]$result.SnapshotId)), [int]([DateTime]::UtcNow - $worker.StartedAtUtc).TotalMilliseconds)
+    if ($script:NotifyPopupTerminalState) { return }
     if ($worker.Mode -eq 'resolve') {
         if ($result.Decision -eq 'exact-ready' -and -not [string]::IsNullOrWhiteSpace([string]$result.SnapshotId)) {
             $script:NotifyPopupTargetSnapshotId = [string]$result.SnapshotId
-            Set-NotifyPopupRecoveryUiState -State 'ready'
             if ($script:NotifyPopupActivateAfterResolve) {
                 $script:NotifyPopupActivateAfterResolve = $false
-                if (-not (Start-NotifyPopupExactWorker -Mode 'activate')) {
-                    Set-NotifyPopupRecoveryUiState -State 'unavailable'
-                }
+                [void](Start-NotifyPopupExactWorker -Mode 'activate')
+            }
+            else {
+                Set-NotifyPopupRecoveryUiState -State 'ready'
             }
         }
         else {
-            Set-NotifyPopupRecoveryUiState -State 'unavailable'
+            [void](Complete-NotifyPopupLifecycle -Outcome 'failed' -Reason $(if ([string]::IsNullOrWhiteSpace([string]$result.Reason)) { 'resolve-failed' } else { [string]$result.Reason }))
         }
     }
+    elseif ($result.Decision -eq 'focused') {
+        [void](Complete-NotifyPopupLifecycle -Outcome 'focused' -Reason $(if ([string]::IsNullOrWhiteSpace([string]$result.Reason)) { 'background-proof-pending' } else { [string]$result.Reason }))
+    }
     elseif ($result.Decision -eq 'handled') {
-        $script:NotifyPopupForm.Close()
+        [void](Complete-NotifyPopupLifecycle -Outcome 'handled' -Reason $(if ([string]::IsNullOrWhiteSpace([string]$result.Result)) { 'activation-handled' } else { [string]$result.Result }))
     }
     else {
-        Set-NotifyPopupRecoveryUiState -State 'unavailable'
+        [void](Complete-NotifyPopupLifecycle -Outcome 'failed' -Reason $(if ([string]::IsNullOrWhiteSpace([string]$result.Reason)) { 'activation-failed' } else { [string]$result.Reason }))
     }
 })
 
 $activateAction = {
-    if ($script:NotifyPopupDidActivate) {
+    if ($script:NotifyPopupTerminalState -or $script:NotifyPopupDidActivate) {
         return
     }
     if ($targetOriginKind -eq 'pi-web') {
@@ -1126,22 +1321,18 @@ $activateAction = {
             Write-NotifyPopupLog -Message 'popup-click-ignored exact-route-unavailable'
             return
         }
-        $script:NotifyPopupDidActivate = $true
         Write-NotifyPopupLog -Message 'popup-click'
-        # An accepted exact-route click owns the popup lifetime. Do not let the
-        # display timeout or foreground watcher close the form and cancel its
-        # recovery/activation worker mid-flight; explicit close remains valid.
-        $timer.Stop()
-        $focusWatchTimer.Stop()
-        $script:NotifyPopupTitleLabel.Text = Get-NotifyPopupRecoveryUiText -Name 'recovering-title'
-        $script:NotifyPopupBodyLabel.Text = Get-NotifyPopupRecoveryUiText -Name 'recovering-body'
+        if (-not (Set-NotifyPopupActivating)) { return }
+        $script:NotifyPopupDidActivate = $true
         if ($null -ne $script:NotifyPopupExactWorker -and $script:NotifyPopupExactWorker.Mode -eq 'resolve') {
             $script:NotifyPopupActivateAfterResolve = $true
+            if (-not (Request-NotifyPopupExactWorkerStop -Reason 'superseded-by-activation')) {
+                $script:NotifyPopupActivateAfterResolve = $false
+                [void](Complete-NotifyPopupLifecycle -Outcome 'failed' -Reason 'activation-cancel-error')
+            }
         }
         else {
-            if (-not (Start-NotifyPopupExactWorker -Mode 'activate')) {
-                Set-NotifyPopupRecoveryUiState -State 'unavailable'
-            }
+            [void](Start-NotifyPopupExactWorker -Mode 'activate')
         }
         return
     }
@@ -1149,13 +1340,13 @@ $activateAction = {
     $script:shouldActivate = $true
     Write-NotifyPopupLog -Message 'popup-click'
     Write-NotifyPopupLog -Message ('popup-action activate targetFingerprint={0} originKind={1} notificationFp={2} snapshotFp={3}' -f (Get-NotifyPopupContextFingerprint -Value $targetHost), $(if ([string]::IsNullOrWhiteSpace($targetOriginKind)) { 'none' } else { $targetOriginKind }), (Get-NotifyRouteFingerprint -Value $targetNotificationId), (Get-NotifyRouteFingerprint -Value $targetSnapshotId))
-    $form.Close()
+    [void](Complete-NotifyPopupLifecycle -Outcome 'handled' -Reason 'legacy-activation-queued')
 }
 
 $closeAction = {
     Write-NotifyPopupLog -Message 'popup-close-button'
     Write-NotifyPopupLog -Message 'popup-action dismiss source="close-button"'
-    $form.Close()
+    [void](Complete-NotifyPopupLifecycle -Outcome 'dismissed' -Reason 'close-button')
 }
 
 foreach ($control in @($form, $panel, $appLabel, $sessionLabel, $titleLabel, $bodyLabel)) {
@@ -1164,22 +1355,21 @@ foreach ($control in @($form, $panel, $appLabel, $sessionLabel, $titleLabel, $bo
 $closeLabel.Add_Click($closeAction)
 
 $timer = New-Object System.Windows.Forms.Timer
+$script:NotifyPopupTimer = $timer
 $timer.Interval = [Math]::Max(3000, ($TimeoutSeconds * 1000))
 $timer.Add_Tick({
     Write-NotifyPopupLog -Message 'popup-timeout-close'
     Write-NotifyPopupLog -Message 'popup-action dismiss source="timeout"'
-    $timer.Stop()
-    $form.Close()
+    [void](Complete-NotifyPopupLifecycle -Outcome 'dismissed' -Reason 'timeout')
 })
 
 $focusWatchTimer = New-Object System.Windows.Forms.Timer
+$script:NotifyPopupFocusWatchTimer = $focusWatchTimer
 $focusWatchTimer.Interval = 800
 $focusWatchTimer.Add_Tick({
     if (Test-NotifyPopupDedupeSuperseded) {
         Write-NotifyPopupLog -Message 'popup-action dismiss source="dedupe-superseded"'
-        $focusWatchTimer.Stop()
-        $timer.Stop()
-        $form.Close()
+        [void](Complete-NotifyPopupLifecycle -Outcome 'dismissed' -Reason 'dedupe-superseded')
         return
     }
 
@@ -1189,10 +1379,22 @@ $focusWatchTimer.Add_Tick({
 
     if (Test-NotifyPopupForegroundTarget -CurrentDirBase $targetCwdBase -SourceTabTitleValue $targetSourceTabTitle) {
         Write-NotifyPopupLog -Message 'popup-action dismiss source="foreground-target"'
-        $focusWatchTimer.Stop()
-        $timer.Stop()
-        $form.Close()
+        [void](Complete-NotifyPopupLifecycle -Outcome 'dismissed' -Reason 'foreground-target')
     }
+})
+
+$script:NotifyPopupFailureCloseTimer = New-Object System.Windows.Forms.Timer
+$script:NotifyPopupFailureCloseTimer.Interval = $script:NotifyPopupFailureCloseDelayMs
+$script:NotifyPopupFailureCloseTimer.Add_Tick({
+    $this.Stop()
+    [void](Complete-NotifyPopupLifecycle -Outcome 'dismissed' -Reason 'failure-auto-close')
+})
+
+$script:NotifyPopupActivationWatchdogTimer = New-Object System.Windows.Forms.Timer
+$script:NotifyPopupActivationWatchdogTimer.Interval = $script:NotifyPopupReadyActivationWatchdogMs
+$script:NotifyPopupActivationWatchdogTimer.Add_Tick({
+    $this.Stop()
+    [void](Invoke-NotifyPopupActivationWatchdog)
 })
 
 function Get-NotifyPopupWorkingArea {
@@ -1238,26 +1440,37 @@ $form.Add_Shown({
         [void](Start-NotifyPopupExactWorker -Mode 'resolve')
     }
     elseif ($script:NotifyPopupRecoveryState -eq 'unavailable') {
-        Set-NotifyPopupRecoveryUiState -State 'unavailable'
+        [void](Complete-NotifyPopupLifecycle -Outcome 'failed' -Reason 'exact-route-unavailable')
     }
 })
 
 $form.Add_FormClosed({
+    $script:NotifyPopupCloseRequested = $true
+    if (-not $script:NotifyPopupTerminalState) {
+        $script:NotifyPopupTerminalState = $true
+        $script:NotifyPopupTerminalOutcome = 'dismissed'
+        $script:NotifyPopupTerminalReason = 'form-closed'
+    }
     Write-NotifyPopupLog -Message ('popup-closed shouldActivate={0}' -f $shouldActivate)
     Remove-NotifyPopupLiveState
     try {
+        if ($null -ne $script:NotifyPopupExactWorker) {
+            # FormClosed runs on the UI thread. Signal cancellation, then let
+            # process teardown reclaim the runspace instead of synchronously
+            # waiting in Stop/Dispose/Close while the popup is trying to exit.
+            [void](Request-NotifyPopupExactWorkerStop -Reason 'popup-closed')
+            $script:NotifyPopupExactWorker = $null
+        }
         $timer.Stop()
         $timer.Dispose()
         $focusWatchTimer.Stop()
         $focusWatchTimer.Dispose()
+        $script:NotifyPopupFailureCloseTimer.Stop()
+        $script:NotifyPopupFailureCloseTimer.Dispose()
+        $script:NotifyPopupActivationWatchdogTimer.Stop()
+        $script:NotifyPopupActivationWatchdogTimer.Dispose()
         $script:NotifyPopupExactWorkerTimer.Stop()
         $script:NotifyPopupExactWorkerTimer.Dispose()
-        if ($null -ne $script:NotifyPopupExactWorker) {
-            try { $script:NotifyPopupExactWorker.PowerShell.Stop() } catch {}
-            try { $script:NotifyPopupExactWorker.PowerShell.Dispose() } catch {}
-            try { $script:NotifyPopupExactWorker.Runspace.Close(); $script:NotifyPopupExactWorker.Runspace.Dispose() } catch {}
-            $script:NotifyPopupExactWorker = $null
-        }
         if ($null -ne $script:NotifyPopupWallpaperImage) {
             $script:NotifyPopupWallpaperImage.Dispose()
             $script:NotifyPopupWallpaperImage = $null

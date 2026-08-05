@@ -171,6 +171,15 @@ public sealed class PendingActivation
     /// <summary>Bounded by the activation deadline; diagnostic only.</summary>
     public int DeliveryAttempts { get; set; }
 
+    /// <summary>
+    /// Latest trusted non-terminal progress. It is deliberately independent
+    /// from delivery leases, deadlines, binding authority, and final results.
+    /// </summary>
+    public string? ActivationPhase { get; set; }
+
+    /// <summary>Host clock of the first accepted report for ActivationPhase.</summary>
+    public long? ActivationProgressAtMs { get; set; }
+
     /// <summary>True after a terminal result is recorded (activate-result, timeout, stale, etc.).</summary>
     public bool Completed { get; set; }
 

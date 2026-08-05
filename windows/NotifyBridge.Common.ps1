@@ -1337,6 +1337,7 @@ function Invoke-NotifyRouteHostClient {
         [int]$TimeoutMs = 8000,
         $Config = $null,
         [string]$ExePath = '',
+        [switch]$ReturnOnProgress,
         [int]$RetryAttempt = 0
     )
 
@@ -1344,7 +1345,7 @@ function Invoke-NotifyRouteHostClient {
     $typeFp = Get-NotifyRouteFingerprint -Value $typeName
 
     if ($script:NotifyRouteHostClientMock -is [scriptblock]) {
-        return & $script:NotifyRouteHostClientMock $Request $WaitMs
+        return & $script:NotifyRouteHostClientMock $Request $WaitMs $ReturnOnProgress.IsPresent
     }
 
     $exe = if (-not [string]::IsNullOrWhiteSpace($ExePath)) { $ExePath.Trim() } else { Get-NotifyRouteHostExe -Config $Config }
@@ -1356,6 +1357,7 @@ function Invoke-NotifyRouteHostClient {
             Reason              = 'route-host-missing'
             SnapshotId          = ''
             ActivationRequestId = ''
+            ActivationPhase     = ''
             RawLength           = 0
             TypeFingerprint     = $typeFp
         }
@@ -1372,6 +1374,7 @@ function Invoke-NotifyRouteHostClient {
                 Reason              = 'empty-request'
                 SnapshotId          = ''
                 ActivationRequestId = ''
+                ActivationPhase     = ''
                 RawLength           = 0
                 TypeFingerprint     = $typeFp
             }
@@ -1385,6 +1388,7 @@ function Invoke-NotifyRouteHostClient {
                 Reason              = 'oversized'
                 SnapshotId          = ''
                 ActivationRequestId = ''
+                ActivationPhase     = ''
                 RawLength           = $jsonBytes
                 TypeFingerprint     = $typeFp
             }
@@ -1396,6 +1400,9 @@ function Invoke-NotifyRouteHostClient {
         $argList = @('--client', '--json', $tempPath)
         if ($WaitMs -gt 0) {
             $argList += @('--wait-ms', ([string][int]$WaitMs))
+        }
+        if ($ReturnOnProgress.IsPresent) {
+            $argList += '--return-on-progress'
         }
 
         $psi = [System.Diagnostics.ProcessStartInfo]::new()
@@ -1425,6 +1432,7 @@ function Invoke-NotifyRouteHostClient {
                 Reason              = 'client-timeout'
                 SnapshotId          = ''
                 ActivationRequestId = ''
+                ActivationPhase     = ''
                 RawLength           = 0
                 TypeFingerprint     = $typeFp
             }
@@ -1455,6 +1463,7 @@ function Invoke-NotifyRouteHostClient {
         $snapshotId = ''
         $recoveryTicketId = ''
         $activationRequestId = ''
+        $activationPhase = ''
         $rawLen = if ($null -eq $stdout) { 0 } else { $stdout.Length }
 
         if (-not [string]::IsNullOrWhiteSpace($stdout)) {
@@ -1479,6 +1488,9 @@ function Invoke-NotifyRouteHostClient {
                 if ($parsed.PSObject.Properties['activationRequestId'] -and -not [string]::IsNullOrWhiteSpace([string]$parsed.activationRequestId)) {
                     $activationRequestId = ([string]$parsed.activationRequestId).Trim()
                 }
+                if ($parsed.PSObject.Properties['activationPhase'] -and -not [string]::IsNullOrWhiteSpace([string]$parsed.activationPhase)) {
+                    $activationPhase = ([string]$parsed.activationPhase).Trim()
+                }
             }
             catch {
                 $result = 'rejected'
@@ -1494,6 +1506,7 @@ function Invoke-NotifyRouteHostClient {
                     -TimeoutMs $TimeoutMs `
                     -Config $Config `
                     -ExePath $ExePath `
+                    -ReturnOnProgress:$ReturnOnProgress.IsPresent `
                     -RetryAttempt ($RetryAttempt + 1)
             }
             $result = 'adapter-unavailable'
@@ -1515,6 +1528,7 @@ function Invoke-NotifyRouteHostClient {
             SnapshotId          = $snapshotId
             RecoveryTicketId    = $recoveryTicketId
             ActivationRequestId = $activationRequestId
+            ActivationPhase     = $activationPhase
             RawLength           = $rawLen
             TypeFingerprint     = $typeFp
         }
@@ -1528,6 +1542,7 @@ function Invoke-NotifyRouteHostClient {
             SnapshotId          = ''
             RecoveryTicketId    = ''
             ActivationRequestId = ''
+            ActivationPhase     = ''
             RawLength           = 0
             TypeFingerprint     = $typeFp
         }
@@ -1651,12 +1666,28 @@ function Get-NotifyRouteActivateDecision {
     $resultName = if ($ClientResult.PSObject.Properties['Result']) { [string]$ClientResult.Result } else { '' }
     $reason = if ($ClientResult.PSObject.Properties['Reason']) { [string]$ClientResult.Reason } else { '' }
     $available = if ($ClientResult.PSObject.Properties['Available']) { [bool]$ClientResult.Available } else { $false }
+    $returnedSnapshotId = if ($ClientResult.PSObject.Properties['SnapshotId']) { [string]$ClientResult.SnapshotId } else { '' }
+    $activationRequestId = if ($ClientResult.PSObject.Properties['ActivationRequestId']) { [string]$ClientResult.ActivationRequestId } else { '' }
+    $activationPhase = if ($ClientResult.PSObject.Properties['ActivationPhase']) { [string]$ClientResult.ActivationPhase } else { '' }
 
     if (-not $available -or $resultName -eq 'adapter-unavailable' -or $reason -in @('route-host-missing', 'client-error', 'empty-response')) {
         return [pscustomobject]@{
             Decision = 'fail-closed'
             Result   = if ($resultName) { $resultName } else { 'adapter-unavailable' }
             Reason   = if ($reason) { $reason } else { 'adapter-unavailable' }
+        }
+    }
+
+    if ($resultName -eq 'pending' -and
+        $activationPhase -eq 'desktop-row-focused-awaiting-proof' -and
+        $returnedSnapshotId -eq $SnapshotId -and
+        $activationRequestId -match '^[A-Za-z0-9._-]{8,128}$') {
+        return [pscustomobject]@{
+            Decision            = 'focused'
+            Result              = 'pending'
+            Reason              = 'background-proof-pending'
+            ActivationPhase     = $activationPhase
+            ActivationRequestId = $activationRequestId
         }
     }
 
@@ -1839,8 +1870,8 @@ function Invoke-NotifyExactRouteRecoveryAndActivate {
         [string]$RecoveryTicketId = '',
         $Config = $null,
         [int]$RecoveryWaitMs = 125000,
-        [int]$ActivateWaitMs = 15000,
-        [int]$ActivateTimeoutMs = 18000
+        [int]$ActivateWaitMs = 45000,
+        [int]$ActivateTimeoutMs = 48000
     )
 
     $resolvedSnapshotId = $SnapshotId
@@ -1878,8 +1909,8 @@ function Invoke-NotifyExactRouteActivate {
         [Parameter(Mandatory = $true)][string]$NotificationId,
         [Parameter(Mandatory = $true)][string]$SnapshotId,
         $Config = $null,
-        [int]$WaitMs = 5000,
-        [int]$TimeoutMs = 8000
+        [int]$WaitMs = 45000,
+        [int]$TimeoutMs = 48000
     )
 
     $now = Get-NotifyUnixTimeMilliseconds
@@ -1888,11 +1919,13 @@ function Invoke-NotifyExactRouteActivate {
         snapshotId     = $SnapshotId
         deadlineMs     = ($now + [Math]::Max(500, $WaitMs))
     }
-    $envelope = New-NotifyRouteRequestEnvelope -Type 'activate' -Fields $fields -TtlMs ([Math]::Max(5000, $WaitMs + 1000))
+    # Transport freshness stays short even though the accepted activation may
+    # execute against its independent, longer deadline.
+    $envelope = New-NotifyRouteRequestEnvelope -Type 'activate' -Fields $fields -TtlMs 5000
     $request = @{}
     foreach ($k in $envelope.Keys) { $request[$k] = $envelope[$k] }
 
-    $clientResult = Invoke-NotifyRouteHostClient -Request $request -WaitMs $WaitMs -TimeoutMs $TimeoutMs -Config $Config
+    $clientResult = Invoke-NotifyRouteHostClient -Request $request -WaitMs $WaitMs -TimeoutMs $TimeoutMs -Config $Config -ReturnOnProgress
     return [pscustomobject]@{
         ClientResult = $clientResult
         Decision     = (Get-NotifyRouteActivateDecision -OriginKind 'pi-web' -NotificationId $NotificationId -SnapshotId $SnapshotId -ClientResult $clientResult)

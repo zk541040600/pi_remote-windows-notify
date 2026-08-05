@@ -91,7 +91,10 @@ public sealed class RouteDispatcher
                 return _state.RememberActivateResponse(msg, completed);
             }
 
-            cts.CancelAfter(TimeSpan.FromMilliseconds(Math.Min(remaining, ProtocolConstants.MaxRequestTtlMs)));
+            cts.CancelAfter(TimeSpan.FromMilliseconds(
+                Math.Min(
+                    remaining,
+                    ProtocolConstants.MaxActivationExecutionMs)));
             adapterResult = await adapter.Activator.ActivateAsync(request, cts.Token).ConfigureAwait(false);
         }
         catch (OperationCanceledException)

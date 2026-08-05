@@ -68,6 +68,10 @@ public sealed class RouteStateMachine
         {
             var clockError = ObserveRequestNow_NoLock(
                 msg.RequestId,
+                completeExpiredActivations: !string.Equals(
+                    msg.Type,
+                    MessageTypes.ActivateProgress,
+                    StringComparison.Ordinal),
                 out var now);
             if (clockError is not null)
             {
@@ -112,6 +116,7 @@ public sealed class RouteStateMachine
                 // Activate is normally dispatched via RouteDispatcher (enqueue/in-process).
                 // Direct Handle path still enqueues for external adapters for consistency.
                 MessageTypes.Activate => HandleActivateEnqueue_NoLock(msg, now),
+                MessageTypes.ActivateProgress => HandleActivateProgress_NoLock(msg, now),
                 MessageTypes.ActivateResult => HandleActivateResult_NoLock(msg, now),
                 MessageTypes.PollActivation => HandlePollActivation_NoLock(msg, now),
                 MessageTypes.ActivationStatus => HandleActivationStatus_NoLock(msg, now),
@@ -133,6 +138,7 @@ public sealed class RouteStateMachine
         {
             var clockError = ObserveRequestNow_NoLock(
                 requestId,
+                completeExpiredActivations: true,
                 out var now);
             if (clockError is not null)
             {
@@ -237,6 +243,7 @@ public sealed class RouteStateMachine
         {
             var clockError = ObserveRequestNow_NoLock(
                 msg.RequestId,
+                completeExpiredActivations: true,
                 out var now);
             if (clockError is not null)
             {
@@ -295,6 +302,7 @@ public sealed class RouteStateMachine
         {
             var clockError = ObserveRequestNow_NoLock(
                 msg.RequestId,
+                completeExpiredActivations: true,
                 out var now);
             if (clockError is not null)
             {
@@ -1800,6 +1808,211 @@ public sealed class RouteStateMachine
         };
     }
 
+    private RouteResponse HandleActivateProgress_NoLock(RouteMessage msg, long now)
+    {
+        var activationRequestId = msg.ActivationRequestId;
+        if (string.IsNullOrWhiteSpace(activationRequestId) ||
+            string.IsNullOrWhiteSpace(msg.NotificationId) ||
+            string.IsNullOrWhiteSpace(msg.SnapshotId) ||
+            string.IsNullOrWhiteSpace(msg.ActivationPhase))
+        {
+            return RouteResponse.Reject(
+                msg.RequestId,
+                RouteResults.Rejected,
+                RejectReasons.MissingField);
+        }
+
+        if (!MessageValidator.IsOpaqueId(activationRequestId) ||
+            !MessageValidator.IsOpaqueId(msg.NotificationId) ||
+            !MessageValidator.IsOpaqueId(msg.SnapshotId) ||
+            !ProtocolConstants.AllowedActivationPhases.Contains(msg.ActivationPhase) ||
+            msg.ElapsedMs is < 0 ||
+            msg.Result is not null ||
+            msg.Reason is not null ||
+            msg.DeadlineMs is not null)
+        {
+            return RouteResponse.Reject(
+                msg.RequestId,
+                RouteResults.Rejected,
+                RejectReasons.InvalidField);
+        }
+
+        if (!_activations.TryGetValue(activationRequestId, out var pending))
+        {
+            return RouteResponse.Reject(
+                msg.RequestId,
+                RouteResults.Stale,
+                RejectReasons.ActivationUnknown);
+        }
+
+        if (!string.Equals(
+                pending.AdapterKey,
+                msg.AdapterKey,
+                StringComparison.Ordinal))
+        {
+            return RouteResponse.Reject(
+                msg.RequestId,
+                RouteResults.Rejected,
+                RejectReasons.WrongAdapter);
+        }
+
+        if (!string.Equals(
+                pending.AdapterGeneration,
+                msg.AdapterGeneration,
+                StringComparison.Ordinal))
+        {
+            return RejectAdapterGeneration_NoLock(msg.RequestId);
+        }
+
+        // Progress authority is the immutable command handed out by
+        // poll-activation. Every supplied correlation field must still name
+        // that command; none of these fields may retarget it.
+        if (!string.Equals(
+                pending.NotificationId,
+                msg.NotificationId,
+                StringComparison.Ordinal) ||
+            !string.Equals(
+                pending.SnapshotId,
+                msg.SnapshotId,
+                StringComparison.Ordinal) ||
+            (msg.OwnerKey is not null &&
+             !string.Equals(pending.OwnerKey, msg.OwnerKey, StringComparison.Ordinal)) ||
+            (msg.PageKey is not null &&
+             !string.Equals(pending.PageKey, msg.PageKey, StringComparison.Ordinal)) ||
+            (msg.InstanceKey is not null &&
+             !string.Equals(pending.InstanceKey, msg.InstanceKey, StringComparison.Ordinal)) ||
+            (msg.RoutingKey is not null &&
+             !string.Equals(pending.RoutingKey, msg.RoutingKey, StringComparison.Ordinal)) ||
+            (msg.PageFingerprint is not null &&
+             !string.Equals(
+                 pending.PageFingerprint,
+                 msg.PageFingerprint,
+                 StringComparison.Ordinal)))
+        {
+            return RouteResponse.Reject(
+                msg.RequestId,
+                RouteResults.Rejected,
+                RejectReasons.SnapshotMismatch);
+        }
+
+        if (!string.Equals(
+                pending.AdapterKind,
+                "pi-web-desktop",
+                StringComparison.OrdinalIgnoreCase) ||
+            (msg.AdapterKind is not null &&
+             !string.Equals(
+                 pending.AdapterKind,
+                 msg.AdapterKind,
+                 StringComparison.OrdinalIgnoreCase)))
+        {
+            return RouteResponse.Reject(
+                msg.RequestId,
+                RouteResults.Rejected,
+                RejectReasons.WrongAdapter);
+        }
+
+        if (pending.Completed)
+        {
+            return new RouteResponse
+            {
+                RequestId = msg.RequestId,
+                Result = pending.FinalResult ?? RouteResults.Stale,
+                Reason = pending.FinalReason ?? RejectReasons.Replay,
+                SnapshotId = pending.SnapshotId,
+                ActivationRequestId = pending.ActivationRequestId,
+                AdapterKind = pending.AdapterKind,
+                OwnerFingerprint = SafeLog.OwnerFp(pending.OwnerKey),
+                RoutingFingerprint = RoutingKey.Fingerprint(pending.RoutingKey),
+                InstanceFingerprint = RoutingKey.FingerprintInstance(pending.InstanceKey),
+                ElapsedMs = pending.ElapsedMs,
+            };
+        }
+
+        // Progress is advisory. Expiry and stale-target observations are
+        // returned without completing, dequeuing, rebinding, or extending the
+        // pending activation; the normal poll/status/result paths remain the
+        // only terminal state transitions.
+        if (pending.ExpiresAtMs < now || pending.DeadlineMs < now)
+        {
+            return new RouteResponse
+            {
+                RequestId = msg.RequestId,
+                Result = RouteResults.Timeout,
+                Reason = RejectReasons.Expired,
+                SnapshotId = pending.SnapshotId,
+                ActivationRequestId = pending.ActivationRequestId,
+                AdapterKind = pending.AdapterKind,
+            };
+        }
+
+        if (!pending.Delivered)
+        {
+            return new RouteResponse
+            {
+                RequestId = msg.RequestId,
+                Result = RouteResults.Rejected,
+                Reason = RejectReasons.PendingAdapterDelivery,
+                SnapshotId = pending.SnapshotId,
+                ActivationRequestId = pending.ActivationRequestId,
+                AdapterKind = pending.AdapterKind,
+            };
+        }
+
+        var revalidation = RevalidatePendingTarget_NoLock(pending, now);
+        if (revalidation is not null)
+        {
+            return new RouteResponse
+            {
+                RequestId = msg.RequestId,
+                Result = revalidation.Result,
+                Reason = revalidation.Reason,
+                SnapshotId = pending.SnapshotId,
+                ActivationRequestId = pending.ActivationRequestId,
+                AdapterKind = pending.AdapterKind,
+                OwnerFingerprint = SafeLog.OwnerFp(pending.OwnerKey),
+                RoutingFingerprint = RoutingKey.Fingerprint(pending.RoutingKey),
+                InstanceFingerprint = RoutingKey.FingerprintInstance(pending.InstanceKey),
+            };
+        }
+
+        if (pending.ActivationPhase is not null &&
+            !string.Equals(
+                pending.ActivationPhase,
+                msg.ActivationPhase,
+                StringComparison.Ordinal))
+        {
+            return RouteResponse.Reject(
+                msg.RequestId,
+                RouteResults.Rejected,
+                RejectReasons.InvalidField);
+        }
+
+        // Idempotent duplicate reports retain the first host timestamp.
+        pending.ActivationPhase ??= msg.ActivationPhase;
+        pending.ActivationProgressAtMs ??= now;
+
+        SafeLog.Info("activate-progress",
+            ("phase", pending.ActivationPhase),
+            ("adapterKind", pending.AdapterKind),
+            ("routeFp", RoutingKey.Fingerprint(pending.RoutingKey)),
+            ("ownerFp", SafeLog.OwnerFp(pending.OwnerKey)));
+
+        return new RouteResponse
+        {
+            RequestId = msg.RequestId,
+            Result = RouteResults.Pending,
+            Reason = "delivered-awaiting-result",
+            SnapshotId = pending.SnapshotId,
+            ActivationRequestId = pending.ActivationRequestId,
+            ActivationPhase = pending.ActivationPhase,
+            AdapterKind = pending.AdapterKind,
+            OwnerFingerprint = SafeLog.OwnerFp(pending.OwnerKey),
+            RoutingFingerprint = RoutingKey.Fingerprint(pending.RoutingKey),
+            InstanceFingerprint = RoutingKey.FingerprintInstance(pending.InstanceKey),
+            ElapsedMs = msg.ElapsedMs,
+        };
+    }
+
     private RouteResponse HandleActivateResult_NoLock(RouteMessage msg, long now)
     {
         var activationRequestId = msg.ActivationRequestId ?? msg.RequestId;
@@ -2114,6 +2327,7 @@ public sealed class RouteStateMachine
             Reason = pending.Delivered ? "delivered-awaiting-result" : RejectReasons.PendingAdapterDelivery,
             SnapshotId = pending.SnapshotId,
             ActivationRequestId = pending.ActivationRequestId,
+            ActivationPhase = pending.ActivationPhase,
             AdapterKind = pending.AdapterKind,
             OwnerFingerprint = SafeLog.OwnerFp(pending.OwnerKey),
             RoutingFingerprint = RoutingKey.Fingerprint(pending.RoutingKey),
@@ -2131,6 +2345,7 @@ public sealed class RouteStateMachine
         {
             var clockError = ObserveRequestNow_NoLock(
                 msg.RequestId,
+                completeExpiredActivations: true,
                 out var now);
             if (clockError is not null)
             {
@@ -2305,8 +2520,9 @@ public sealed class RouteStateMachine
             ? d
             : now + ProtocolConstants.DefaultRequestTtlMs;
 
-        // Cap deadline to MaxRequestTtlMs from now for fail-closed bounded wait.
-        var maxDeadline = now + ProtocolConstants.MaxRequestTtlMs;
+        // Activation execution may outlive its short transport envelope, but
+        // remains independently bounded and fail-closed.
+        var maxDeadline = now + ProtocolConstants.MaxActivationExecutionMs;
         if (deadline > maxDeadline)
         {
             deadline = maxDeadline;
@@ -2344,6 +2560,8 @@ public sealed class RouteStateMachine
             Delivered = false,
             DeliveredAtMs = null,
             DeliveryAttempts = 0,
+            ActivationPhase = null,
+            ActivationProgressAtMs = null,
             Completed = false,
         };
 
@@ -2690,6 +2908,7 @@ public sealed class RouteStateMachine
 
     private RouteResponse? ObserveRequestNow_NoLock(
         string requestId,
+        bool completeExpiredActivations,
         out long now)
     {
         now = _clock.UtcNowMs;
@@ -2701,11 +2920,13 @@ public sealed class RouteStateMachine
                 RejectReasons.BindingPersistFailed);
         }
 
-        SweepExpired_NoLock(now);
+        SweepExpired_NoLock(now, completeExpiredActivations);
         return null;
     }
 
-    private void SweepExpired_NoLock(long now)
+    private void SweepExpired_NoLock(
+        long now,
+        bool completeExpiredActivations = true)
     {
         if (now < _lastObservedUtcMs &&
             (decimal)_lastObservedUtcMs - now >
@@ -2790,10 +3011,14 @@ public sealed class RouteStateMachine
             _replay.Remove(key);
         }
 
-        // Timeout open activations past deadline; drop fully expired completed records.
+        // Timeout open activations past deadline; drop fully expired completed
+        // records. activate-progress deliberately observes expiry without
+        // owning this terminal transition.
         foreach (var pending in _activations.Values.ToList())
         {
-            if (!pending.Completed && (pending.DeadlineMs < now || pending.ExpiresAtMs < now))
+            if (completeExpiredActivations &&
+                !pending.Completed &&
+                (pending.DeadlineMs < now || pending.ExpiresAtMs < now))
             {
                 CompleteActivation_NoLock(pending, RouteResults.Timeout, RejectReasons.Expired, null, now);
             }

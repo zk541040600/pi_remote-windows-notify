@@ -56,7 +56,8 @@ public static class MessageValidator
             Exceeds(msg.InstanceKey) || Exceeds(msg.RoutingKey) || Exceeds(msg.NotificationId) ||
             Exceeds(msg.SnapshotId) || Exceeds(msg.RecoveryTicketId) ||
             Exceeds(msg.ProfileKey) || Exceeds(msg.PageFingerprint) ||
-            Exceeds(msg.ActivationRequestId) || Exceeds(msg.OpenEventId))
+            Exceeds(msg.ActivationRequestId) || Exceeds(msg.ActivationPhase) ||
+            Exceeds(msg.OpenEventId))
         {
             return RouteResponse.Reject(msg.RequestId, RouteResults.Rejected, RejectReasons.InvalidField);
         }
@@ -162,6 +163,18 @@ public static class MessageValidator
             !string.Equals(
                 msg.Type,
                 MessageTypes.RegisterOwner,
+                StringComparison.Ordinal))
+        {
+            return RouteResponse.Reject(
+                msg.RequestId,
+                RouteResults.Rejected,
+                RejectReasons.InvalidField);
+        }
+
+        if (msg.ActivationPhase is not null &&
+            !string.Equals(
+                msg.Type,
+                MessageTypes.ActivateProgress,
                 StringComparison.Ordinal))
         {
             return RouteResponse.Reject(
