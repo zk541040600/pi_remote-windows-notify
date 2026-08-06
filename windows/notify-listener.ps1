@@ -427,17 +427,19 @@ function Save-NotifyToastActivationState {
         [string]$OriginKind = '',
         [string]$NotificationId = '',
         [string]$SnapshotId = '',
-        [string]$RecoveryTicketId = ''
+        [string]$RecoveryTicketId = '',
+        [int]$TtlSeconds = 600
     )
 
     try {
+        $ttl = [Math]::Max(3, [Math]::Min(1800, $TtlSeconds))
         $logDirs = @((Get-NotifyBridgeLogDir), (Join-Path (Get-NotifyBridgeDefaultBaseDir) 'logs')) | Select-Object -Unique
         $payload = @{
             activationId   = $ActivationId
             protectedHost  = Protect-NotifyActivationValue -Value $FocusTarget
             protectedCwd   = Protect-NotifyActivationValue -Value $CwdBase
             protectedTab   = Protect-NotifyActivationValue -Value $TabTitle
-            expiresAtTicks = [DateTime]::UtcNow.AddMinutes(10).Ticks
+            expiresAtTicks = [DateTime]::UtcNow.AddSeconds($ttl).Ticks
         }
         # Exact-route handles only: never store raw session/instance/routing keys.
         if (-not [string]::IsNullOrWhiteSpace($OriginKind)) {
@@ -456,9 +458,25 @@ function Save-NotifyToastActivationState {
         foreach ($logDir in $logDirs) {
             New-Item -ItemType Directory -Force -Path $logDir | Out-Null
             foreach ($item in @(Get-ChildItem -LiteralPath $logDir -Filter 'activation-*.json' -File -ErrorAction SilentlyContinue)) {
-                if ($item.LastWriteTime -lt (Get-Date).AddMinutes(-10)) {
-                    Remove-Item -LiteralPath $item.FullName -Force -ErrorAction SilentlyContinue
+                $remove = $item.LastWriteTime -lt (Get-Date).AddMinutes(-30)
+                if (-not $remove) {
+                    try {
+                        $existing = [System.IO.File]::ReadAllText($item.FullName, [System.Text.UTF8Encoding]::new($false)) | ConvertFrom-Json
+                        $existingExpiry = [int64]0
+                        if ($existing.PSObject.Properties['expiresAtTicks']) {
+                            [void][int64]::TryParse([string]$existing.expiresAtTicks, [ref]$existingExpiry)
+                        }
+                        $remove = $existingExpiry -le [DateTime]::UtcNow.Ticks
+                    }
+                    catch { $remove = $true }
                 }
+                if ($remove) { Remove-Item -LiteralPath $item.FullName -Force -ErrorAction SilentlyContinue }
+            }
+            # Reserve one slot so toast pointer files stay bounded with the timer list.
+            $remaining = @(Get-ChildItem -LiteralPath $logDir -Filter 'activation-*.json' -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime)
+            while ($remaining.Count -gt 95) {
+                Remove-Item -LiteralPath $remaining[0].FullName -Force -ErrorAction SilentlyContinue
+                $remaining = @($remaining | Select-Object -Skip 1)
             }
             $path = Join-Path $logDir ('activation-{0}.json' -f $ActivationId)
             [System.IO.File]::WriteAllText($path, ($payload | ConvertTo-Json -Depth 4), [System.Text.UTF8Encoding]::new($false))
@@ -467,7 +485,7 @@ function Save-NotifyToastActivationState {
         $cleanupTimer = [System.Threading.Timer]::new([System.Threading.TimerCallback]{
             param($state)
             foreach ($path in @($state)) { try { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue } catch {} }
-        }, @($writtenPaths), [TimeSpan]::FromMinutes(10), [System.Threading.Timeout]::InfiniteTimeSpan)
+        }, @($writtenPaths), [TimeSpan]::FromSeconds($ttl), [System.Threading.Timeout]::InfiniteTimeSpan)
         [void]$script:NotifyActivationCleanupTimers.Add($cleanupTimer)
         while ($script:NotifyActivationCleanupTimers.Count -gt 96) {
             try { $script:NotifyActivationCleanupTimers[0].Dispose() } catch {}
@@ -476,7 +494,7 @@ function Save-NotifyToastActivationState {
         return @($writtenPaths)
     }
     catch {
-        Write-NotifyListenerLog -Message ('activation-cache-write-error "{0}"' -f $_.Exception.Message)
+        Write-NotifyListenerLog -Message ('activation-cache-write-error reason={0}' -f $_.Exception.GetType().Name)
     }
 }
 
@@ -659,10 +677,15 @@ function Get-NotifyPopupProcesses {
 function Get-NotifyPopupStackPlan {
     param(
         [Parameter(Mandatory = $true)]
-        [string]$TargetKey
+        [string]$TargetKey,
+        [string]$TargetFingerprint = ''
     )
 
-    $targetFingerprint = Get-NotifyPopupTargetFingerprint -TargetKey $TargetKey
+    $targetFingerprint = if ([string]::IsNullOrWhiteSpace($TargetFingerprint)) {
+        Get-NotifyPopupTargetFingerprint -TargetKey $TargetKey
+    } else {
+        $TargetFingerprint
+    }
     $usedSlots = @{}
     $reuseSlot = -1
     foreach ($popup in Get-NotifyPopupProcesses) {
@@ -722,12 +745,15 @@ function Test-NotifyDuplicateDrop {
         [string]$Body,
         [string]$FocusTarget,
         [string]$CwdBase,
-        [string]$TabTitle
+        [string]$TabTitle,
+        [string]$OriginKind = '',
+        [switch]$CheckOnly
     )
 
     $now = Get-Date
     $precise = -not [string]::IsNullOrWhiteSpace($CwdBase) -or -not [string]::IsNullOrWhiteSpace($TabTitle)
-    $signature = ('{0}`n{1}`n{2}' -f ([string]$FocusTarget).Trim().ToLowerInvariant(), $Title.Trim(), $Body.Trim())
+    $originPart = if ([string]::IsNullOrWhiteSpace($OriginKind)) { 'none' } else { $OriginKind.Trim().ToLowerInvariant() }
+    $signature = ('{0}`n{1}`n{2}`n{3}' -f $originPart, ([string]$FocusTarget).Trim().ToLowerInvariant(), $Title.Trim(), $Body.Trim())
     $script:NotifyRecentNotifications = @($script:NotifyRecentNotifications | Where-Object { ($now - $_.Time).TotalSeconds -lt 5 })
     $matches = @($script:NotifyRecentNotifications | Where-Object { $_.Signature -eq $signature })
 
@@ -741,10 +767,12 @@ function Test-NotifyDuplicateDrop {
         Stop-NotifyPopupTarget -TargetKey $hostKey -Reason 'dedupe-precise-arrived'
     }
 
-    $script:NotifyRecentNotifications += [pscustomobject]@{
-        Time      = $now
-        Signature = $signature
-        Precise   = $precise
+    if (-not $CheckOnly) {
+        $script:NotifyRecentNotifications += [pscustomobject]@{
+            Time      = $now
+            Signature = $signature
+            Precise   = $precise
+        }
     }
     return $false
 }
@@ -1036,7 +1064,8 @@ function Show-Toast {
         [string]$OriginKind = '',
         [string]$NotificationId = '',
         [string]$SnapshotId = '',
-        [string]$RecoveryTicketId = ''
+        [string]$RecoveryTicketId = '',
+        [string]$TargetFingerprint = ''
     )
 
     if (-not [string]::IsNullOrWhiteSpace($TestDesktopSinkPath)) {
@@ -1046,25 +1075,29 @@ function Show-Toast {
         return
     }
 
-    $focusTarget = if ([string]::IsNullOrWhiteSpace($FocusTarget)) { [string]$config.RemoteHostAlias } else { [string]$FocusTarget }
+    $originKind = if ([string]::IsNullOrWhiteSpace($OriginKind)) { '' } else { [string]$OriginKind }
+    $focusTarget = if ($originKind -eq 'paseo') { '' } elseif ([string]::IsNullOrWhiteSpace($FocusTarget)) { [string]$config.RemoteHostAlias } else { [string]$FocusTarget }
     $cwdBase = if ([string]::IsNullOrWhiteSpace($CwdBase)) { '' } else { [string]$CwdBase }
     $tabTitle = if ([string]::IsNullOrWhiteSpace($TabTitle)) { '' } else { [string]$TabTitle }
-    $sessionName = if ([string]::IsNullOrWhiteSpace($SessionName)) { '' } else { [string]$SessionName }
-    $originKind = if ([string]::IsNullOrWhiteSpace($OriginKind)) { '' } else { [string]$OriginKind }
+    $sessionName = if ($originKind -eq 'paseo' -or [string]::IsNullOrWhiteSpace($SessionName)) { '' } else { [string]$SessionName }
     $notificationId = if ([string]::IsNullOrWhiteSpace($NotificationId)) { '' } else { [string]$NotificationId }
     $snapshotId = if ([string]::IsNullOrWhiteSpace($SnapshotId)) { '' } else { [string]$SnapshotId }
     $recoveryTicketId = if ([string]::IsNullOrWhiteSpace($RecoveryTicketId)) { '' } else { [string]$RecoveryTicketId }
 
     if ($DisplayMode -eq 'popup-focus' -and (Test-Path -LiteralPath $script:NotifyPopupScript)) {
         $targetKey = Get-NotifyPopupTargetKey -TargetHost $focusTarget -CwdBase $cwdBase -TabTitle $tabTitle
-        $targetFingerprint = Get-NotifyPopupTargetFingerprint -TargetKey $targetKey
+        $targetFingerprint = if (-not [string]::IsNullOrWhiteSpace($TargetFingerprint)) {
+            [string]$TargetFingerprint
+        } else {
+            Get-NotifyPopupTargetFingerprint -TargetKey $targetKey
+        }
 
         $brokerSent = Invoke-NotifyBrokerPopup -Title $Title -Body $Body -FocusTarget $focusTarget -CwdBase $cwdBase -TabTitle $tabTitle -SessionName $sessionName -TargetFingerprint $targetFingerprint -StackIndex -1 -TimeoutSeconds $PopupTimeoutSeconds -PopupPlacement ([string]$config.PopupPlacement) -OriginKind $originKind -NotificationId $notificationId -SnapshotId $snapshotId -RecoveryTicketId $recoveryTicketId
         if ($brokerSent) {
             return
         }
 
-        $stackIndex = Get-NotifyPopupStackPlan -TargetKey $targetKey
+        $stackIndex = Get-NotifyPopupStackPlan -TargetKey $targetKey -TargetFingerprint $targetFingerprint
         Clear-NotifyBridgePopupArtifacts -Aggressive
 
         Write-NotifyListenerLog -Message ('popup-launch targetFingerprint={0} slot={1} timeout={2} source=fallback originKind={3}' -f $targetFingerprint, $stackIndex, $PopupTimeoutSeconds, $(if ([string]::IsNullOrWhiteSpace($originKind)) { 'none' } else { $originKind }))
@@ -1082,13 +1115,43 @@ function Show-Toast {
     $texts.Item(1).AppendChild($xml.CreateTextNode($Body)) | Out-Null
 
     $activationId = [Guid]::NewGuid().ToString('N')
-    $activationPaths = @(Save-NotifyToastActivationState -ActivationId $activationId -FocusTarget $focusTarget -CwdBase $cwdBase -TabTitle $tabTitle -OriginKind $originKind -NotificationId $notificationId -SnapshotId $snapshotId -RecoveryTicketId $recoveryTicketId)
+    $activationTtlSeconds = if ($originKind -eq 'paseo') {
+        Get-NotifyPaseoActivationTtlSeconds -Config $config -PopupTimeoutSeconds ([int]$PopupTimeoutSeconds)
+    } else {
+        600
+    }
+    $activationPaths = @(Save-NotifyToastActivationState -ActivationId $activationId -FocusTarget $focusTarget -CwdBase $cwdBase -TabTitle $tabTitle -OriginKind $originKind -NotificationId $notificationId -SnapshotId $snapshotId -RecoveryTicketId $recoveryTicketId -TtlSeconds $activationTtlSeconds)
+    if ($originKind -eq 'paseo' -and $activationPaths.Count -eq 0) {
+        throw 'Paseo toast activation pointer cache is unavailable.'
+    }
     $safeLaunchUri = Get-NotifyBridgeActivationUri -ActivationId $activationId
     $xml.DocumentElement.SetAttribute('launch', $safeLaunchUri)
     $xml.DocumentElement.SetAttribute('activationType', 'protocol')
 
     Write-NotifyListenerLog -Message ('system-toast activationId={0} hasCwd={1} hasTab={2} originKind={3} notificationFp={4} snapshotFp={5}' -f $activationId, (-not [string]::IsNullOrWhiteSpace($cwdBase)), (-not [string]::IsNullOrWhiteSpace($tabTitle)), $(if ([string]::IsNullOrWhiteSpace($originKind)) { 'none' } else { $originKind }), (Get-NotifyRouteFingerprint -Value $notificationId), (Get-NotifyRouteFingerprint -Value $snapshotId))
     $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
+    if ($originKind -eq 'paseo') {
+        # Exact close uses notification UUID as Tag and agent fingerprint as Group.
+        # Remove prior same-agent toast(s) before showing so replacement stays agent-scoped.
+        if (-not [string]::IsNullOrWhiteSpace($TargetFingerprint)) {
+            try {
+                [Windows.UI.Notifications.ToastNotificationManager]::History.RemoveGroup($TargetFingerprint, $ToastAppId)
+            }
+            catch {
+                # Best-effort only; display must still proceed.
+            }
+            $toast.Group = $TargetFingerprint
+        }
+        else {
+            $toast.Group = 'paseo'
+        }
+        if (-not [string]::IsNullOrWhiteSpace($notificationId)) {
+            $toast.Tag = $notificationId
+        }
+        elseif (-not [string]::IsNullOrWhiteSpace($TargetFingerprint)) {
+            $toast.Tag = $TargetFingerprint
+        }
+    }
     $isPendingRecoveryToast = $originKind -eq 'pi-web' -and
         [string]::IsNullOrWhiteSpace($snapshotId) -and
         -not [string]::IsNullOrWhiteSpace($notificationId) -and
@@ -1099,6 +1162,9 @@ function Show-Toast {
     # snapshots retain the normal five-minute visibility window.
     $toast.ExpirationTime = if ($isPendingRecoveryToast) {
         [DateTimeOffset]::Now.AddSeconds(115)
+    }
+    elseif ($originKind -eq 'paseo') {
+        [DateTimeOffset]::Now.AddSeconds($activationTtlSeconds)
     }
     else {
         [DateTimeOffset]::Now.AddMinutes(5)
@@ -1146,7 +1212,7 @@ try {
                 continue
             }
 
-            if ($path -notin @('/', '/notify')) {
+            if ($path -notin @('/', '/notify', '/paseo/health', '/paseo/close')) {
                 Write-HttpResponse -Stream $stream -StatusCode 404 -Reason 'Not Found' -Body 'not found'
                 continue
             }
@@ -1162,6 +1228,55 @@ try {
             }
             else {
                 ''
+            }
+
+            # Authenticated capability health: fixed schema only, side-effect free.
+            if ($path -eq '/paseo/health') {
+                try {
+                    $health = Get-NotifyPaseoHealthSnapshot -Config $config -DisplayMode ([string]$DisplayMode)
+                    $healthJson = ConvertTo-NotifyPaseoHealthJson -Snapshot $health
+                    Write-NotifyListenerLog -Message ('paseo-health ready={0} displayReady={1} routeReady={2} routeState={3}' -f $health.ready, $health.displayReady, $health.routeReady, $health.routeState)
+                    Write-HttpResponse -Stream $stream -StatusCode 200 -Reason 'OK' -Body $healthJson -ContentType 'application/json; charset=utf-8'
+                }
+                catch {
+                    Write-NotifyListenerLog -Message ('paseo-health-error reason={0}' -f $_.Exception.GetType().Name)
+                    $fallback = ConvertTo-NotifyPaseoHealthJson -Snapshot ([pscustomobject]@{
+                            version = 1; ready = $false; listenerReady = $true; displayReady = $false; routeReady = $false; routeState = 'probe-error'
+                        })
+                    Write-HttpResponse -Stream $stream -StatusCode 200 -Reason 'OK' -Body $fallback -ContentType 'application/json; charset=utf-8'
+                }
+                continue
+            }
+
+            # Exact idempotent permission close by notification UUID only.
+            if ($path -eq '/paseo/close') {
+                $closePayload = $null
+                if (-not [string]::IsNullOrWhiteSpace($bodyText)) {
+                    try { $closePayload = $bodyText | ConvertFrom-Json } catch { $closePayload = $null }
+                }
+                $closeReq = Resolve-NotifyPaseoCloseRequest -Payload $closePayload
+                if (-not $closeReq.IsValid) {
+                    Write-NotifyListenerLog -Message ('paseo-close-invalid reason={0} notificationFp={1}' -f $(if ([string]::IsNullOrWhiteSpace($closeReq.InvalidReason)) { 'invalid' } else { $closeReq.InvalidReason }), (Get-NotifyRouteFingerprint -Value $closeReq.NotificationId))
+                    Write-HttpResponse -Stream $stream -StatusCode 200 -Reason 'OK' -Body 'invalid'
+                    continue
+                }
+                try {
+                    $closeResult = Invoke-NotifyPaseoCloseByNotificationId -NotificationId $closeReq.NotificationId -Config $config -ToastAppId $AppId
+                    if ($closeResult.Ok) {
+                        Write-NotifyListenerLog -Message ('paseo-close result=ok notificationFp={0} removedActivations={1}' -f $closeResult.NotificationFp, $closeResult.RemovedActivations)
+                        Write-HttpResponse -Stream $stream -StatusCode 200 -Reason 'OK' -Body 'ok'
+                    }
+                    else {
+                        $closeBody = if ([string]$closeResult.Result -eq 'invalid') { 'invalid' } else { 'retry' }
+                        Write-NotifyListenerLog -Message ('paseo-close result={0} notificationFp={1}' -f $closeBody, $closeResult.NotificationFp)
+                        Write-HttpResponse -Stream $stream -StatusCode 200 -Reason 'OK' -Body $closeBody
+                    }
+                }
+                catch {
+                    Write-NotifyListenerLog -Message ('paseo-close-error reason={0} notificationFp={1}' -f $_.Exception.GetType().Name, (Get-NotifyRouteFingerprint -Value $closeReq.NotificationId))
+                    Write-HttpResponse -Stream $stream -StatusCode 200 -Reason 'OK' -Body 'retry'
+                }
+                continue
             }
 
             $payload = $null
@@ -1207,68 +1322,158 @@ try {
 
             # Optional exact-route metadata (additive). Valid pi-web freezes immediately; only
             # notificationId + snapshotId + originKind are retained for click paths.
-            $routeMeta = Resolve-NotifyExactRouteMetadata -Payload $payload
+            # Paseo is a separate origin: raw route triples never leave listener scope except DPAPI cache.
+            $declaredOrigin = ''
+            if ($null -ne $payload -and $payload.PSObject.Properties['originKind'] -and -not [string]::IsNullOrWhiteSpace([string]$payload.originKind)) {
+                $declaredOrigin = ([string]$payload.originKind).Trim()
+            }
             $routeOriginKind = ''
             $routeNotificationId = ''
             $routeSnapshotId = ''
             $routeRecoveryTicketId = ''
             $suppressTerminalFallback = $false
-            if ($routeMeta.HasAnyRouteField) {
-                if ($routeMeta.IsValidPiWebExact) {
-                    Write-NotifyListenerLog -Message ('notify-received originKind=pi-web notificationFp={0} instanceFp={1} routingFp={2} kind={3}' -f (Get-NotifyRouteFingerprint -Value $routeMeta.NotificationId), (Get-NotifyRouteFingerprint -Value $routeMeta.InstanceKey), (Get-NotifyRouteFingerprint -Value $routeMeta.RoutingKey), $(if ([string]::IsNullOrWhiteSpace($routeMeta.NotificationKind)) { 'none' } else { $routeMeta.NotificationKind }))
-                    $freezeDecision = Invoke-NotifyExactRouteFreeze -NotificationId $routeMeta.NotificationId -NotificationKind $routeMeta.NotificationKind -InstanceKey $routeMeta.InstanceKey -RoutingKey $routeMeta.RoutingKey -Config $config
-                    Write-NotifyListenerLog -Message ('route-freeze decision={0} result={1} reason={2} notificationFp={3} snapshotFp={4}' -f $freezeDecision.Decision, $freezeDecision.Result, $(if ([string]::IsNullOrWhiteSpace($freezeDecision.Reason)) { 'none' } else { $freezeDecision.Reason }), (Get-NotifyRouteFingerprint -Value $routeMeta.NotificationId), (Get-NotifyRouteFingerprint -Value $freezeDecision.SnapshotId))
-                    if ($freezeDecision.Decision -eq 'exact-ready') {
-                        $routeOriginKind = 'pi-web'
-                        $routeNotificationId = $routeMeta.NotificationId
-                        $routeSnapshotId = $freezeDecision.SnapshotId
+            $paseoTargetFingerprint = ''
+            $paseoDedupChecked = $false
+
+            if ($declaredOrigin -eq 'paseo') {
+                $paseoMeta = Resolve-NotifyPaseoRouteMetadata -Payload $payload
+                if ($paseoMeta.IsValidPaseoExact) {
+                    $paseoTargetFingerprint = Get-NotifyPaseoTargetFingerprint -ServerId $paseoMeta.ServerId -AgentId $paseoMeta.AgentId
+                    # A resolved UUID wins before foreground suppression so permission replay is terminal dedup.
+                    if (Test-NotifyPaseoCloseTombstone -NotificationId $paseoMeta.NotificationId) {
+                        Write-NotifyListenerLog -Message ('paseo-close-tombstone-hit notificationFp={0}' -f (Get-NotifyRouteFingerprint -Value $paseoMeta.NotificationId))
+                        Write-HttpResponse -Stream $stream -StatusCode 200 -Reason 'OK' -Body 'dedup'
+                        continue
                     }
-                    elseif ($freezeDecision.Decision -eq 'exact-recovering') {
-                        $routeOriginKind = 'pi-web'
-                        $routeNotificationId = $routeMeta.NotificationId
-                        $routeSnapshotId = ''
-                        $routeRecoveryTicketId = $freezeDecision.RecoveryTicketId
-                        $suppressTerminalFallback = $true
-                        Write-NotifyListenerLog -Message ('route-freeze-recovering notificationFp={0} ticketFp={1}' -f (Get-NotifyRouteFingerprint -Value $routeMeta.NotificationId), (Get-NotifyRouteFingerprint -Value $routeRecoveryTicketId))
+
+                    $foreground = Test-NotifyPaseoForegroundActiveAgent -ServerId $paseoMeta.ServerId -AgentId $paseoMeta.AgentId -Config $config
+                    if ($foreground.State -eq 'active') {
+                        Write-NotifyListenerLog -Message ('paseo-suppressed-active-agent notificationFp={0} result={1}' -f (Get-NotifyRouteFingerprint -Value $paseoMeta.NotificationId), $(if ([string]::IsNullOrWhiteSpace([string]$foreground.Result)) { 'exact-agent-focused' } else { [string]$foreground.Result }))
+                        Write-HttpResponse -Stream $stream -StatusCode 200 -Reason 'OK' -Body 'suppressed-active-agent'
+                        continue
                     }
-                    else {
-                        # Preserve the declared origin so every Pi Web route failure is a click no-op.
-                        $routeOriginKind = 'pi-web'
-                        $routeNotificationId = $routeMeta.NotificationId
-                        $routeSnapshotId = ''
-                        $suppressTerminalFallback = $true
-                        Write-NotifyListenerLog -Message ('route-freeze-fail-closed result={0} reason={1} notificationFp={2}' -f $freezeDecision.Result, $(if ([string]::IsNullOrWhiteSpace($freezeDecision.Reason)) { 'none' } else { $freezeDecision.Reason }), (Get-NotifyRouteFingerprint -Value $routeMeta.NotificationId))
+
+                    if (Test-NotifyDuplicateDrop -Title $title -Body $body -FocusTarget $paseoTargetFingerprint -CwdBase '' -TabTitle '' -OriginKind 'paseo' -CheckOnly) {
+                        Write-HttpResponse -Stream $stream -StatusCode 200 -Reason 'OK' -Body 'dedup'
+                        continue
                     }
+                    $paseoDedupChecked = $true
+
+                    $paseoActivationId = [Guid]::NewGuid().ToString('N')
+                    $ttlSeconds = Get-NotifyPaseoActivationTtlSeconds -Config $config -PopupTimeoutSeconds ([int]$PopupTimeoutSeconds)
+                    $activationSave = Save-NotifyPaseoActivationUnlessClosed -ActivationId $paseoActivationId -NotificationId $paseoMeta.NotificationId -NotificationKind $paseoMeta.NotificationKind -ServerId $paseoMeta.ServerId -WorkspaceId $paseoMeta.WorkspaceId -AgentId $paseoMeta.AgentId -TtlSeconds $ttlSeconds
+                    if ($activationSave.Result -eq 'closed') {
+                        Write-NotifyListenerLog -Message ('paseo-close-race-dedup notificationFp={0}' -f (Get-NotifyRouteFingerprint -Value $paseoMeta.NotificationId))
+                        Write-HttpResponse -Stream $stream -StatusCode 200 -Reason 'OK' -Body 'dedup'
+                        continue
+                    }
+                    if (-not $activationSave.Ok) {
+                        # Cache write failure: do not display a non-activatable card; sender may retry.
+                        Write-NotifyListenerLog -Message ('paseo-activation-cache-error result=retry reason=cache-write notificationFp={0}' -f (Get-NotifyRouteFingerprint -Value $paseoMeta.NotificationId))
+                        Write-HttpResponse -Stream $stream -StatusCode 200 -Reason 'OK' -Body 'retry'
+                        continue
+                    }
+
+                    $routeOriginKind = 'paseo'
+                    $routeNotificationId = $paseoMeta.NotificationId
+                    $routeSnapshotId = $paseoActivationId
+                    $suppressTerminalFallback = $true
+                    Write-NotifyListenerLog -Message ('notify-received originKind=paseo notificationFp={0} activationFp={1} kind={2} result=accepted' -f (Get-NotifyRouteFingerprint -Value $paseoMeta.NotificationId), (Get-NotifyRouteFingerprint -Value $paseoActivationId), $paseoMeta.NotificationKind)
                 }
-                elseif (-not [string]::IsNullOrWhiteSpace($routeMeta.InvalidReason)) {
-                    Write-NotifyListenerLog -Message ('route-metadata-invalid reason={0}' -f $routeMeta.InvalidReason)
-                    if ($routeMeta.OriginKind -ne 'terminal') {
-                        # Unknown or malformed Web route metadata must not be reinterpreted as Terminal.
-                        $routeOriginKind = 'pi-web'
-                        $routeNotificationId = ''
-                        $routeSnapshotId = ''
-                        $suppressTerminalFallback = $true
+                else {
+                    $routeOriginKind = 'paseo'
+                    $routeNotificationId = $(if ($paseoMeta.NotificationId) { $paseoMeta.NotificationId } else { '' })
+                    $routeSnapshotId = ''
+                    $suppressTerminalFallback = $true
+                    Write-NotifyListenerLog -Message ('paseo-route-metadata-invalid reason={0} notificationFp={1}' -f $(if ([string]::IsNullOrWhiteSpace($paseoMeta.InvalidReason)) { 'invalid' } else { $paseoMeta.InvalidReason }), (Get-NotifyRouteFingerprint -Value $paseoMeta.NotificationId))
+                    # error / invalid paseo payloads never display and never fall into other origins.
+                    Write-HttpResponse -Stream $stream -StatusCode 200 -Reason 'OK' -Body 'invalid'
+                    continue
+                }
+            }
+            else {
+                $routeMeta = Resolve-NotifyExactRouteMetadata -Payload $payload
+                if ($routeMeta.HasAnyRouteField) {
+                    if ($routeMeta.IsValidPiWebExact) {
+                        Write-NotifyListenerLog -Message ('notify-received originKind=pi-web notificationFp={0} instanceFp={1} routingFp={2} kind={3}' -f (Get-NotifyRouteFingerprint -Value $routeMeta.NotificationId), (Get-NotifyRouteFingerprint -Value $routeMeta.InstanceKey), (Get-NotifyRouteFingerprint -Value $routeMeta.RoutingKey), $(if ([string]::IsNullOrWhiteSpace($routeMeta.NotificationKind)) { 'none' } else { $routeMeta.NotificationKind }))
+                        $freezeDecision = Invoke-NotifyExactRouteFreeze -NotificationId $routeMeta.NotificationId -NotificationKind $routeMeta.NotificationKind -InstanceKey $routeMeta.InstanceKey -RoutingKey $routeMeta.RoutingKey -Config $config
+                        Write-NotifyListenerLog -Message ('route-freeze decision={0} result={1} reason={2} notificationFp={3} snapshotFp={4}' -f $freezeDecision.Decision, $freezeDecision.Result, $(if ([string]::IsNullOrWhiteSpace($freezeDecision.Reason)) { 'none' } else { $freezeDecision.Reason }), (Get-NotifyRouteFingerprint -Value $routeMeta.NotificationId), (Get-NotifyRouteFingerprint -Value $freezeDecision.SnapshotId))
+                        if ($freezeDecision.Decision -eq 'exact-ready') {
+                            $routeOriginKind = 'pi-web'
+                            $routeNotificationId = $routeMeta.NotificationId
+                            $routeSnapshotId = $freezeDecision.SnapshotId
+                        }
+                        elseif ($freezeDecision.Decision -eq 'exact-recovering') {
+                            $routeOriginKind = 'pi-web'
+                            $routeNotificationId = $routeMeta.NotificationId
+                            $routeSnapshotId = ''
+                            $routeRecoveryTicketId = $freezeDecision.RecoveryTicketId
+                            $suppressTerminalFallback = $true
+                            Write-NotifyListenerLog -Message ('route-freeze-recovering notificationFp={0} ticketFp={1}' -f (Get-NotifyRouteFingerprint -Value $routeMeta.NotificationId), (Get-NotifyRouteFingerprint -Value $routeRecoveryTicketId))
+                        }
+                        else {
+                            # Preserve the declared origin so every Pi Web route failure is a click no-op.
+                            $routeOriginKind = 'pi-web'
+                            $routeNotificationId = $routeMeta.NotificationId
+                            $routeSnapshotId = ''
+                            $suppressTerminalFallback = $true
+                            Write-NotifyListenerLog -Message ('route-freeze-fail-closed result={0} reason={1} notificationFp={2}' -f $freezeDecision.Result, $(if ([string]::IsNullOrWhiteSpace($freezeDecision.Reason)) { 'none' } else { $freezeDecision.Reason }), (Get-NotifyRouteFingerprint -Value $routeMeta.NotificationId))
+                        }
+                    }
+                    elseif (-not [string]::IsNullOrWhiteSpace($routeMeta.InvalidReason)) {
+                        Write-NotifyListenerLog -Message ('route-metadata-invalid reason={0}' -f $routeMeta.InvalidReason)
+                        if ($routeMeta.OriginKind -ne 'terminal') {
+                            # Unknown or malformed Web route metadata must not be reinterpreted as Terminal.
+                            $routeOriginKind = 'pi-web'
+                            $routeNotificationId = ''
+                            $routeSnapshotId = ''
+                            $suppressTerminalFallback = $true
+                        }
                     }
                 }
             }
 
-            if ($DisplayMode -eq 'popup-focus' -and [string]::IsNullOrWhiteSpace($cwdBase) -and [string]::IsNullOrWhiteSpace($tabTitle) -and [string]::IsNullOrWhiteSpace($routeSnapshotId) -and -not $suppressTerminalFallback) {
+            if ($DisplayMode -eq 'popup-focus' -and [string]::IsNullOrWhiteSpace($cwdBase) -and [string]::IsNullOrWhiteSpace($tabTitle) -and [string]::IsNullOrWhiteSpace($routeSnapshotId) -and -not $suppressTerminalFallback -and $routeOriginKind -ne 'paseo') {
                 Write-NotifyListenerLog -Message ('notify-drop missing-target-metadata targetFingerprint="{0}"' -f (Get-NotifyPopupTargetFingerprint -TargetKey $focusTarget))
                 Write-HttpResponse -Stream $stream -StatusCode 200 -Reason 'OK' -Body 'no-target'
                 continue
             }
-            if (Test-NotifyDuplicateDrop -Title $title -Body $body -FocusTarget $focusTarget -CwdBase $cwdBase -TabTitle $tabTitle) {
+            if (-not $paseoDedupChecked -and (Test-NotifyDuplicateDrop -Title $title -Body $body -FocusTarget $focusTarget -CwdBase $cwdBase -TabTitle $tabTitle -OriginKind $routeOriginKind)) {
                 Write-HttpResponse -Stream $stream -StatusCode 200 -Reason 'OK' -Body 'dedup'
                 continue
             }
 
             $launchUri = Get-NotifyBridgeActivationUri -ActivationId ([Guid]::NewGuid().ToString('N'))
+            $displayTargetFingerprint = if ($routeOriginKind -eq 'paseo' -and -not [string]::IsNullOrWhiteSpace($paseoTargetFingerprint)) {
+                $paseoTargetFingerprint
+            } else {
+                (Get-NotifyPopupTargetFingerprint -TargetKey $focusTarget)
+            }
 
-            Write-NotifyListenerLog -Message ('notify targetFingerprint="{0}" hasCwd={1} hasTab={2} originKind={3} notificationFp={4} snapshotFp={5}' -f (Get-NotifyPopupTargetFingerprint -TargetKey $focusTarget), (-not [string]::IsNullOrWhiteSpace($cwdBase)), (-not [string]::IsNullOrWhiteSpace($tabTitle)), $(if ([string]::IsNullOrWhiteSpace($routeOriginKind)) { 'none' } else { $routeOriginKind }), (Get-NotifyRouteFingerprint -Value $routeNotificationId), (Get-NotifyRouteFingerprint -Value $routeSnapshotId))
-            Show-Toast -Title $title -Body $body -ToastAppId $AppId -FocusTarget $focusTarget -CwdBase $cwdBase -TabTitle $tabTitle -SessionName $sessionName -LaunchUri $launchUri -OriginKind $routeOriginKind -NotificationId $routeNotificationId -SnapshotId $routeSnapshotId -RecoveryTicketId $routeRecoveryTicketId
+            Write-NotifyListenerLog -Message ('notify targetFingerprint="{0}" hasCwd={1} hasTab={2} originKind={3} notificationFp={4} snapshotFp={5}' -f $displayTargetFingerprint, (-not [string]::IsNullOrWhiteSpace($cwdBase)), (-not [string]::IsNullOrWhiteSpace($tabTitle)), $(if ([string]::IsNullOrWhiteSpace($routeOriginKind)) { 'none' } else { $routeOriginKind }), (Get-NotifyRouteFingerprint -Value $routeNotificationId), (Get-NotifyRouteFingerprint -Value $routeSnapshotId))
+            if ($routeOriginKind -eq 'paseo') {
+                # Agent fingerprint drives same-agent replacement / different-agent stack.
+                # Route transports contain only the opaque activation handle; Terminal metadata is blank.
+                try {
+                    Show-Toast -Title $title -Body $body -ToastAppId $AppId -FocusTarget '' -CwdBase '' -TabTitle '' -SessionName '' -LaunchUri $launchUri -OriginKind 'paseo' -NotificationId $routeNotificationId -SnapshotId $routeSnapshotId -RecoveryTicketId '' -TargetFingerprint $displayTargetFingerprint
+                }
+                catch {
+                    Write-NotifyListenerLog -Message ('paseo-display-error result=retry reason={0} notificationFp={1}' -f $_.Exception.GetType().Name, (Get-NotifyRouteFingerprint -Value $routeNotificationId))
+                    Write-HttpResponse -Stream $stream -StatusCode 200 -Reason 'OK' -Body 'retry'
+                    continue
+                }
+                # Record five-second dedup only after the desktop path accepted the display.
+                [void](Test-NotifyDuplicateDrop -Title $title -Body $body -FocusTarget $paseoTargetFingerprint -CwdBase '' -TabTitle '' -OriginKind 'paseo')
+            }
+            else {
+                Show-Toast -Title $title -Body $body -ToastAppId $AppId -FocusTarget $focusTarget -CwdBase $cwdBase -TabTitle $tabTitle -SessionName $sessionName -LaunchUri $launchUri -OriginKind $routeOriginKind -NotificationId $routeNotificationId -SnapshotId $routeSnapshotId -RecoveryTicketId $routeRecoveryTicketId
+            }
             $notified = $true
             try {
-                Start-NotifyQqDispatch -Title $title -Body $body
+                # Paseo stays off the QQ mirror path; Terminal/Pi Web keep the single post-desktop dispatch.
+                if ($routeOriginKind -ne 'paseo') {
+                    Start-NotifyQqDispatch -Title $title -Body $body
+                }
             }
             catch {
                 Write-NotifyListenerLog -Message ('qq-send-error reason={0}' -f $_.Exception.GetType().Name)
@@ -1287,7 +1492,7 @@ try {
                 }
                 catch {
                 }
-                Write-NotifyListenerLog -Message ('error "{0}"' -f $_.Exception.Message)
+                Write-NotifyListenerLog -Message ('error reason={0}' -f $_.Exception.GetType().Name)
             }
         }
         finally {

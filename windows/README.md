@@ -22,7 +22,9 @@ This folder implements a reliable **Windows local notification bridge** for runn
 - `remote-windows-notify.ts` — Pi extension template installed on the remote host
 - `pi-notify-ensure.mjs` — atomic package/standalone ownership, config restore, and read-only drift check on the remote host
 - `route-host/` — .NET current-user exact-route daemon, client, and Chromium Native Messaging relay
-- `test-route.ps1` — Windows PowerShell 5.1 route metadata and fail-closed decision regression
+- `test-route.ps1` — Windows PowerShell 5.1 route metadata and fail-closed decision regression (includes Paseo contracts)
+- `paseo-desktop-route.ps1` — loopback-only Paseo CDP controller (event dispatch; no Page.navigate)
+- `set-paseo-desktop-routing.ps1` — explicit user-confirmed Enable/Disable helper for persistent `PASEO_ELECTRON_FLAGS` + config flag (never auto-run by install/refresh)
 - `../browser-extension/` — shared opt-in Chrome/Edge Manifest V3 route adapter
 
 ## Architecture
@@ -48,6 +50,146 @@ Optional Pi Web exact route
 ```
 
 The broker binds only `127.0.0.1` and is never exposed through the SSH tunnel. The listener remains the single public entry point and continues to authenticate every request. Route Host does not replace Terminal matching: `originKind=terminal` keeps the existing canonical-title path, while a declared `originKind=pi-web` is either exact or a fail-closed no-op.
+
+`originKind=paseo` is a third, fully isolated branch. Legitimate Paseo payloads display without Terminal `cwdBase/tabTitle`, use a fixed UI label `Paseo`, and store only an opaque DPAPI-protected activation handle. Click paths (broker, fallback popup, system toast, activate-oldest) all call the same Paseo handler and **never** fall through to Terminal or Pi Web. Activation uses loopback CDP only to dispatch Paseo's existing `paseo:web-notification-click` renderer event (no `Page.navigate`, no handcrafted `paseo://` URLs, no cold-start/kill/restart).
+
+
+
+## Paseo desktop notifications (opt-in)
+
+### Payload contract
+
+```json
+{
+  "originKind": "paseo",
+  "notificationId": "<uuid>",
+  "notificationKind": "finished|permission",
+  "title": "<minimal display title>",
+  "body": "<minimal display body>",
+  "paseoRoute": {
+    "version": 1,
+    "serverId": "<opaque>",
+    "workspaceId": "<opaque>",
+    "agentId": "<opaque>"
+  }
+}
+```
+
+Rules:
+
+- `error` and invalid/incomplete routes never create a Paseo desktop popup and never enter Terminal/Pi Web routing.
+- Route IDs are for activation only; titles/bodies/cwd are never used to infer the target Agent.
+- UI app label is always derived as `Paseo` (not customizable via payload).
+- Dedup signatures include origin so identical Pi/Paseo text cannot cross-suppress.
+- Same `serverId + agentId` replaces the previous card; different Agents stack. `workspaceId` is kept only inside the protected activation state.
+
+### Privacy
+
+Logs, command lines, temp files, and activation caches must never contain:
+
+- raw title/body
+- raw route triple (`serverId`/`workspaceId`/`agentId`)
+- tokens / credentials
+- CDP WebSocket URLs or page content
+
+Only irreversible fingerprints, fixed result codes, candidate counts, and elapsed times are logged. Click URIs and toast caches carry opaque activation IDs only.
+
+### Authenticated health capability
+
+Unauthenticated `GET /health` remains listener liveness only (`{"ok":true}`).
+
+Sender capability probe is token-protected:
+
+```http
+POST /paseo/health
+X-Pi-Notify-Token: <token>
+```
+
+Fixed JSON schema v1 (no token/paths/ports/PID/target URL/route IDs/title/body):
+
+```json
+{
+  "version": 1,
+  "ready": true,
+  "listenerReady": true,
+  "displayReady": true,
+  "routeReady": true,
+  "routeState": "app-absent|ready|disabled|non-loopback|foreign-owner|...",
+  "capabilities": {
+    "notifyV1": true,
+    "closeV1": true,
+    "existingClickEventV1": true
+  }
+}
+```
+
+- `ready = listenerReady && displayReady && routeReady`
+- popup-focus: display is ready when the owned fallback popup script exists (broker may be down)
+- system-toast: display remains ready
+- route readiness requires routing enabled, safe high non-conflicting CDP port, controller file + standard Paseo executable, and persisted user `PASEO_ELECTRON_FLAGS` for exact port + `127.0.0.1`
+- no CDP listener/Paseo process => `routeReady=true` with `routeState=app-absent`
+- listener present => require exact loopback Paseo owner and at least one trusted top-level page
+- non-loopback/foreign/ambiguous/malformed/disabled/config mismatch fail closed (`ready=false`)
+- health helper is side-effect free (no launch/kill/restart/navigate/env mutation)
+
+### Exact idempotent permission close
+
+```http
+POST /paseo/close
+X-Pi-Notify-Token: <token>
+Content-Type: application/json
+
+{"originKind":"paseo","version":1,"notificationId":"<uuid>"}
+```
+
+Responses (HTTP 200 body):
+
+- `ok` — valid idempotent close, including already-missing
+- `invalid` — malformed body/origin/version/uuid or unexpected route fields
+- `retry` — internal close orchestration failure only
+
+Rules:
+
+- `notificationId` is event-stable across sender retries and is propagated through Show-Toast/broker/fallback/toast (opaque; never enables Terminal/Pi Web fallback)
+- close matches only `originKind=paseo + notificationId`; an older resolved permission never closes a newer same-agent popup with another UUID
+- bounded 30-minute close tombstone keyed by `SHA-256(notificationId)` only (no plaintext ID); listener checks before display and returns `dedup`; max 96 markers with atomic/serialized cleanup
+- close revokes matching DPAPI activation entries and invalidates later clicks (bounded scan; fingerprint logs only)
+- broker closes matching card(s) on the UI thread by origin+notification UUID
+- fallback popup self-closes via Local named event derived from full SHA-256 plus tombstone polling (no process kill)
+- system toast: Tag = notification UUID, Group = agent fingerprint; remove prior same-agent group before show; exact tag+group on close; toast-history errors are best-effort and must not block broker/fallback/cache close
+
+### Child sender integration notes
+
+- `dedup` is terminal delivery (do not retry as if transient)
+- health uses the authenticated **POST** `/paseo/health` contract (not unauthenticated GET `/health`)
+- close valid/missing is idempotent `ok`
+
+### Foreground suppression
+
+Listener returns `suppressed-active-agent` only when a trusted Paseo page is **visible, focused, and showing the same `serverId + agentId`**. Minimized, background, multi-window ambiguity, CDP down, or unknown state default to **show**. `finished` suppressed as known; `permission` retention/re-show is sender-side.
+
+### Click activation and retry
+
+- Activation state lives under the instance runtime dir in `paseo-activation/` with CurrentUser DPAPI fields.
+- TTL = `min(popupTimeoutSeconds, 1800)`.
+- Read does not consume; only successful exact-agent acceptance consumes. Temporary failures release the in-flight lease and restore a retry UI (“跳转失败，点击重试”). Permanent failures (`expired`/`invalid`/`ambiguous`/`foreign-owner`/`non-loopback`) disable the card without Terminal fallback.
+
+### Enable / disable (deployment gate)
+
+Routing defaults to **disabled** (`paseoDesktopRoutingEnabled=false`, CDP port `29318`). Install/refresh/restart copy `paseo-desktop-route.ps1` and `set-paseo-desktop-routing.ps1` into the runtime bin but **never execute** the helper.
+
+```powershell
+# Explicit, interactive, user-level only. Does not kill/restart Paseo.
+powershell.exe -ExecutionPolicy Bypass -File .\windows\set-paseo-desktop-routing.ps1 -Enable
+powershell.exe -ExecutionPolicy Bypass -File .\windows\set-paseo-desktop-routing.ps1 -Disable
+```
+
+Enable persists user-level `PASEO_ELECTRON_FLAGS` with loopback-only remote debugging flags, saves a backup of the previous flags, and requires a **manual Paseo restart**. Notification clicks never set environment variables. Disable restores the backup and turns the config flag off.
+
+### Security residual risk and rollback
+
+CDP has no authentication; any same-user local process that can reach the loopback port can control the page. Keep routing disabled until Windows live verification confirms loopback binding, owner checks, multi-window fail-closed behavior, and privacy. On any safety failure: keep/disable routing, run `-Disable`, do not kill Paseo, and re-enable built-in notifications if they were turned off manually.
+
 
 ## First-time remote install
 
@@ -182,7 +324,7 @@ Expected result:
 - Windows shows a toast or popup card
 - response body is `ok`
 
-When `displayMode` is `popup-focus`, include `cwdBase` or `tabTitle`; metadata-free payloads are intentionally dropped as `no-target` so clicks never jump to the wrong terminal.
+When `displayMode` is `popup-focus`, Terminal notifications must include `cwdBase` or `tabTitle`; metadata-free Terminal payloads are intentionally dropped as `no-target` so clicks never jump to the wrong terminal. Paseo (`originKind=paseo`) is exempt from that gate and still displays without Terminal metadata.
 
 ## Config
 

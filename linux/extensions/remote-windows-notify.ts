@@ -18,6 +18,14 @@ type NotifyConfigFile = {
   originKind?: string;
   /** Pi Web instance UUID (opaque). Required with originKind=pi-web for Web exact fields. */
   instanceKey?: string;
+  /**
+   * Manual opt-in: when true (or PI_NOTIFY_PASEO_LEASE_GATE=1), suppress legacy Pi
+   * popups only if PASEO_AGENT_ID is set and paseo-sender health lease is fresh.
+   * Default false — controlled takeover, never auto-enabled by health alone.
+   */
+  paseoLeaseGateEnabled?: boolean;
+  /** Override path to paseo-sender health.json (tests / non-default state dir). */
+  paseoLeasePath?: string;
 };
 
 type RuntimeConfig = {
@@ -33,6 +41,10 @@ type RuntimeConfig = {
   piWebOriginConfigured: boolean;
   /** Validated opaque instance key, or empty when absent/invalid. */
   instanceKey: string;
+  /** Manual Pi-only lease gate (default false). */
+  paseoLeaseGateEnabled: boolean;
+  /** Absolute path to paseo-sender health lease file. */
+  paseoLeasePath: string;
 };
 
 type AgentMessageLike = {
@@ -79,6 +91,8 @@ type NotifyPayload = {
 const DEFAULT_ENDPOINT = "http://127.0.0.1:23118/notify";
 const DEFAULT_TIMEOUT_MS = 4000;
 const DEFAULT_CONFIG_PATH = join(homedir(), ".pi", "agent", "remote-windows-notify.json");
+const DEFAULT_PASEO_LEASE_STALE_MS = 15_000;
+const PASEO_LEASE_SCHEMA_VERSION = 1;
 const ASK_USER_PROMPT_EVENT = "rpiv:ask-user:prompt";
 const PI_TERMINAL_TITLE = "π";
 const MAX_CANONICAL_TITLE_BYTES = 144;
@@ -459,6 +473,8 @@ function isConfigShapeValid(file: NotifyConfigFile): boolean {
   if (file.remoteHostAlias !== undefined && typeof file.remoteHostAlias !== "string") return false;
   if (file.originKind !== undefined && typeof file.originKind !== "string") return false;
   if (file.instanceKey !== undefined && typeof file.instanceKey !== "string") return false;
+  if (file.paseoLeaseGateEnabled !== undefined && typeof file.paseoLeaseGateEnabled !== "boolean") return false;
+  if (file.paseoLeasePath !== undefined && typeof file.paseoLeasePath !== "string") return false;
   return true;
 }
 
@@ -554,6 +570,13 @@ export async function getRuntimeConfig(): Promise<RuntimeConfig> {
   const instanceKey =
     normalizeInstanceKey(process.env.PI_NOTIFY_INSTANCE_KEY) || normalizeInstanceKey(file.instanceKey);
 
+  const xdgState = configString(process.env.XDG_STATE_HOME) || join(homedir(), ".local", "state");
+  const defaultLeasePath = join(xdgState, "paseo-sender", "health.json");
+  const leasePath =
+    configString(process.env.PI_NOTIFY_PASEO_LEASE_PATH) ||
+    configString(file.paseoLeasePath) ||
+    defaultLeasePath;
+
   return {
     enabled: file.enabled !== false && !isTruthy(process.env.PI_NOTIFY_DISABLED) && endpointPolicy.allowed,
     endpoint,
@@ -571,7 +594,66 @@ export async function getRuntimeConfig(): Promise<RuntimeConfig> {
       isExplicitPiWebOriginKind(environmentOriginKind) ||
       (isExplicitPiWebOriginKind(fileOriginKind) && isPiWebHostProcess()),
     instanceKey,
+    paseoLeaseGateEnabled:
+      isTruthy(process.env.PI_NOTIFY_PASEO_LEASE_GATE) || file.paseoLeaseGateEnabled === true,
+    paseoLeasePath: resolve(leasePath),
   };
+}
+
+/**
+ * Pure lease health check for the Pi-only duplicate gate.
+ * Fail-open (return false => send Pi popup) on any doubt.
+ */
+export function isPaseoLeaseHealthy(
+  lease: unknown,
+  options: { staleMs?: number; now?: number } = {},
+): boolean {
+  const staleMs = options.staleMs ?? DEFAULT_PASEO_LEASE_STALE_MS;
+  const now = options.now ?? Date.now();
+  if (!lease || typeof lease !== "object") return false;
+  const record = lease as {
+    schemaVersion?: unknown;
+    lastHealthyAt?: unknown;
+    status?: unknown;
+  };
+  if (record.schemaVersion !== PASEO_LEASE_SCHEMA_VERSION) return false;
+  if (typeof record.lastHealthyAt !== "number" || !Number.isFinite(record.lastHealthyAt)) return false;
+  if (record.lastHealthyAt > now) return false;
+  if (now - record.lastHealthyAt > staleMs) return false;
+  if (record.status !== "healthy") return false;
+  return true;
+}
+
+/**
+ * Suppress legacy Pi popup only when:
+ * - manual gate enabled
+ * - PASEO_AGENT_ID present (Paseo-managed Pi)
+ * - lease healthy (schema/age/status)
+ * - PI_NOTIFY_ALLOW_PASEO != 1
+ * Any read/schema/stale/override failure => do not suppress.
+ */
+export async function shouldSuppressLegacyPiPopup(
+  config: Pick<RuntimeConfig, "paseoLeaseGateEnabled" | "paseoLeasePath">,
+  options: {
+    env?: NodeJS.ProcessEnv;
+    readFileImpl?: typeof readFile;
+    now?: number;
+    staleMs?: number;
+  } = {},
+): Promise<boolean> {
+  const env = options.env ?? process.env;
+  if (!config.paseoLeaseGateEnabled) return false;
+  if (isTruthy(env.PI_NOTIFY_ALLOW_PASEO)) return false;
+  if (!configString(env.PASEO_AGENT_ID)) return false;
+
+  const readImpl = options.readFileImpl ?? readFile;
+  try {
+    const raw = await readImpl(config.paseoLeasePath, "utf8");
+    const parsed = JSON.parse(raw) as unknown;
+    return isPaseoLeaseHealthy(parsed, { staleMs: options.staleMs, now: options.now });
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -734,6 +816,9 @@ export default function remoteWindowsNotify(pi: ExtensionAPI): void {
     if (!isAlive() || !config.enabled || !config.token) {
       return;
     }
+    if (await shouldSuppressLegacyPiPopup(config)) {
+      return;
+    }
 
     let promptSummary = "";
     if (config.messageMode === "dynamic" && data && typeof data === "object") {
@@ -806,6 +891,9 @@ export default function remoteWindowsNotify(pi: ExtensionAPI): void {
     }
     const config = await getRuntimeConfig();
     if (!isAlive() || !config.enabled || !config.token) {
+      return;
+    }
+    if (await shouldSuppressLegacyPiPopup(config)) {
       return;
     }
 

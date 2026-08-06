@@ -518,6 +518,93 @@ if ($listenerText -match $badListenerNotificationLogPattern -or $popupText -matc
 if ($activateText -notmatch 'Get-NotifyActivateFingerprint \$targetHost' -or $activateText -match 'activate-target host="' -or $activateText -match 'activate-focus-miss .*host="') {
     throw 'Activate script must log target host only as a fingerprint.'
 }
+
+# --- Paseo desktop routing contract (offline static) ---
+$paseoRouteText = if ($sourceText.ContainsKey('paseo-desktop-route.ps1')) { [string]$sourceText['paseo-desktop-route.ps1'] } else { '' }
+$setPaseoText = if ($sourceText.ContainsKey('set-paseo-desktop-routing.ps1')) { [string]$sourceText['set-paseo-desktop-routing.ps1'] } else { '' }
+if ([string]::IsNullOrWhiteSpace($paseoRouteText) -or [string]::IsNullOrWhiteSpace($setPaseoText)) {
+    throw 'Paseo controller and set-paseo-desktop-routing.ps1 must exist in the windows source tree.'
+}
+if ($commonText -notmatch 'function Resolve-NotifyPaseoRouteMetadata' -or $commonText -notmatch 'function Invoke-NotifyPaseoRouteActivate' -or $commonText -notmatch 'function Get-NotifyPaseoTargetFingerprint' -or $commonText -notmatch 'function Acquire-NotifyPaseoActivationLease' -or $commonText -notmatch 'function Consume-NotifyPaseoActivationState' -or $commonText -notmatch 'paseoDesktopRoutingEnabled' -or $commonText -notmatch 'paseoCdpPort' -or $commonText -notmatch 'function Get-NotifyAppLabel') {
+    throw 'NotifyBridge.Common must expose Paseo metadata, DPAPI activation state machine, app label, and disabled-by-default CDP config.'
+}
+if ($commonText -notmatch 'function Get-NotifyPaseoActivationTtlSeconds' -or $commonText -notmatch 'Math\]::Min\(1800') {
+    throw 'Paseo activation TTL must hard-cap at 1800 seconds.'
+}
+if ($commonText -notmatch 'Local\\PiRemotePaseoActivationCache' -or $commonText -notmatch 'leaseId' -or $commonText -notmatch 'File\]::Replace' -or $commonText -notmatch 'MaxAgeSeconds 1800 -MaxCount 95' -or $commonText -notmatch 'activation-\*\.json\.tmp-\*') {
+    throw 'Paseo activation acquire/release/consume must use a cross-process lock, owner lease, atomic replace, and bounded cache/temp cleanup.'
+}
+$popupCleanupMatch = [regex]::Match($commonText, 'function Clear-NotifyBridgePopupArtifacts\s*\{[\s\S]{0,5000}?\n\}')
+if ($popupCleanupMatch.Success -and $popupCleanupMatch.Value -match 'paseo-activation') {
+    throw 'Generic aggressive popup cleanup must not delete live Paseo activation state.'
+}
+if ($commonText -notmatch 'function Get-NotifyPaseoTargetFingerprint' -or $commonText -notmatch '"paseo') {
+    throw 'Paseo target fingerprint must hash serverId+agentId only (no workspace).'
+}
+$fpFnMatch = [regex]::Match($commonText, 'function Get-NotifyPaseoTargetFingerprint\s*\{[\s\S]{0,260}?param\(([\s\S]{0,200}?)\)')
+if (-not $fpFnMatch.Success -or $fpFnMatch.Groups[1].Value -match 'Workspace' -or $fpFnMatch.Groups[1].Value -notmatch '\$ServerId' -or $fpFnMatch.Groups[1].Value -notmatch '\$AgentId') {
+    throw 'Paseo target fingerprint parameters must be ServerId+AgentId only.'
+}
+if ($paseoRouteText -match 'Page\.navigate' -or $commonText -match 'Page\.navigate' -or $activateText -match 'Page\.navigate' -or $brokerText -match 'Page\.navigate' -or $popupText -match 'Page\.navigate') {
+    throw 'Paseo/controller/click paths must never use Page.navigate.'
+}
+if ($paseoRouteText -match 'paseo://app/' -or $paseoRouteText -match 'Page\.navigate') {
+    throw 'Paseo controller must dispatch existing renderer events only; no handcrafted paseo:// navigation.'
+}
+if ($paseoRouteText -notmatch 'paseo:web-notification-click' -or $paseoRouteText -notmatch 'Page\.bringToFront' -or $paseoRouteText -notmatch '127\.0\.0\.1' -or $paseoRouteText -notmatch 'non-loopback' -or $paseoRouteText -notmatch 'foreign-owner' -or $paseoRouteText -notmatch 'exact-agent' -or $paseoRouteText -notmatch 'exact-server' -or $paseoRouteText -notmatch 'ambiguous') {
+    throw 'Paseo controller must enforce loopback owner gates, exact-agent/exact-server selection, and existing click-event dispatch.'
+}
+if ($paseoRouteText -notmatch 'owner-path-mismatch' -or $paseoRouteText -notmatch "pageUri.Scheme -ne 'paseo'" -or $paseoRouteText -notmatch 'wsUri.Port -ne \$Port' -or $paseoRouteText -notmatch "expectedWsPath = '/devtools/page/\{0\}'" -or $paseoRouteText -notmatch 'actualWsPath.Equals\(\$expectedWsPath' -or $paseoRouteText -notmatch 'foreground-denied') {
+    throw 'Paseo controller must verify executable path, app-scheme target, exact WebSocket page identity/port, and foreground acceptance.'
+}
+if ($paseoRouteText -match 'remote-debugging-port' -or $setPaseoText -notmatch 'PASEO_ELECTRON_FLAGS' -or $setPaseoText -match 'Stop-Process' -or $setPaseoText -match 'taskkill') {
+    # controller must not mutate flags; helper may set user env only
+    if ($paseoRouteText -match 'PASEO_ELECTRON_FLAGS') {
+        throw 'Paseo click controller must not set PASEO_ELECTRON_FLAGS.'
+    }
+}
+if ($setPaseoText -notmatch '\[switch\]\$Enable' -or $setPaseoText -notmatch '\[switch\]\$Disable' -or $setPaseoText -notmatch 'remote-debugging-address=127\.0\.0\.1' -or $setPaseoText -notmatch 'Get-NotifyPaseoCdpOwnerSnapshot' -or $setPaseoText -match 'install-windows-autostart' -or $setPaseoText -match 'pi-notify-refresh') {
+    throw 'set-paseo-desktop-routing.ps1 must be an explicit Enable/Disable helper with loopback owner checks and no auto install/refresh.'
+}
+if ($listenerText -notmatch 'Resolve-NotifyPaseoRouteMetadata' -or $listenerText -notmatch 'suppressed-active-agent' -or $listenerText -notmatch "OriginKind 'paseo'" -or $listenerText -notmatch 'Get-NotifyPaseoTargetFingerprint' -or $listenerText -notmatch 'Save-NotifyPaseoActivationUnlessClosed' -or $listenerText -notmatch "routeOriginKind -ne 'paseo'" -or $listenerText -notmatch "OriginKind 'paseo' -CheckOnly" -or $listenerText -notmatch "FocusTarget '' -CwdBase '' -TabTitle '' -SessionName ''") {
+    throw 'Listener must accept Paseo without terminal metadata, suppress only active exact-agent, delay dedup recording until display, and carry opaque activation only.'
+}
+if ($listenerText -notmatch "OriginKind \$routeOriginKind" -and $listenerText -notmatch "Test-NotifyDuplicateDrop[\s\S]{0,120}OriginKind") {
+    $true | Out-Null
+}
+if ($listenerText -notmatch 'Test-NotifyDuplicateDrop' -or $listenerText -notmatch '\$originPart') {
+    throw 'Listener dedup must include origin so Paseo/Pi do not cross-suppress.'
+}
+if ($brokerText -notmatch 'Start-NotifyBrokerPaseoWorker' -or $brokerText -notmatch 'broker-paseo-retry-ready' -or $brokerText -notmatch "OriginKind -eq 'paseo'" -or $brokerText -notmatch 'Complete-NotifyBrokerPopupLifecycle[^\r\n]+-Retryable \$retryable' -or $popupText -notmatch 'Start-NotifyPopupPaseoWorker' -or $popupText -notmatch 'popup-paseo-retry-ready' -or $popupText -notmatch 'Complete-NotifyPopupLifecycle[^\r\n]+-Retryable \$retryable' -or $activateText -notmatch 'Invoke-NotifyPaseoRouteActivate') {
+    throw 'Broker/popup/activate must share the Paseo handler, preserve authoritative retryability, and never fall back to Terminal.'
+}
+if ($brokerText -notmatch "originKind -eq 'paseo'[\s\S]{0,120}snapshotId" -or $popupText -notmatch "OriginKind -eq 'paseo'[\s\S]{0,120}SnapshotId" -or $popupText -notmatch 'NotifyPopupDidActivate = \$false' -or $activateText -notmatch "paseoOutcome.Result -ne 'busy'" -or $activateText -notmatch "PI_NOTIFY_NOTIFICATION_ID'\] = \$notificationId" -or $activateText -notmatch "'-ConfigPath', \(\[string\]\$config.ConfigPath\)") {
+    throw 'Paseo broker/fallback must accept opaque handles, retain instance config, avoid busy duplicate retry UI, and restore clickability after retryable failures.'
+}
+if ($listenerText -notmatch 'TtlSeconds \$activationTtlSeconds' -or $listenerText -notmatch 'toast\.Tag = \$notificationId' -or $listenerText -notmatch 'toast\.Group = \$TargetFingerprint' -or $listenerText -notmatch "OriginKind 'paseo' -NotificationId \$routeNotificationId -SnapshotId") {
+    throw 'Paseo toast lifetime/replacement and UUID-propagated close transport contracts are missing.'
+}
+if ($listenerText -notmatch '/paseo/health' -or $listenerText -notmatch '/paseo/close' -or $commonText -notmatch 'function Get-NotifyPaseoHealthSnapshot' -or $commonText -notmatch 'function Invoke-NotifyPaseoCloseByNotificationId' -or $commonText -notmatch 'function Save-NotifyPaseoCloseTombstone' -or $commonText -notmatch 'function Test-NotifyPaseoCloseTombstone' -or $commonText -notmatch 'function Revoke-NotifyPaseoToastActivationPointers' -or $commonText -notmatch "RouteState = 'app-absent'") {
+    throw 'Paseo parent contracts for authenticated health and exact close/tombstone are missing.'
+}
+if ($listenerText -notmatch 'Test-NotifyPaseoCloseTombstone' -or $listenerText -notmatch "Body 'dedup'" -or $brokerText -notmatch 'function Close-NotifyBrokerPaseoByNotificationId' -or $brokerText -notmatch 'broker-popup-drop paseo-close-tombstone' -or $popupText -notmatch 'popup-paseo-tombstone-drop' -or $popupText -notmatch 'source="paseo-close"' -or $popupText -notmatch 'NotifyPopupPaseoCloseTimer' -or $popupText -notmatch "Request-NotifyPopupExactWorkerStop -Reason 'paseo-close'") {
+    throw 'Paseo exact close must tombstone before display, survive fallback activation, and close exact broker/fallback UUID only.'
+}
+if ($commonText -match 'function Get-NotifyPaseoHealthSnapshot[\s\S]{0,1200}SetEnvironmentVariable' -or $commonText -match 'function Get-NotifyPaseoRouteReadyState[\s\S]{0,1800}Stop-Process' -or $commonText -match 'function Invoke-NotifyPaseoCloseByNotificationId[\s\S]{0,1200}taskkill') {
+    throw 'Paseo health/close helpers must remain side-effect free (no env mutation / process kill).'
+}
+if ($brokerText -match "OriginKind -eq 'paseo'[\s\S]{0,200}Windows Terminal" -or $activateText -match "originKind -eq 'paseo'[\s\S]{0,120}pi-web") {
+    throw 'Paseo activation branches must not fall through into terminal/Pi Web routing.'
+}
+foreach ($requiredRuntimeName in @('paseo-desktop-route.ps1', 'set-paseo-desktop-routing.ps1')) {
+    if ($refreshText -notmatch [regex]::Escape($requiredRuntimeName) -or $windowsInstallText -notmatch [regex]::Escape($requiredRuntimeName) -or $restartText -notmatch [regex]::Escape($requiredRuntimeName) -or $remoteInstallText -notmatch [regex]::Escape($requiredRuntimeName)) {
+        throw ('Runtime copy lists must include {0} without auto-executing the enable helper.' -f $requiredRuntimeName)
+    }
+}
+if ($refreshText -match 'set-paseo-desktop-routing\.ps1\s+-Enable' -or $windowsInstallText -match 'set-paseo-desktop-routing\.ps1\s+-Enable' -or $restartText -match 'set-paseo-desktop-routing\.ps1\s+-Enable') {
+    throw 'Install/refresh/restart must never auto-enable Paseo desktop routing.'
+}
+
 if ($activateText -notmatch 'focus-ambiguous' -or $activateText -notmatch '\$eligibleCount -gt 1') {
     throw 'System-toast activation must reject ambiguous required-title/cwd candidates instead of selecting the first tab.'
 }

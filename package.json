@@ -9,8 +9,10 @@
     "pi-extension"
   ],
   "scripts": {
-    "check": "node scripts/check-package.mjs",
-    "test": "node --experimental-transform-types --test test/*.test.mjs"
+    "check": "node scripts/run-paseo-sender-gate.mjs check && node scripts/check-package.mjs",
+    "test": "node scripts/run-paseo-sender-gate.mjs test && node --experimental-transform-types --test test/*.test.mjs",
+    "test:paseo-sender": "npm --prefix linux/paseo-sender test",
+    "check:paseo-sender": "npm --prefix linux/paseo-sender run check"
   },
   "pi": {
     "extensions": [

@@ -124,6 +124,7 @@ function Unprotect-NotifyActivationValue {
 function Resolve-NotifyActivationState {
     param([string]$ActivationId)
     if ([string]::IsNullOrWhiteSpace($ActivationId) -or $ActivationId -notmatch '^[0-9a-fA-F]{32}$') { return $null }
+    $originKind = ''
     $paths = @(
         (Join-Path (Get-NotifyBridgeLogDir) ('activation-{0}.json' -f $ActivationId)),
         (Join-Path (Join-Path (Get-NotifyBridgeDefaultBaseDir) 'logs') ('activation-{0}.json' -f $ActivationId))
@@ -133,11 +134,24 @@ function Resolve-NotifyActivationState {
     $path = [string]$path[0]
     try {
         $payload = [System.IO.File]::ReadAllText($path, [System.Text.UTF8Encoding]::new($false)) | ConvertFrom-Json
-        foreach ($candidate in $paths) { Remove-Item -LiteralPath $candidate -Force -ErrorAction SilentlyContinue }
+        $originKind = if ($payload.PSObject.Properties['originKind'] -and -not [string]::IsNullOrWhiteSpace([string]$payload.originKind)) { ([string]$payload.originKind).Trim() } else { '' }
+        # Paseo toast cache is only an opaque handle pointer; do not consume here.
+        # Terminal/pi-web retain one-shot consume semantics.
+        if ($originKind -ne 'paseo') {
+            foreach ($candidate in $paths) { Remove-Item -LiteralPath $candidate -Force -ErrorAction SilentlyContinue }
+        }
         $expiresAtTicks = [int64]0
         if ($payload.PSObject.Properties['expiresAtTicks']) { [int64]::TryParse([string]$payload.expiresAtTicks, [ref]$expiresAtTicks) | Out-Null }
-        if ($expiresAtTicks -le [DateTime]::UtcNow.Ticks) { return $null }
-        $originKind = if ($payload.PSObject.Properties['originKind'] -and -not [string]::IsNullOrWhiteSpace([string]$payload.originKind)) { ([string]$payload.originKind).Trim() } else { '' }
+        if ($expiresAtTicks -le [DateTime]::UtcNow.Ticks) {
+            foreach ($candidate in $paths) { Remove-Item -LiteralPath $candidate -Force -ErrorAction SilentlyContinue }
+            if ($originKind -eq 'paseo') {
+                return [pscustomobject]@{
+                    FocusTarget = ''; CwdBase = ''; TabTitle = ''; OriginKind = 'paseo'; NotificationId = ''; SnapshotId = ''; RecoveryTicketId = ''
+                    ActivationState = 'expired'
+                }
+            }
+            return $null
+        }
         $notificationId = if ($payload.PSObject.Properties['protectedNotificationId'] -and -not [string]::IsNullOrWhiteSpace([string]$payload.protectedNotificationId)) { Unprotect-NotifyActivationValue -Value ([string]$payload.protectedNotificationId) } else { '' }
         $snapshotId = if ($payload.PSObject.Properties['protectedSnapshotId'] -and -not [string]::IsNullOrWhiteSpace([string]$payload.protectedSnapshotId)) { Unprotect-NotifyActivationValue -Value ([string]$payload.protectedSnapshotId) } else { '' }
         $recoveryTicketId = if ($payload.PSObject.Properties['protectedRecoveryTicketId'] -and -not [string]::IsNullOrWhiteSpace([string]$payload.protectedRecoveryTicketId)) { Unprotect-NotifyActivationValue -Value ([string]$payload.protectedRecoveryTicketId) } else { '' }
@@ -149,10 +163,17 @@ function Resolve-NotifyActivationState {
             NotificationId = $notificationId
             SnapshotId     = $snapshotId
             RecoveryTicketId = $recoveryTicketId
+            ActivationState = 'ready'
         }
     }
     catch {
         Write-NotifyActivateLog -Message ('activation-cache-read-error "{0}"' -f $_.Exception.Message)
+        if ($originKind -eq 'paseo') {
+            return [pscustomobject]@{
+                FocusTarget = ''; CwdBase = ''; TabTitle = ''; OriginKind = 'paseo'; NotificationId = ''; SnapshotId = ''; RecoveryTicketId = ''
+                ActivationState = 'invalid'
+            }
+        }
         return $null
     }
 }
@@ -383,6 +404,8 @@ $originKind = ''
 $notificationId = ''
 $snapshotId = ''
 $recoveryTicketId = ''
+$activationIdValue = ''
+$activationStateResult = ''
 if (-not [string]::IsNullOrWhiteSpace($Uri)) {
     try {
         $parsedUri = [Uri]$Uri
@@ -396,6 +419,7 @@ if (-not [string]::IsNullOrWhiteSpace($Uri)) {
             if ($state.PSObject.Properties['NotificationId'] -and -not [string]::IsNullOrWhiteSpace([string]$state.NotificationId)) { $notificationId = ([string]$state.NotificationId).Trim() }
             if ($state.PSObject.Properties['SnapshotId'] -and -not [string]::IsNullOrWhiteSpace([string]$state.SnapshotId)) { $snapshotId = ([string]$state.SnapshotId).Trim() }
             if ($state.PSObject.Properties['RecoveryTicketId'] -and -not [string]::IsNullOrWhiteSpace([string]$state.RecoveryTicketId)) { $recoveryTicketId = ([string]$state.RecoveryTicketId).Trim() }
+            if ($state.PSObject.Properties['ActivationState']) { $activationStateResult = ([string]$state.ActivationState).Trim() }
         }
         else {
             $hostValue = Get-NotifyQueryValue -ParsedUri $parsedUri -Name 'host'
@@ -410,13 +434,91 @@ if (-not [string]::IsNullOrWhiteSpace($Uri)) {
     }
 }
 
-if (-not [string]::IsNullOrWhiteSpace($env:PI_NOTIFY_FOCUS_TARGET)) { $targetHost = $env:PI_NOTIFY_FOCUS_TARGET.Trim() }
-if (-not [string]::IsNullOrWhiteSpace($env:PI_NOTIFY_CWD_BASE)) { $cwdBase = $env:PI_NOTIFY_CWD_BASE.Trim() }
-if (-not [string]::IsNullOrWhiteSpace($env:PI_NOTIFY_TAB_TITLE)) { $tabTitle = $env:PI_NOTIFY_TAB_TITLE.Trim() }
-if (-not [string]::IsNullOrWhiteSpace($env:PI_NOTIFY_ORIGIN_KIND)) { $originKind = $env:PI_NOTIFY_ORIGIN_KIND.Trim() }
-if (-not [string]::IsNullOrWhiteSpace($env:PI_NOTIFY_NOTIFICATION_ID)) { $notificationId = $env:PI_NOTIFY_NOTIFICATION_ID.Trim() }
-if (-not [string]::IsNullOrWhiteSpace($env:PI_NOTIFY_SNAPSHOT_ID)) { $snapshotId = $env:PI_NOTIFY_SNAPSHOT_ID.Trim() }
-if (-not [string]::IsNullOrWhiteSpace($env:PI_NOTIFY_RECOVERY_TICKET_ID)) { $recoveryTicketId = $env:PI_NOTIFY_RECOVERY_TICKET_ID.Trim() }
+# A resolved Paseo pointer is authoritative; inherited environment must not change its branch.
+if ($originKind -ne 'paseo') {
+    if (-not [string]::IsNullOrWhiteSpace($env:PI_NOTIFY_FOCUS_TARGET)) { $targetHost = $env:PI_NOTIFY_FOCUS_TARGET.Trim() }
+    if (-not [string]::IsNullOrWhiteSpace($env:PI_NOTIFY_CWD_BASE)) { $cwdBase = $env:PI_NOTIFY_CWD_BASE.Trim() }
+    if (-not [string]::IsNullOrWhiteSpace($env:PI_NOTIFY_TAB_TITLE)) { $tabTitle = $env:PI_NOTIFY_TAB_TITLE.Trim() }
+    if (-not [string]::IsNullOrWhiteSpace($env:PI_NOTIFY_ORIGIN_KIND)) { $originKind = $env:PI_NOTIFY_ORIGIN_KIND.Trim() }
+    if (-not [string]::IsNullOrWhiteSpace($env:PI_NOTIFY_NOTIFICATION_ID)) { $notificationId = $env:PI_NOTIFY_NOTIFICATION_ID.Trim() }
+    if (-not [string]::IsNullOrWhiteSpace($env:PI_NOTIFY_SNAPSHOT_ID)) { $snapshotId = $env:PI_NOTIFY_SNAPSHOT_ID.Trim() }
+    if (-not [string]::IsNullOrWhiteSpace($env:PI_NOTIFY_RECOVERY_TICKET_ID)) { $recoveryTicketId = $env:PI_NOTIFY_RECOVERY_TICKET_ID.Trim() }
+}
+
+if ($originKind -eq 'paseo') {
+    Write-NotifyActivateLog -Message ('activate-route originKind=paseo notificationFp={0} activationFp={1}' -f (Get-NotifyRouteFingerprint -Value $notificationId), (Get-NotifyRouteFingerprint -Value $snapshotId))
+    if ($activationStateResult -in @('expired', 'invalid')) {
+        Write-NotifyActivateLog -Message ('activate-route fail-closed result={0} reason=toast-activation-state' -f $activationStateResult)
+        exit 1
+    }
+    if ([string]::IsNullOrWhiteSpace($snapshotId)) {
+        Write-NotifyActivateLog -Message ('activate-route fail-closed result=activation-missing reason=missing-activation-handle notificationFp={0}' -f (Get-NotifyRouteFingerprint -Value $notificationId))
+        exit 1
+    }
+    $paseoOutcome = Invoke-NotifyPaseoRouteActivate -ActivationId $snapshotId -Config $config -TimeoutMs 20000
+    Write-NotifyActivateLog -Message ('activate-route decision={0} result={1} reason={2} notificationFp={3} activationFp={4}' -f $paseoOutcome.Decision, $paseoOutcome.Result, $(if ([string]::IsNullOrWhiteSpace([string]$paseoOutcome.Reason)) { 'none' } else { [string]$paseoOutcome.Reason }), (Get-NotifyRouteFingerprint -Value $notificationId), (Get-NotifyRouteFingerprint -Value $snapshotId))
+    if ($paseoOutcome.Decision -eq 'handled') {
+        # Consume toast pointer cache after successful activation.
+        try {
+            $toastPaths = @(
+                (Join-Path (Get-NotifyBridgeLogDir) ('activation-{0}.json' -f $activationIdValue)),
+                (Join-Path (Join-Path (Get-NotifyBridgeDefaultBaseDir) 'logs') ('activation-{0}.json' -f $activationIdValue))
+            ) | Select-Object -Unique
+            foreach ($candidate in $toastPaths) { Remove-Item -LiteralPath $candidate -Force -ErrorAction SilentlyContinue }
+        } catch {}
+        Write-NotifyActivateLog -Message 'activate-route-success'
+        exit 0
+    }
+
+    # Temporary failure: restore custom retry popup with same opaque activation id; never terminal fallback.
+    # Permanent failures (expired/invalid/ambiguous/foreign-owner/non-loopback) stay fail-closed without retry UI.
+    $retryable = $true
+    if ($paseoOutcome.PSObject.Properties['Retryable']) {
+        try { $retryable = [bool]$paseoOutcome.Retryable } catch { $retryable = $true }
+    }
+    $permanent = ([string]$paseoOutcome.Result -in @('expired', 'invalid', 'activation-missing', 'foreign-owner', 'non-loopback', 'ambiguous'))
+    if ($retryable -and -not $permanent -and [string]$paseoOutcome.Result -ne 'busy') {
+        try {
+            $retryState = Resolve-NotifyPaseoActivationState -ActivationId $snapshotId
+            if (-not $retryState.Available) { exit 1 }
+            $remainingSeconds = [int][Math]::Ceiling(([DateTime]::new([int64]$retryState.ExpiresAtTicks, [DateTimeKind]::Utc) - [DateTime]::UtcNow).TotalSeconds)
+            if ($remainingSeconds -lt 3) { exit 1 }
+            $retryFingerprint = Get-NotifyPaseoTargetFingerprint -ServerId $retryState.ServerId -AgentId $retryState.AgentId
+
+            $popupScript = Join-Path $PSScriptRoot 'pi-notify-popup.ps1'
+            if (-not (Test-Path -LiteralPath $popupScript)) {
+                $popupScript = Join-Path (Get-NotifyBridgeBinDir) 'pi-notify-popup.ps1'
+            }
+            if (Test-Path -LiteralPath $popupScript) {
+                $retryTitle = -join @([char]0x8df3, [char]0x8f6c, [char]0x5931, [char]0x8d25, [char]0xff0c, [char]0x70b9, [char]0x51fb, [char]0x91cd, [char]0x8bd5)
+                $retryBody = -join @([char]0x70b9, [char]0x51fb, [char]0x91cd, [char]0x8bd5)
+                $psi = [System.Diagnostics.ProcessStartInfo]::new()
+                $psi.FileName = Get-NotifyBridgePowerShellExe
+                $psi.UseShellExecute = $false
+                $psi.CreateNoWindow = $true
+                $psi.Arguments = Join-NotifyBridgeProcessArguments @(
+                    '-NoProfile',
+                    '-ExecutionPolicy', 'Bypass',
+                    '-File', $popupScript,
+                    '-ConfigPath', ([string]$config.ConfigPath),
+                    '-TargetFingerprint', $retryFingerprint,
+                    '-TimeoutSeconds', $remainingSeconds
+                )
+                $psi.EnvironmentVariables['PI_NOTIFY_TITLE'] = $retryTitle
+                $psi.EnvironmentVariables['PI_NOTIFY_BODY'] = $retryBody
+                $psi.EnvironmentVariables['PI_NOTIFY_ORIGIN_KIND'] = 'paseo'
+                $psi.EnvironmentVariables['PI_NOTIFY_NOTIFICATION_ID'] = $notificationId
+                $psi.EnvironmentVariables['PI_NOTIFY_SNAPSHOT_ID'] = $snapshotId
+                [void][System.Diagnostics.Process]::Start($psi)
+                Write-NotifyActivateLog -Message ('activate-route-retry-popup result={0}' -f $paseoOutcome.Result)
+            }
+        }
+        catch {
+            Write-NotifyActivateLog -Message 'activate-route-retry-popup-error'
+        }
+    }
+    exit 1
+}
 
 if ($originKind -eq 'pi-web') {
     Write-NotifyActivateLog -Message ('activate-route originKind=pi-web notificationFp={0} snapshotFp={1}' -f (Get-NotifyRouteFingerprint -Value $notificationId), (Get-NotifyRouteFingerprint -Value $snapshotId))

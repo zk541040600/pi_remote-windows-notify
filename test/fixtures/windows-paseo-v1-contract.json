@@ -1,0 +1,57 @@
+{
+  "version": 1,
+  "description": "Shared parent Windows Paseo v1 contract fixture (sender + Windows validator drift guard)",
+  "notify": {
+    "method": "POST",
+    "path": "/notify",
+    "headers": ["Content-Type: application/json", "X-Pi-Notify-Token"],
+    "payload": {
+      "originKind": "paseo",
+      "notificationId": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+      "notificationKind": "finished",
+      "title": "Agent",
+      "body": "已完成",
+      "paseoRoute": {
+        "version": 1,
+        "serverId": "server-1",
+        "workspaceId": "workspace-1",
+        "agentId": "agent-1"
+      }
+    },
+    "notificationKinds": ["finished", "permission"],
+    "responses": ["ok", "dedup", "suppressed-active-agent", "retry", "invalid"],
+    "titleMaxCodePoints": 72,
+    "bodyMaxCodePoints": 220
+  },
+  "health": {
+    "method": "POST",
+    "path": "/paseo/health",
+    "headers": ["X-Pi-Notify-Token"],
+    "responseSchema": {
+      "version": 1,
+      "ready": true,
+      "listenerReady": true,
+      "displayReady": true,
+      "routeReady": true,
+      "routeState": "app-absent",
+      "capabilities": {
+        "notifyV1": true,
+        "closeV1": true,
+        "existingClickEventV1": true
+      }
+    },
+    "requiredCapabilityKeys": ["notifyV1", "closeV1", "existingClickEventV1"]
+  },
+  "close": {
+    "method": "POST",
+    "path": "/paseo/close",
+    "headers": ["Content-Type: application/json", "X-Pi-Notify-Token"],
+    "payload": {
+      "originKind": "paseo",
+      "version": 1,
+      "notificationId": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+    },
+    "allowedFields": ["originKind", "version", "notificationId"],
+    "responses": ["ok", "invalid", "retry"]
+  }
+}

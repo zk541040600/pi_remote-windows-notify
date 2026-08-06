@@ -2,6 +2,9 @@ Set-StrictMode -Version Latest
 $script:NotifyBridgeActiveConfigPath = $null
 $script:NotifyBridgeActiveBaseDir = $null
 
+# DPAPI helpers (Paseo activation cache) require System.Security on Windows PowerShell 5.1.
+try { Add-Type -AssemblyName System.Security -ErrorAction Stop } catch {}
+
 function Get-NotifyBridgeDefaultBaseDir {
     [CmdletBinding()]
     param()
@@ -957,6 +960,30 @@ function Ensure-NotifyBridgeConfig {
         $finalRouteHostExe = [string]$existing['RouteHostExe']
     }
 
+    $finalPaseoDesktopRoutingEnabled = if ($existing.ContainsKey('paseoDesktopRoutingEnabled')) {
+        ConvertTo-NotifyBridgeBoolean -Value $existing['paseoDesktopRoutingEnabled'] -Default $false
+    }
+    else {
+        $false
+    }
+
+    $finalPaseoExecutablePath = ''
+    if ($existing.ContainsKey('paseoExecutablePath') -and -not [string]::IsNullOrWhiteSpace([string]$existing['paseoExecutablePath'])) {
+        $finalPaseoExecutablePath = ([string]$existing['paseoExecutablePath']).Trim()
+    }
+
+    $defaultPaseoCdpPort = 29318
+    $finalPaseoCdpPort = if ($existing.ContainsKey('paseoCdpPort') -and [int]$existing['paseoCdpPort'] -gt 0) {
+        [int]$existing['paseoCdpPort']
+    }
+    else {
+        $defaultPaseoCdpPort
+    }
+    # Keep CDP out of the listener/broker public ports and well-known privileged range.
+    if ($finalPaseoCdpPort -lt 1024 -or $finalPaseoCdpPort -gt 65535 -or $finalPaseoCdpPort -eq $finalPort -or $finalPaseoCdpPort -eq $finalBrokerPort) {
+        $finalPaseoCdpPort = @(@($defaultPaseoCdpPort, 29319, 29320) | Where-Object { $_ -ne $finalPort -and $_ -ne $finalBrokerPort } | Select-Object -First 1)[0]
+    }
+
     $config = @{
         listenHost                = $finalHost
         port                      = $finalPort
@@ -984,6 +1011,9 @@ function Ensure-NotifyBridgeConfig {
         qqSenderScript             = $finalQqSenderScript
         qqSendTimeoutSeconds       = $finalQqSendTimeoutSeconds
         qqMaxConcurrent            = $finalQqMaxConcurrent
+        paseoDesktopRoutingEnabled = $finalPaseoDesktopRoutingEnabled
+        paseoExecutablePath        = $finalPaseoExecutablePath
+        paseoCdpPort               = $finalPaseoCdpPort
         updatedAtUtc               = [DateTime]::UtcNow.ToString('o')
     }
     foreach ($key in $existing.Keys) {
@@ -1026,6 +1056,9 @@ function Ensure-NotifyBridgeConfig {
         QqSendTimeoutSeconds       = $config.qqSendTimeoutSeconds
         QqMaxConcurrent            = $config.qqMaxConcurrent
         RouteHostExe               = $finalRouteHostExe
+        PaseoDesktopRoutingEnabled = [bool]$config.paseoDesktopRoutingEnabled
+        PaseoExecutablePath        = [string]$config.paseoExecutablePath
+        PaseoCdpPort               = [int]$config.paseoCdpPort
         BrokerUrl                  = ('http://127.0.0.1:{0}' -f $config.brokerPort)
         BrokerHealthUrl            = ('http://127.0.0.1:{0}/health' -f $config.brokerPort)
         BrokerPopupUrl             = ('http://127.0.0.1:{0}/popup' -f $config.brokerPort)
@@ -1930,4 +1963,1836 @@ function Invoke-NotifyExactRouteActivate {
         ClientResult = $clientResult
         Decision     = (Get-NotifyRouteActivateDecision -OriginKind 'pi-web' -NotificationId $NotificationId -SnapshotId $SnapshotId -ClientResult $clientResult)
     }
+}
+
+
+# --- Paseo desktop route helpers (opaque activation + loopback CDP contract) ---------
+
+function Get-NotifyAppLabel {
+    [CmdletBinding()]
+    param([string]$OriginKind = '')
+
+    $kind = if ($null -eq $OriginKind) { '' } else { $OriginKind.Trim() }
+    if ($kind -eq 'paseo') { return 'Paseo' }
+    return 'Pi Remote'
+}
+
+function Test-NotifyPaseoRouteId {
+    [CmdletBinding()]
+    param(
+        [string]$Value,
+        [int]$MinLength = 1,
+        [int]$MaxLength = 256
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
+    $text = $Value.Trim()
+    if ($text.Length -lt $MinLength -or $text.Length -gt $MaxLength) { return $false }
+    # Paseo IDs are opaque. Reject controls, but do not invent URL/token character rules.
+    if ($text -match '[\x00-\x1F\x7F-\x9F]') { return $false }
+    return $true
+}
+
+function Test-NotifyPaseoNotificationKind {
+    [CmdletBinding()]
+    param([string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
+    return ($Value.Trim() -in @('finished', 'permission'))
+}
+
+function Get-NotifyPaseoRouteObject {
+    [CmdletBinding()]
+    param($Payload)
+
+    if ($null -eq $Payload -or -not $Payload.PSObject.Properties['paseoRoute']) {
+        return $null
+    }
+    return $Payload.paseoRoute
+}
+
+function Get-NotifyPaseoActivationTtlSeconds {
+    [CmdletBinding()]
+    param(
+        $Config = $null,
+        [int]$PopupTimeoutSeconds = 0
+    )
+
+    $timeout = 0
+    if ($PopupTimeoutSeconds -ge 3) {
+        $timeout = $PopupTimeoutSeconds
+    }
+    elseif ($null -ne $Config) {
+        if ($Config -is [hashtable]) {
+            if ($Config.ContainsKey('popupTimeoutSeconds')) {
+                try { $timeout = [int]$Config['popupTimeoutSeconds'] } catch { $timeout = 0 }
+            }
+            elseif ($Config.ContainsKey('PopupTimeoutSeconds')) {
+                try { $timeout = [int]$Config['PopupTimeoutSeconds'] } catch { $timeout = 0 }
+            }
+        }
+        elseif ($Config.PSObject.Properties['PopupTimeoutSeconds']) {
+            try { $timeout = [int]$Config.PopupTimeoutSeconds } catch { $timeout = 0 }
+        }
+        elseif ($Config.PSObject.Properties['popupTimeoutSeconds']) {
+            try { $timeout = [int]$Config.popupTimeoutSeconds } catch { $timeout = 0 }
+        }
+    }
+    if ($timeout -lt 3) { $timeout = 1800 }
+    return [Math]::Min(1800, [Math]::Max(3, $timeout))
+}
+
+function Get-NotifyPaseoTargetFingerprint {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$ServerId,
+        [Parameter(Mandatory = $true)][string]$AgentId
+    )
+
+    $material = "paseo`0$($ServerId.Trim())`0$($AgentId.Trim())"
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $hash = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($material))
+        return ([System.BitConverter]::ToString($hash).Replace('-', '').ToLowerInvariant())
+    }
+    finally {
+        $sha.Dispose()
+    }
+}
+
+<#
+.SYNOPSIS
+  Validate originKind=paseo metadata and route triple from a notify payload.
+.OUTPUTS
+  PSCustomObject with HasAnyPaseoField, IsValidPaseoExact, OriginKind, NotificationId,
+  NotificationKind, ServerId, WorkspaceId, AgentId, RouteVersion, InvalidReason
+#>
+function Resolve-NotifyPaseoRouteMetadata {
+    [CmdletBinding()]
+    param($Payload)
+
+    $originKind = Get-NotifyPayloadStringField -Payload $Payload -Name 'originKind'
+    $notificationId = Get-NotifyPayloadStringField -Payload $Payload -Name 'notificationId'
+    $notificationKind = Get-NotifyPayloadStringField -Payload $Payload -Name 'notificationKind'
+    $routeObj = Get-NotifyPaseoRouteObject -Payload $Payload
+
+    $serverId = ''
+    $workspaceId = ''
+    $agentId = ''
+    $serverIdIsString = $false
+    $workspaceIdIsString = $false
+    $agentIdIsString = $false
+    $routeVersionRaw = ''
+    if ($null -ne $routeObj) {
+        if ($routeObj.PSObject.Properties['serverId']) {
+            $serverIdIsString = $routeObj.serverId -is [string]
+            if ($serverIdIsString) { $serverId = Get-NotifyPayloadStringField -Payload $routeObj -Name 'serverId' }
+        }
+        if ($routeObj.PSObject.Properties['workspaceId']) {
+            $workspaceIdIsString = $routeObj.workspaceId -is [string]
+            if ($workspaceIdIsString) { $workspaceId = Get-NotifyPayloadStringField -Payload $routeObj -Name 'workspaceId' }
+        }
+        if ($routeObj.PSObject.Properties['agentId']) {
+            $agentIdIsString = $routeObj.agentId -is [string]
+            if ($agentIdIsString) { $agentId = Get-NotifyPayloadStringField -Payload $routeObj -Name 'agentId' }
+        }
+        if ($routeObj.PSObject.Properties['version']) {
+            try { $routeVersionRaw = [string]$routeObj.version } catch { $routeVersionRaw = '' }
+            if ([string]::IsNullOrWhiteSpace($routeVersionRaw)) {
+                $routeVersionRaw = Get-NotifyPayloadStringField -Payload $routeObj -Name 'version'
+            }
+        }
+    }
+
+    $hasAny = ($originKind -eq 'paseo') -or ($null -ne $routeObj) -or (
+        -not [string]::IsNullOrWhiteSpace($serverId) -or
+        -not [string]::IsNullOrWhiteSpace($workspaceId) -or
+        -not [string]::IsNullOrWhiteSpace($agentId)
+    )
+
+    $result = [pscustomobject]@{
+        HasAnyPaseoField  = [bool]$hasAny
+        IsValidPaseoExact = $false
+        OriginKind        = $originKind
+        NotificationId    = $notificationId
+        NotificationKind  = $notificationKind
+        ServerId          = $serverId
+        WorkspaceId       = $workspaceId
+        AgentId           = $agentId
+        RouteVersion      = $routeVersionRaw
+        InvalidReason     = ''
+    }
+
+    if (-not $hasAny) {
+        return $result
+    }
+
+    if ($originKind -ne 'paseo') {
+        $result.InvalidReason = 'origin-kind'
+        return $result
+    }
+
+    if (-not (Test-NotifyRouteUuid -Value $notificationId)) {
+        $result.InvalidReason = 'notification-id'
+        return $result
+    }
+
+    if (-not (Test-NotifyPaseoNotificationKind -Value $notificationKind)) {
+        # error and other kinds must never create a Paseo desktop popup route.
+        $result.InvalidReason = 'notification-kind'
+        return $result
+    }
+    $result.NotificationKind = $notificationKind.Trim()
+
+    if (($routeVersionRaw + '').Trim() -ne '1') {
+        $result.InvalidReason = 'route-version'
+        return $result
+    }
+    $result.RouteVersion = '1'
+
+    if (-not $serverIdIsString -or -not (Test-NotifyPaseoRouteId -Value $serverId)) {
+        $result.InvalidReason = 'server-id'
+        return $result
+    }
+    if (-not $workspaceIdIsString -or -not (Test-NotifyPaseoRouteId -Value $workspaceId)) {
+        $result.InvalidReason = 'workspace-id'
+        return $result
+    }
+    if (-not $agentIdIsString -or -not (Test-NotifyPaseoRouteId -Value $agentId)) {
+        $result.InvalidReason = 'agent-id'
+        return $result
+    }
+
+    $result.ServerId = $serverId.Trim()
+    $result.WorkspaceId = $workspaceId.Trim()
+    $result.AgentId = $agentId.Trim()
+    $result.IsValidPaseoExact = $true
+    return $result
+}
+
+function Protect-NotifyBridgeValue {
+    [CmdletBinding()]
+    param([string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return '' }
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes([string]$Value)
+    $protected = [System.Security.Cryptography.ProtectedData]::Protect($bytes, $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser)
+    return [Convert]::ToBase64String($protected)
+}
+
+function Unprotect-NotifyBridgeValue {
+    [CmdletBinding()]
+    param([string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return '' }
+    $protected = [Convert]::FromBase64String($Value)
+    $bytes = [System.Security.Cryptography.ProtectedData]::Unprotect($protected, $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser)
+    return [System.Text.Encoding]::UTF8.GetString($bytes)
+}
+
+function Get-NotifyPaseoActivationCacheDir {
+    [CmdletBinding()]
+    param()
+
+    return (Join-Path (Get-NotifyBridgeBaseDir) 'paseo-activation')
+}
+
+function Get-NotifyPaseoActivationCachePath {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$ActivationId)
+
+    return (Join-Path (Get-NotifyPaseoActivationCacheDir) ('activation-{0}.json' -f $ActivationId))
+}
+
+function Enter-NotifyPaseoActivationCacheLock {
+    [CmdletBinding()]
+    param([int]$TimeoutMs = 5000)
+
+    $mutex = [System.Threading.Mutex]::new($false, 'Local\PiRemotePaseoActivationCache')
+    try {
+        if (-not $mutex.WaitOne([Math]::Max(100, $TimeoutMs), $false)) {
+            $mutex.Dispose()
+            return $null
+        }
+        return $mutex
+    }
+    catch [System.Threading.AbandonedMutexException] {
+        return $mutex
+    }
+    catch {
+        $mutex.Dispose()
+        throw
+    }
+}
+
+function Exit-NotifyPaseoActivationCacheLock {
+    [CmdletBinding()]
+    param($Mutex)
+
+    if ($null -eq $Mutex) { return }
+    try { $Mutex.ReleaseMutex() } finally { $Mutex.Dispose() }
+}
+
+function Clear-NotifyPaseoActivationCache {
+    [CmdletBinding()]
+    param(
+        [int]$MaxAgeSeconds = 1800,
+        [int]$MaxCount = 96
+    )
+
+    $dir = Get-NotifyPaseoActivationCacheDir
+    if (-not (Test-Path -LiteralPath $dir)) { return }
+
+    # Writes are serialized by the cache mutex, so abandoned encrypted temp files are never live.
+    foreach ($tempItem in @(Get-ChildItem -LiteralPath $dir -Filter 'activation-*.json.tmp-*' -File -ErrorAction SilentlyContinue)) {
+        Remove-Item -LiteralPath $tempItem.FullName -Force -ErrorAction SilentlyContinue
+    }
+
+    $cutoff = (Get-Date).AddSeconds(-[Math]::Max(3, $MaxAgeSeconds))
+    $items = @(Get-ChildItem -LiteralPath $dir -Filter 'activation-*.json' -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime)
+    foreach ($item in $items) {
+        $remove = $item.LastWriteTime -lt $cutoff
+        if (-not $remove) {
+            try {
+                $payload = [System.IO.File]::ReadAllText($item.FullName, [System.Text.UTF8Encoding]::new($false)) | ConvertFrom-Json
+                $expiresAtTicks = [int64]0
+                if ($payload.PSObject.Properties['expiresAtTicks']) {
+                    [void][int64]::TryParse([string]$payload.expiresAtTicks, [ref]$expiresAtTicks)
+                }
+                if ($expiresAtTicks -gt 0 -and $expiresAtTicks -le [DateTime]::UtcNow.Ticks) {
+                    $remove = $true
+                }
+            }
+            catch {
+                $remove = $true
+            }
+        }
+        if ($remove) {
+            Remove-Item -LiteralPath $item.FullName -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    $remaining = @(Get-ChildItem -LiteralPath $dir -Filter 'activation-*.json' -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime)
+    while ($remaining.Count -gt $MaxCount) {
+        try { Remove-Item -LiteralPath $remaining[0].FullName -Force -ErrorAction SilentlyContinue } catch {}
+        if ($remaining.Count -gt 0) { $remaining = @($remaining | Select-Object -Skip 1) } else { break }
+    }
+}
+
+function Save-NotifyPaseoActivationState {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$ActivationId,
+        [Parameter(Mandatory = $true)][string]$NotificationId,
+        [Parameter(Mandatory = $true)][string]$NotificationKind,
+        [Parameter(Mandatory = $true)][string]$ServerId,
+        [Parameter(Mandatory = $true)][string]$WorkspaceId,
+        [Parameter(Mandatory = $true)][string]$AgentId,
+        [int]$TtlSeconds = 1800
+    )
+
+    $mutex = Enter-NotifyPaseoActivationCacheLock
+    if ($null -eq $mutex) { throw 'Paseo activation cache is busy.' }
+    try {
+        $ttl = [Math]::Max(3, [Math]::Min(1800, $TtlSeconds))
+        $dir = Get-NotifyPaseoActivationCacheDir
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        # Reserve one slot before writing so the cache never exceeds its hard bound.
+        Clear-NotifyPaseoActivationCache -MaxAgeSeconds 1800 -MaxCount 95
+
+        $payload = @{
+            activationId              = $ActivationId
+            originKind                = 'paseo'
+            routeVersion              = 1
+            state                     = 'ready'
+            leaseId                   = ''
+            leaseExpiresAtTicks       = 0
+            protectedNotificationId   = Protect-NotifyBridgeValue -Value $NotificationId
+            protectedNotificationKind = Protect-NotifyBridgeValue -Value $NotificationKind
+            protectedPaseoServerId    = Protect-NotifyBridgeValue -Value $ServerId
+            protectedPaseoWorkspaceId = Protect-NotifyBridgeValue -Value $WorkspaceId
+            protectedPaseoAgentId     = Protect-NotifyBridgeValue -Value $AgentId
+            expiresAtTicks            = [DateTime]::UtcNow.AddSeconds($ttl).Ticks
+        }
+
+        [void](Write-NotifyPaseoActivationPayload -ActivationId $ActivationId -Payload $payload)
+        return @((Get-NotifyPaseoActivationCachePath -ActivationId $ActivationId))
+    }
+    finally {
+        Exit-NotifyPaseoActivationCacheLock -Mutex $mutex
+    }
+}
+
+function Read-NotifyPaseoActivationPayload {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$ActivationId)
+
+    if ([string]::IsNullOrWhiteSpace($ActivationId)) { return $null }
+    if ($ActivationId -notmatch '^[0-9a-fA-F]{32}$' -and -not (Test-NotifyRouteUuid -Value $ActivationId)) {
+        return $null
+    }
+
+    $path = Get-NotifyPaseoActivationCachePath -ActivationId $ActivationId
+    if (-not (Test-Path -LiteralPath $path)) { return $null }
+    try {
+        return [System.IO.File]::ReadAllText($path, [System.Text.UTF8Encoding]::new($false)) | ConvertFrom-Json
+    }
+    catch {
+        return $null
+    }
+}
+
+function Write-NotifyPaseoActivationPayload {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$ActivationId,
+        [Parameter(Mandatory = $true)]$Payload
+    )
+
+    $path = Get-NotifyPaseoActivationCachePath -ActivationId $ActivationId
+    $dir = Split-Path -Parent $path
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    $tempPath = $path + ('.tmp-{0}' -f [Guid]::NewGuid().ToString('N'))
+    try {
+        [System.IO.File]::WriteAllText($tempPath, ($Payload | ConvertTo-Json -Depth 4), [System.Text.UTF8Encoding]::new($false))
+        if (Test-Path -LiteralPath $path) {
+            [System.IO.File]::Replace($tempPath, $path, $null)
+        }
+        else {
+            [System.IO.File]::Move($tempPath, $path)
+        }
+        $tempPath = ''
+        return $true
+    }
+    finally {
+        if (-not [string]::IsNullOrWhiteSpace($tempPath)) {
+            try { Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue } catch {}
+        }
+    }
+}
+
+function ConvertFrom-NotifyPaseoActivationPayload {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$Payload,
+        [string]$ActivationId = ''
+    )
+
+    $originKind = if ($Payload.PSObject.Properties['originKind']) { ([string]$Payload.originKind).Trim() } else { '' }
+    if ($originKind -ne 'paseo') {
+        return [pscustomobject]@{
+            Available        = $false
+            Result           = 'invalid'
+            Reason           = 'origin-kind'
+            State            = 'invalid'
+            ActivationId     = $ActivationId
+            NotificationId   = ''
+            NotificationKind = ''
+            ServerId         = ''
+            WorkspaceId      = ''
+            AgentId          = ''
+        }
+    }
+
+    $expiresAtTicks = [int64]0
+    if ($Payload.PSObject.Properties['expiresAtTicks']) {
+        [void][int64]::TryParse([string]$Payload.expiresAtTicks, [ref]$expiresAtTicks)
+    }
+    if ($expiresAtTicks -le [DateTime]::UtcNow.Ticks) {
+        return [pscustomobject]@{
+            Available        = $false
+            Result           = 'expired'
+            Reason           = 'expired'
+            State            = 'expired'
+            ActivationId     = $ActivationId
+            NotificationId   = ''
+            NotificationKind = ''
+            ServerId         = ''
+            WorkspaceId      = ''
+            AgentId          = ''
+        }
+    }
+
+    $routeVersion = 0
+    $routeVersionRaw = if ($Payload.PSObject.Properties['routeVersion']) { [string]$Payload.routeVersion } else { '' }
+    if (-not [int]::TryParse(($routeVersionRaw + '').Trim(), [ref]$routeVersion) -or $routeVersion -ne 1) {
+        return [pscustomobject]@{
+            Available        = $false
+            Result           = 'invalid'
+            Reason           = 'route-version'
+            State            = 'invalid'
+            ActivationId     = $ActivationId
+            NotificationId   = ''
+            NotificationKind = ''
+            ServerId         = ''
+            WorkspaceId      = ''
+            AgentId          = ''
+        }
+    }
+
+    $stateName = if ($Payload.PSObject.Properties['state']) { ([string]$Payload.state).Trim().ToLowerInvariant() } else { 'ready' }
+    $leaseExpiresAtTicks = [int64]0
+    if ($Payload.PSObject.Properties['leaseExpiresAtTicks']) {
+        [void][int64]::TryParse([string]$Payload.leaseExpiresAtTicks, [ref]$leaseExpiresAtTicks)
+    }
+    if ($stateName -eq 'consumed') {
+        return [pscustomobject]@{
+            Available = $false; Result = 'invalid'; Reason = 'already-consumed'; State = 'consumed'; ActivationId = $ActivationId
+            NotificationId = ''; NotificationKind = ''; ServerId = ''; WorkspaceId = ''; AgentId = ''
+        }
+    }
+    if ($stateName -notin @('ready', 'in-flight')) {
+        return [pscustomobject]@{
+            Available = $false; Result = 'invalid'; Reason = 'state-invalid'; State = 'invalid'; ActivationId = $ActivationId
+            NotificationId = ''; NotificationKind = ''; ServerId = ''; WorkspaceId = ''; AgentId = ''
+        }
+    }
+    if ($stateName -eq 'in-flight' -and $leaseExpiresAtTicks -gt 0 -and $leaseExpiresAtTicks -le [DateTime]::UtcNow.Ticks) {
+        $stateName = 'ready'
+    }
+
+    try {
+        $notificationId = if ($Payload.PSObject.Properties['protectedNotificationId']) { Unprotect-NotifyBridgeValue -Value ([string]$Payload.protectedNotificationId) } else { '' }
+        $notificationKind = if ($Payload.PSObject.Properties['protectedNotificationKind']) { Unprotect-NotifyBridgeValue -Value ([string]$Payload.protectedNotificationKind) } else { '' }
+        $serverId = if ($Payload.PSObject.Properties['protectedPaseoServerId']) { Unprotect-NotifyBridgeValue -Value ([string]$Payload.protectedPaseoServerId) } else { '' }
+        $workspaceId = if ($Payload.PSObject.Properties['protectedPaseoWorkspaceId']) { Unprotect-NotifyBridgeValue -Value ([string]$Payload.protectedPaseoWorkspaceId) } else { '' }
+        $agentId = if ($Payload.PSObject.Properties['protectedPaseoAgentId']) { Unprotect-NotifyBridgeValue -Value ([string]$Payload.protectedPaseoAgentId) } else { '' }
+    }
+    catch {
+        return [pscustomobject]@{
+            Available        = $false
+            Result           = 'invalid'
+            Reason           = 'decrypt-failed'
+            State            = 'invalid'
+            ActivationId     = $ActivationId
+            NotificationId   = ''
+            NotificationKind = ''
+            ServerId         = ''
+            WorkspaceId      = ''
+            AgentId          = ''
+        }
+    }
+
+    if (-not (Test-NotifyRouteUuid -Value $notificationId) -or
+        -not (Test-NotifyPaseoNotificationKind -Value $notificationKind) -or
+        -not (Test-NotifyPaseoRouteId -Value $serverId) -or
+        -not (Test-NotifyPaseoRouteId -Value $workspaceId) -or
+        -not (Test-NotifyPaseoRouteId -Value $agentId)) {
+        return [pscustomobject]@{
+            Available        = $false
+            Result           = 'invalid'
+            Reason           = 'incomplete-context'
+            State            = 'invalid'
+            ActivationId     = $ActivationId
+            NotificationId   = ''
+            NotificationKind = ''
+            ServerId         = ''
+            WorkspaceId      = ''
+            AgentId          = ''
+        }
+    }
+
+    return [pscustomobject]@{
+        Available        = $true
+        Result           = $(if ($stateName -eq 'in-flight') { 'busy' } else { 'ready' })
+        Reason           = ''
+        State            = $stateName
+        ActivationId     = $ActivationId
+        NotificationId   = $notificationId.Trim()
+        NotificationKind = $notificationKind.Trim()
+        ServerId         = $serverId.Trim()
+        WorkspaceId      = $workspaceId.Trim()
+        AgentId          = $agentId.Trim()
+        LeaseId         = if ($Payload.PSObject.Properties['leaseId']) { [string]$Payload.leaseId } else { '' }
+        LeaseExpiresAtTicks = $leaseExpiresAtTicks
+        ExpiresAtTicks   = $expiresAtTicks
+    }
+}
+
+function Resolve-NotifyPaseoActivationState {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$ActivationId)
+
+    $payload = Read-NotifyPaseoActivationPayload -ActivationId $ActivationId
+    if ($null -eq $payload) {
+        return [pscustomobject]@{
+            Available        = $false
+            Result           = 'invalid'
+            Reason           = 'activation-missing'
+            State            = 'missing'
+            ActivationId     = $ActivationId
+            NotificationId   = ''
+            NotificationKind = ''
+            ServerId         = ''
+            WorkspaceId      = ''
+            AgentId          = ''
+        }
+    }
+    return ConvertFrom-NotifyPaseoActivationPayload -Payload $payload -ActivationId $ActivationId
+}
+
+function Acquire-NotifyPaseoActivationLease {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$ActivationId,
+        [int]$LeaseSeconds = 45
+    )
+
+    $mutex = Enter-NotifyPaseoActivationCacheLock
+    if ($null -eq $mutex) {
+        return [pscustomobject]@{
+            Acquired = $false; Available = $true; Result = 'busy'; Reason = 'cache-lock-timeout'; State = 'busy'
+            ActivationId = $ActivationId; LeaseId = ''; NotificationId = ''; NotificationKind = ''; ServerId = ''; WorkspaceId = ''; AgentId = ''
+        }
+    }
+    try {
+        $payload = Read-NotifyPaseoActivationPayload -ActivationId $ActivationId
+        if ($null -eq $payload) {
+            return [pscustomobject]@{
+                Acquired = $false; Available = $false; Result = 'invalid'; Reason = 'activation-missing'; State = 'missing'
+                ActivationId = $ActivationId; LeaseId = ''; NotificationId = ''; NotificationKind = ''; ServerId = ''; WorkspaceId = ''; AgentId = ''
+            }
+        }
+
+        $state = ConvertFrom-NotifyPaseoActivationPayload -Payload $payload -ActivationId $ActivationId
+        if (-not $state.Available) {
+            return [pscustomobject]@{
+                Acquired = $false; Available = $false; Result = $state.Result; Reason = $state.Reason; State = $state.State
+                ActivationId = $ActivationId; LeaseId = ''; NotificationId = ''; NotificationKind = ''; ServerId = ''; WorkspaceId = ''; AgentId = ''
+            }
+        }
+        if ($state.State -eq 'in-flight') {
+            return [pscustomobject]@{
+                Acquired = $false; Available = $true; Result = 'busy'; Reason = 'in-flight'; State = 'in-flight'
+                ActivationId = $ActivationId; LeaseId = ''; NotificationId = $state.NotificationId; NotificationKind = $state.NotificationKind
+                ServerId = $state.ServerId; WorkspaceId = $state.WorkspaceId; AgentId = $state.AgentId
+            }
+        }
+
+        $leaseId = [Guid]::NewGuid().ToString('N')
+        $leaseSeconds = [Math]::Max(5, [Math]::Min(120, $LeaseSeconds))
+        $payload.state = 'in-flight'
+        $payload.leaseId = $leaseId
+        $payload.leaseExpiresAtTicks = [DateTime]::UtcNow.AddSeconds($leaseSeconds).Ticks
+        [void](Write-NotifyPaseoActivationPayload -ActivationId $ActivationId -Payload $payload)
+
+        return [pscustomobject]@{
+            Acquired = $true; Available = $true; Result = 'ready'; Reason = ''; State = 'in-flight'
+            ActivationId = $ActivationId; LeaseId = $leaseId; NotificationId = $state.NotificationId; NotificationKind = $state.NotificationKind
+            ServerId = $state.ServerId; WorkspaceId = $state.WorkspaceId; AgentId = $state.AgentId
+        }
+    }
+    finally {
+        Exit-NotifyPaseoActivationCacheLock -Mutex $mutex
+    }
+}
+
+function Release-NotifyPaseoActivationLease {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$ActivationId,
+        [Parameter(Mandatory = $true)][string]$LeaseId
+    )
+
+    $mutex = Enter-NotifyPaseoActivationCacheLock
+    if ($null -eq $mutex) { return $false }
+    try {
+        $payload = Read-NotifyPaseoActivationPayload -ActivationId $ActivationId
+        if ($null -eq $payload -or -not $payload.PSObject.Properties['leaseId']) { return $false }
+        if ([string]$payload.state -ne 'in-flight' -or [string]$payload.leaseId -ne $LeaseId) { return $false }
+        $payload.state = 'ready'
+        $payload.leaseId = ''
+        $payload.leaseExpiresAtTicks = 0
+        return [bool](Write-NotifyPaseoActivationPayload -ActivationId $ActivationId -Payload $payload)
+    }
+    finally {
+        Exit-NotifyPaseoActivationCacheLock -Mutex $mutex
+    }
+}
+
+function Consume-NotifyPaseoActivationState {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$ActivationId,
+        [Parameter(Mandatory = $true)][string]$LeaseId
+    )
+
+    $mutex = Enter-NotifyPaseoActivationCacheLock
+    if ($null -eq $mutex) { return $false }
+    try {
+        $payload = Read-NotifyPaseoActivationPayload -ActivationId $ActivationId
+        if ($null -eq $payload -or -not $payload.PSObject.Properties['leaseId']) { return $false }
+        if ([string]$payload.state -ne 'in-flight' -or [string]$payload.leaseId -ne $LeaseId) { return $false }
+        $expiresAtTicks = [int64]0
+        if (-not $payload.PSObject.Properties['expiresAtTicks'] -or -not [int64]::TryParse([string]$payload.expiresAtTicks, [ref]$expiresAtTicks) -or $expiresAtTicks -le [DateTime]::UtcNow.Ticks) {
+            return $false
+        }
+        $path = Get-NotifyPaseoActivationCachePath -ActivationId $ActivationId
+        try {
+            Remove-Item -LiteralPath $path -Force -ErrorAction Stop
+            return $true
+        }
+        catch {
+            # Preserve a terminal marker if physical deletion is temporarily blocked.
+            $payload.state = 'consumed'
+            $payload.leaseId = ''
+            $payload.leaseExpiresAtTicks = 0
+            return [bool](Write-NotifyPaseoActivationPayload -ActivationId $ActivationId -Payload $payload)
+        }
+    }
+    catch {
+        return $false
+    }
+    finally {
+        Exit-NotifyPaseoActivationCacheLock -Mutex $mutex
+    }
+}
+
+function Get-NotifyPaseoDesktopRouteScriptPath {
+    [CmdletBinding()]
+    param()
+
+    $binCandidate = Join-Path (Get-NotifyBridgeBinDir) 'paseo-desktop-route.ps1'
+    if (Test-Path -LiteralPath $binCandidate) { return $binCandidate }
+    $sourceCandidate = Join-Path $PSScriptRoot 'paseo-desktop-route.ps1'
+    if (Test-Path -LiteralPath $sourceCandidate) { return $sourceCandidate }
+    return $sourceCandidate
+}
+
+function Test-NotifyPaseoDesktopRoutingEnabled {
+    [CmdletBinding()]
+    param($Config = $null)
+
+    if ($null -eq $Config) { return $false }
+    if ($Config -is [hashtable]) {
+        if ($Config.ContainsKey('paseoDesktopRoutingEnabled')) {
+            return ConvertTo-NotifyBridgeBoolean -Value $Config['paseoDesktopRoutingEnabled'] -Default $false
+        }
+        if ($Config.ContainsKey('PaseoDesktopRoutingEnabled')) {
+            try { return [bool]$Config['PaseoDesktopRoutingEnabled'] } catch { return $false }
+        }
+        return $false
+    }
+    if ($Config.PSObject.Properties['PaseoDesktopRoutingEnabled']) {
+        try { return [bool]$Config.PaseoDesktopRoutingEnabled } catch { return $false }
+    }
+    if ($Config.PSObject.Properties['paseoDesktopRoutingEnabled']) {
+        return ConvertTo-NotifyBridgeBoolean -Value $Config.paseoDesktopRoutingEnabled -Default $false
+    }
+    return $false
+}
+
+function Get-NotifyPaseoCdpPort {
+    [CmdletBinding()]
+    param($Config = $null)
+
+    $port = 29318
+    if ($null -ne $Config) {
+        if ($Config -is [hashtable]) {
+            if ($Config.ContainsKey('paseoCdpPort')) {
+                try { $port = [int]$Config['paseoCdpPort'] } catch { $port = 29318 }
+            }
+            elseif ($Config.ContainsKey('PaseoCdpPort')) {
+                try { $port = [int]$Config['PaseoCdpPort'] } catch { $port = 29318 }
+            }
+        }
+        elseif ($Config.PSObject.Properties['PaseoCdpPort']) {
+            try { $port = [int]$Config.PaseoCdpPort } catch { $port = 29318 }
+        }
+        elseif ($Config.PSObject.Properties['paseoCdpPort']) {
+            try { $port = [int]$Config.paseoCdpPort } catch { $port = 29318 }
+        }
+    }
+    if ($port -lt 1024 -or $port -gt 65535) { $port = 29318 }
+    return $port
+}
+
+function Invoke-NotifyPaseoRouteActivate {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$ActivationId,
+        $Config = $null,
+        [int]$TimeoutMs = 20000
+    )
+
+    $startedAt = [DateTime]::UtcNow
+    $activationFp = Get-NotifyRouteFingerprint -Value $ActivationId
+
+    if ([string]::IsNullOrWhiteSpace($ActivationId)) {
+        return [pscustomobject]@{
+            Decision     = 'fail-closed'
+            OriginKind   = 'paseo'
+            Result       = 'invalid'
+            Reason       = 'missing-activation-id'
+            ActivationFp = $activationFp
+            ElapsedMs    = [int]([DateTime]::UtcNow - $startedAt).TotalMilliseconds
+            Retryable    = $false
+        }
+    }
+
+    $activationState = Resolve-NotifyPaseoActivationState -ActivationId $ActivationId
+    if (-not $activationState.Available) {
+        return [pscustomobject]@{
+            Decision     = 'fail-closed'
+            OriginKind   = 'paseo'
+            Result       = [string]$activationState.Result
+            Reason       = [string]$activationState.Reason
+            ActivationFp = $activationFp
+            ElapsedMs    = [int]([DateTime]::UtcNow - $startedAt).TotalMilliseconds
+            Retryable    = $false
+        }
+    }
+
+    if (-not (Test-NotifyPaseoDesktopRoutingEnabled -Config $Config)) {
+        return [pscustomobject]@{
+            Decision     = 'fail-closed'
+            OriginKind   = 'paseo'
+            Result       = 'disabled'
+            Reason       = 'routing-disabled'
+            ActivationFp = $activationFp
+            ElapsedMs    = [int]([DateTime]::UtcNow - $startedAt).TotalMilliseconds
+            Retryable    = $true
+        }
+    }
+
+    $remainingMs = [int][Math]::Floor(([DateTime]::new([int64]$activationState.ExpiresAtTicks, [DateTimeKind]::Utc) - [DateTime]::UtcNow).TotalMilliseconds)
+    if ($remainingMs -lt 1000) {
+        return [pscustomobject]@{
+            Decision = 'fail-closed'; OriginKind = 'paseo'; Result = 'expired'; Reason = 'insufficient-activation-lifetime'
+            ActivationFp = $activationFp; ElapsedMs = [int]([DateTime]::UtcNow - $startedAt).TotalMilliseconds; Retryable = $false
+        }
+    }
+    $effectiveTimeoutMs = [Math]::Min([Math]::Max(500, $TimeoutMs), [Math]::Max(500, $remainingMs - 250))
+    $leaseSeconds = [int][Math]::Ceiling($effectiveTimeoutMs / 1000.0) + 5
+    $lease = Acquire-NotifyPaseoActivationLease -ActivationId $ActivationId -LeaseSeconds $leaseSeconds
+    if (-not $lease.Acquired) {
+        $resultName = if ($lease.Result) { [string]$lease.Result } else { 'invalid' }
+        $reason = if ($lease.Reason) { [string]$lease.Reason } else { 'activation-unavailable' }
+        $retryable = $resultName -in @('busy', 'cdp-unavailable', 'dispatch-failed', 'ack-timeout', 'target-missing')
+        return [pscustomobject]@{
+            Decision     = 'fail-closed'
+            OriginKind   = 'paseo'
+            Result       = $resultName
+            Reason       = $reason
+            ActivationFp = $activationFp
+            ElapsedMs    = [int]([DateTime]::UtcNow - $startedAt).TotalMilliseconds
+            Retryable    = $retryable
+        }
+    }
+
+    try {
+        $scriptPath = Get-NotifyPaseoDesktopRouteScriptPath
+        if ([string]::IsNullOrWhiteSpace($scriptPath) -or -not (Test-Path -LiteralPath $scriptPath)) {
+            [void](Release-NotifyPaseoActivationLease -ActivationId $ActivationId -LeaseId $lease.LeaseId)
+            return [pscustomobject]@{
+                Decision     = 'fail-closed'
+                OriginKind   = 'paseo'
+                Result       = 'controller-missing'
+                Reason       = 'route-script-missing'
+                ActivationFp = $activationFp
+                ElapsedMs    = [int]([DateTime]::UtcNow - $startedAt).TotalMilliseconds
+                Retryable    = $true
+            }
+        }
+
+        . $scriptPath
+
+        $route = [pscustomobject]@{
+            NotificationId   = $lease.NotificationId
+            NotificationKind = $lease.NotificationKind
+            ServerId         = $lease.ServerId
+            WorkspaceId      = $lease.WorkspaceId
+            AgentId          = $lease.AgentId
+        }
+
+        $controllerResult = Invoke-NotifyPaseoDesktopRouteActivate -Route $route -Config $Config -TimeoutMs $effectiveTimeoutMs
+        $resultName = if ($controllerResult.PSObject.Properties['Result'] -and -not [string]::IsNullOrWhiteSpace([string]$controllerResult.Result)) {
+            ([string]$controllerResult.Result).Trim()
+        } else {
+            'dispatch-failed'
+        }
+        $reason = if ($controllerResult.PSObject.Properties['Reason'] -and -not [string]::IsNullOrWhiteSpace([string]$controllerResult.Reason)) {
+            ([string]$controllerResult.Reason).Trim()
+        } else {
+            ''
+        }
+
+        if ($resultName -eq 'activated') {
+            if (Consume-NotifyPaseoActivationState -ActivationId $ActivationId -LeaseId $lease.LeaseId) {
+                return [pscustomobject]@{
+                    Decision     = 'handled'
+                    OriginKind   = 'paseo'
+                    Result       = 'activated'
+                    Reason       = ''
+                    ActivationFp = $activationFp
+                    ElapsedMs    = [int]([DateTime]::UtcNow - $startedAt).TotalMilliseconds
+                    Retryable    = $false
+                }
+            }
+            return [pscustomobject]@{
+                Decision = 'fail-closed'; OriginKind = 'paseo'; Result = 'consume-failed'; Reason = 'activation-consume-failed'
+                ActivationFp = $activationFp; ElapsedMs = [int]([DateTime]::UtcNow - $startedAt).TotalMilliseconds; Retryable = $false
+            }
+        }
+
+        [void](Release-NotifyPaseoActivationLease -ActivationId $ActivationId -LeaseId $lease.LeaseId)
+        $retryable = $resultName -notin @('expired', 'invalid', 'foreign-owner', 'non-loopback', 'ambiguous')
+        return [pscustomobject]@{
+            Decision     = 'fail-closed'
+            OriginKind   = 'paseo'
+            Result       = $resultName
+            Reason       = $reason
+            ActivationFp = $activationFp
+            ElapsedMs    = [int]([DateTime]::UtcNow - $startedAt).TotalMilliseconds
+            Retryable    = $retryable
+        }
+    }
+    catch {
+        try { [void](Release-NotifyPaseoActivationLease -ActivationId $ActivationId -LeaseId $lease.LeaseId) } catch {}
+        return [pscustomobject]@{
+            Decision     = 'fail-closed'
+            OriginKind   = 'paseo'
+            Result       = 'controller-error'
+            Reason       = 'client-error'
+            ActivationFp = $activationFp
+            ElapsedMs    = [int]([DateTime]::UtcNow - $startedAt).TotalMilliseconds
+            Retryable    = $true
+        }
+    }
+}
+
+function Test-NotifyPaseoForegroundActiveAgent {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$ServerId,
+        [Parameter(Mandatory = $true)][string]$AgentId,
+        $Config = $null,
+        [int]$TimeoutMs = 2500
+    )
+
+    if (-not (Test-NotifyPaseoDesktopRoutingEnabled -Config $Config)) {
+        return [pscustomobject]@{
+            State  = 'unknown'
+            Result = 'disabled'
+            Reason = 'routing-disabled'
+        }
+    }
+
+    $scriptPath = Get-NotifyPaseoDesktopRouteScriptPath
+    if ([string]::IsNullOrWhiteSpace($scriptPath) -or -not (Test-Path -LiteralPath $scriptPath)) {
+        return [pscustomobject]@{
+            State  = 'unknown'
+            Result = 'controller-missing'
+            Reason = 'route-script-missing'
+        }
+    }
+
+    try {
+        . $scriptPath
+        return Get-NotifyPaseoForegroundAgentState -ServerId $ServerId -AgentId $AgentId -Config $Config -TimeoutMs $TimeoutMs
+    }
+    catch {
+        return [pscustomobject]@{
+            State  = 'unknown'
+            Result = 'probe-error'
+            Reason = 'controller-error'
+        }
+    }
+}
+
+
+# --- Paseo parent contracts: close tombstones + authenticated health ---------------
+
+function Get-NotifyPaseoNotificationFingerprint {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$NotificationId)
+
+    if ([string]::IsNullOrWhiteSpace($NotificationId)) { return '' }
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $hash = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($NotificationId.Trim()))
+        return ([System.BitConverter]::ToString($hash).Replace('-', '').ToLowerInvariant())
+    }
+    finally {
+        $sha.Dispose()
+    }
+}
+
+function Get-NotifyPaseoCloseTombstoneDir {
+    [CmdletBinding()]
+    param()
+    return (Join-Path (Get-NotifyBridgeBaseDir) 'paseo-close-tombstone')
+}
+
+function Get-NotifyPaseoCloseTombstonePath {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$NotificationFingerprint)
+
+    $fp = $NotificationFingerprint.Trim().ToLowerInvariant()
+    if ($fp -notmatch '^[0-9a-f]{64}$') { return '' }
+    return (Join-Path (Get-NotifyPaseoCloseTombstoneDir) ('close-{0}.json' -f $fp))
+}
+
+function Get-NotifyPaseoCloseEventName {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$NotificationFingerprint)
+
+    $fp = $NotificationFingerprint.Trim().ToLowerInvariant()
+    if ($fp -notmatch '^[0-9a-f]{64}$') { return '' }
+    return ('Local\PiRemotePaseoClose_{0}' -f $fp)
+}
+
+function Enter-NotifyPaseoCloseTombstoneLock {
+    [CmdletBinding()]
+    param([int]$TimeoutMs = 5000)
+
+    $mutex = [System.Threading.Mutex]::new($false, 'Local\PiRemotePaseoCloseTombstone')
+    try {
+        if (-not $mutex.WaitOne([Math]::Max(100, $TimeoutMs), $false)) {
+            $mutex.Dispose()
+            return $null
+        }
+        return $mutex
+    }
+    catch [System.Threading.AbandonedMutexException] {
+        return $mutex
+    }
+    catch {
+        $mutex.Dispose()
+        throw
+    }
+}
+
+function Exit-NotifyPaseoCloseTombstoneLock {
+    [CmdletBinding()]
+    param($Mutex)
+
+    if ($null -eq $Mutex) { return }
+    try { $Mutex.ReleaseMutex() } finally { $Mutex.Dispose() }
+}
+
+function Test-NotifyPaseoCloseTombstonePayload {
+    [CmdletBinding()]
+    param(
+        $Payload,
+        [Parameter(Mandatory = $true)][string]$ExpectedFingerprint
+    )
+
+    if ($null -eq $Payload -or $ExpectedFingerprint -notmatch '^[0-9a-f]{64}$') { return $false }
+    if (-not $Payload.PSObject.Properties['version'] -or ([string]$Payload.version).Trim() -ne '1') { return $false }
+    if (-not $Payload.PSObject.Properties['fingerprint']) { return $false }
+    $fingerprint = ([string]$Payload.fingerprint).Trim().ToLowerInvariant()
+    if ($fingerprint -notmatch '^[0-9a-f]{64}$') { return $false }
+    if (-not $fingerprint.Equals($ExpectedFingerprint, [System.StringComparison]::Ordinal)) { return $false }
+    if (-not $Payload.PSObject.Properties['expiresAtTicks']) { return $false }
+
+    $expiresAtTicks = [int64]0
+    if (-not [int64]::TryParse([string]$Payload.expiresAtTicks, [ref]$expiresAtTicks)) { return $false }
+    $nowTicks = [DateTime]::UtcNow.Ticks
+    if ($expiresAtTicks -le $nowTicks) { return $false }
+    if ($expiresAtTicks -gt [DateTime]::UtcNow.AddSeconds(1800).Ticks) { return $false }
+    return $true
+}
+
+function Clear-NotifyPaseoCloseTombstones {
+    [CmdletBinding()]
+    param(
+        [int]$MaxAgeSeconds = 1800,
+        [int]$MaxCount = 96
+    )
+
+    $dir = Get-NotifyPaseoCloseTombstoneDir
+    if (-not (Test-Path -LiteralPath $dir)) { return }
+
+    foreach ($tempItem in @(Get-ChildItem -LiteralPath $dir -Filter 'close-*.json.tmp-*' -File -ErrorAction SilentlyContinue)) {
+        Remove-Item -LiteralPath $tempItem.FullName -Force -ErrorAction SilentlyContinue
+    }
+
+    $cutoff = (Get-Date).AddSeconds(-[Math]::Max(3, $MaxAgeSeconds))
+    $items = @(Get-ChildItem -LiteralPath $dir -Filter 'close-*.json' -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime)
+    foreach ($item in $items) {
+        $remove = $item.LastWriteTime -lt $cutoff
+        if (-not $remove) {
+            try {
+                $nameMatch = [regex]::Match($item.Name, '^close-([0-9a-f]{64})\.json$')
+                if (-not $nameMatch.Success) {
+                    $remove = $true
+                }
+                else {
+                    $payload = [System.IO.File]::ReadAllText($item.FullName, [System.Text.UTF8Encoding]::new($false)) | ConvertFrom-Json
+                    $remove = -not (Test-NotifyPaseoCloseTombstonePayload -Payload $payload -ExpectedFingerprint $nameMatch.Groups[1].Value)
+                }
+            }
+            catch {
+                $remove = $true
+            }
+        }
+        if ($remove) {
+            Remove-Item -LiteralPath $item.FullName -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    $remaining = @(Get-ChildItem -LiteralPath $dir -Filter 'close-*.json' -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime)
+    while ($remaining.Count -gt $MaxCount) {
+        try { Remove-Item -LiteralPath $remaining[0].FullName -Force -ErrorAction SilentlyContinue } catch {}
+        if ($remaining.Count -gt 0) { $remaining = @($remaining | Select-Object -Skip 1) } else { break }
+    }
+}
+
+function Test-NotifyPaseoCloseTombstone {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$NotificationId)
+
+    if (-not (Test-NotifyRouteUuid -Value $NotificationId)) { return $false }
+    $fp = Get-NotifyPaseoNotificationFingerprint -NotificationId $NotificationId
+    $path = Get-NotifyPaseoCloseTombstonePath -NotificationFingerprint $fp
+    if ([string]::IsNullOrWhiteSpace($path) -or -not (Test-Path -LiteralPath $path)) { return $false }
+    try {
+        $payload = [System.IO.File]::ReadAllText($path, [System.Text.UTF8Encoding]::new($false)) | ConvertFrom-Json
+        if (Test-NotifyPaseoCloseTombstonePayload -Payload $payload -ExpectedFingerprint $fp) {
+            return $true
+        }
+    }
+    catch {}
+
+    # Corrupt, partial, expired, or fingerprint-mismatched markers never suppress.
+    try { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue } catch {}
+    return $false
+}
+
+function Test-NotifyPaseoCloseSignal {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$NotificationId,
+        $CloseEvent = $null
+    )
+
+    if (-not (Test-NotifyRouteUuid -Value $NotificationId)) { return $false }
+    if ($null -ne $CloseEvent) {
+        try {
+            if ($CloseEvent.WaitOne(0)) { return $true }
+        }
+        catch {}
+    }
+    return (Test-NotifyPaseoCloseTombstone -NotificationId $NotificationId)
+}
+
+function Save-NotifyPaseoCloseTombstone {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$NotificationId,
+        [int]$TtlSeconds = 1800
+    )
+
+    if (-not (Test-NotifyRouteUuid -Value $NotificationId)) {
+        return [pscustomobject]@{ Ok = $false; Result = 'invalid'; Fingerprint = '' }
+    }
+
+    $fp = Get-NotifyPaseoNotificationFingerprint -NotificationId $NotificationId
+    $mutex = Enter-NotifyPaseoCloseTombstoneLock
+    if ($null -eq $mutex) {
+        return [pscustomobject]@{ Ok = $false; Result = 'retry'; Fingerprint = $fp }
+    }
+    try {
+        $ttl = [Math]::Max(3, [Math]::Min(1800, $TtlSeconds))
+        $dir = Get-NotifyPaseoCloseTombstoneDir
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        Clear-NotifyPaseoCloseTombstones -MaxAgeSeconds 1800 -MaxCount 95
+
+        $path = Get-NotifyPaseoCloseTombstonePath -NotificationFingerprint $fp
+        $payload = @{
+            version        = 1
+            fingerprint    = $fp
+            expiresAtTicks = [DateTime]::UtcNow.AddSeconds($ttl).Ticks
+            createdAtUtc   = [DateTime]::UtcNow.ToString('o')
+        }
+        $tempPath = $path + ('.tmp-{0}' -f [Guid]::NewGuid().ToString('N'))
+        try {
+            [System.IO.File]::WriteAllText($tempPath, ($payload | ConvertTo-Json -Depth 3 -Compress), [System.Text.UTF8Encoding]::new($false))
+            if (Test-Path -LiteralPath $path) {
+                [System.IO.File]::Replace($tempPath, $path, $null)
+            }
+            else {
+                [System.IO.File]::Move($tempPath, $path)
+            }
+            $tempPath = ''
+        }
+        finally {
+            if (-not [string]::IsNullOrWhiteSpace($tempPath)) {
+                try { Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue } catch {}
+            }
+        }
+
+        # Best-effort signal for live fallback popup processes.
+        try {
+            $eventName = Get-NotifyPaseoCloseEventName -NotificationFingerprint $fp
+            if (-not [string]::IsNullOrWhiteSpace($eventName)) {
+                $ev = [System.Threading.EventWaitHandle]::new($true, [System.Threading.EventResetMode]::ManualReset, $eventName)
+                try { [void]$ev.Set() } finally { $ev.Dispose() }
+            }
+        }
+        catch {}
+
+        return [pscustomobject]@{ Ok = $true; Result = 'ok'; Fingerprint = $fp }
+    }
+    catch {
+        return [pscustomobject]@{ Ok = $false; Result = 'retry'; Fingerprint = $fp }
+    }
+    finally {
+        Exit-NotifyPaseoCloseTombstoneLock -Mutex $mutex
+    }
+}
+
+function Save-NotifyPaseoActivationUnlessClosed {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$ActivationId,
+        [Parameter(Mandatory = $true)][string]$NotificationId,
+        [Parameter(Mandatory = $true)][string]$NotificationKind,
+        [Parameter(Mandatory = $true)][string]$ServerId,
+        [Parameter(Mandatory = $true)][string]$WorkspaceId,
+        [Parameter(Mandatory = $true)][string]$AgentId,
+        [int]$TtlSeconds = 1800
+    )
+
+    # Serialize the final tombstone check with activation creation. Whichever
+    # operation wins first leaves the other side able to converge without resurrection.
+    $mutex = Enter-NotifyPaseoCloseTombstoneLock
+    if ($null -eq $mutex) {
+        return [pscustomobject]@{ Ok = $false; Result = 'retry' }
+    }
+    try {
+        if (Test-NotifyPaseoCloseTombstone -NotificationId $NotificationId) {
+            return [pscustomobject]@{ Ok = $true; Result = 'closed' }
+        }
+        try {
+            [void](Save-NotifyPaseoActivationState -ActivationId $ActivationId -NotificationId $NotificationId -NotificationKind $NotificationKind -ServerId $ServerId -WorkspaceId $WorkspaceId -AgentId $AgentId -TtlSeconds $TtlSeconds)
+            return [pscustomobject]@{ Ok = $true; Result = 'saved' }
+        }
+        catch {
+            return [pscustomobject]@{ Ok = $false; Result = 'retry' }
+        }
+    }
+    finally {
+        Exit-NotifyPaseoCloseTombstoneLock -Mutex $mutex
+    }
+}
+
+function Revoke-NotifyPaseoActivationByNotificationId {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$NotificationId)
+
+    if (-not (Test-NotifyRouteUuid -Value $NotificationId)) {
+        return [pscustomobject]@{ Ok = $false; Result = 'invalid'; Removed = 0; Scanned = 0; TargetFingerprint = '' }
+    }
+
+    $targetId = $NotificationId.Trim()
+    $mutex = Enter-NotifyPaseoActivationCacheLock
+    if ($null -eq $mutex) {
+        return [pscustomobject]@{ Ok = $false; Result = 'retry'; Removed = 0; Scanned = 0; TargetFingerprint = '' }
+    }
+    try {
+        Clear-NotifyPaseoActivationCache -MaxAgeSeconds 1800 -MaxCount 96
+        $dir = Get-NotifyPaseoActivationCacheDir
+        if (-not (Test-Path -LiteralPath $dir)) {
+            return [pscustomobject]@{ Ok = $true; Result = 'ok'; Removed = 0; Scanned = 0; TargetFingerprint = '' }
+        }
+
+        $items = @(Get-ChildItem -LiteralPath $dir -Filter 'activation-*.json' -File -ErrorAction SilentlyContinue)
+        $scanned = 0
+        $removed = 0
+        $targetFingerprint = ''
+        foreach ($item in $items) {
+            $scanned += 1
+            if ($scanned -gt 96) { break }
+            try {
+                $payload = [System.IO.File]::ReadAllText($item.FullName, [System.Text.UTF8Encoding]::new($false)) | ConvertFrom-Json
+                $state = ConvertFrom-NotifyPaseoActivationPayload -Payload $payload -ActivationId ''
+                $notificationId = ''
+                $serverId = ''
+                $agentId = ''
+                if ($state.Available -or $state.Result -eq 'busy') {
+                    $notificationId = [string]$state.NotificationId
+                    $serverId = [string]$state.ServerId
+                    $agentId = [string]$state.AgentId
+                }
+                else {
+                    if ($payload.PSObject.Properties['protectedNotificationId']) {
+                        try { $notificationId = Unprotect-NotifyBridgeValue -Value ([string]$payload.protectedNotificationId) } catch { $notificationId = '' }
+                    }
+                    if ($payload.PSObject.Properties['protectedPaseoServerId']) {
+                        try { $serverId = Unprotect-NotifyBridgeValue -Value ([string]$payload.protectedPaseoServerId) } catch { $serverId = '' }
+                    }
+                    if ($payload.PSObject.Properties['protectedPaseoAgentId']) {
+                        try { $agentId = Unprotect-NotifyBridgeValue -Value ([string]$payload.protectedPaseoAgentId) } catch { $agentId = '' }
+                    }
+                }
+                if (-not [string]::IsNullOrWhiteSpace($notificationId) -and $notificationId.Trim().Equals($targetId, [System.StringComparison]::OrdinalIgnoreCase)) {
+                    if ([string]::IsNullOrWhiteSpace($targetFingerprint) -and -not [string]::IsNullOrWhiteSpace($serverId) -and -not [string]::IsNullOrWhiteSpace($agentId)) {
+                        $targetFingerprint = Get-NotifyPaseoTargetFingerprint -ServerId $serverId -AgentId $agentId
+                    }
+                    Remove-Item -LiteralPath $item.FullName -Force -ErrorAction SilentlyContinue
+                    $removed += 1
+                }
+            }
+            catch {
+                # Keep scanning; one corrupt entry must not fail close orchestration.
+            }
+        }
+        return [pscustomobject]@{ Ok = $true; Result = 'ok'; Removed = $removed; Scanned = $scanned; TargetFingerprint = $targetFingerprint }
+    }
+    catch {
+        return [pscustomobject]@{ Ok = $false; Result = 'retry'; Removed = 0; Scanned = 0; TargetFingerprint = '' }
+    }
+    finally {
+        Exit-NotifyPaseoActivationCacheLock -Mutex $mutex
+    }
+}
+
+function Revoke-NotifyPaseoToastActivationPointers {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$NotificationId)
+
+    if (-not (Test-NotifyRouteUuid -Value $NotificationId)) {
+        return [pscustomobject]@{ Ok = $false; Result = 'invalid'; Removed = 0; Scanned = 0 }
+    }
+
+    $targetId = $NotificationId.Trim()
+    $removed = 0
+    $scanned = 0
+    try {
+        $logDirs = @((Get-NotifyBridgeLogDir), (Join-Path (Get-NotifyBridgeDefaultBaseDir) 'logs')) | Select-Object -Unique
+        foreach ($logDir in $logDirs) {
+            if (-not (Test-Path -LiteralPath $logDir)) { continue }
+            foreach ($item in @(Get-ChildItem -LiteralPath $logDir -Filter 'activation-*.json' -File -ErrorAction Stop)) {
+                $scanned += 1
+                if ($scanned -gt 192) { break }
+                try {
+                    $payload = [System.IO.File]::ReadAllText($item.FullName, [System.Text.UTF8Encoding]::new($false)) | ConvertFrom-Json
+                    $originKind = if ($payload.PSObject.Properties['originKind']) { ([string]$payload.originKind).Trim() } else { '' }
+                    if ($originKind -ne 'paseo' -or -not $payload.PSObject.Properties['protectedNotificationId']) { continue }
+                    $storedId = Unprotect-NotifyBridgeValue -Value ([string]$payload.protectedNotificationId)
+                }
+                catch {
+                    # A malformed/unreadable unrelated pointer is not an exact match.
+                    continue
+                }
+                if (-not $storedId.Trim().Equals($targetId, [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+                try {
+                    Remove-Item -LiteralPath $item.FullName -Force -ErrorAction Stop
+                    $removed += 1
+                }
+                catch {
+                    return [pscustomobject]@{ Ok = $false; Result = 'retry'; Removed = $removed; Scanned = $scanned }
+                }
+            }
+            if ($scanned -gt 192) { break }
+        }
+        return [pscustomobject]@{ Ok = $true; Result = 'ok'; Removed = $removed; Scanned = $scanned }
+    }
+    catch {
+        return [pscustomobject]@{ Ok = $false; Result = 'retry'; Removed = $removed; Scanned = $scanned }
+    }
+}
+
+function Invoke-NotifyBrokerPaseoCloseByNotificationId {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$NotificationId,
+        $Config = $null
+    )
+
+    if (-not (Test-NotifyRouteUuid -Value $NotificationId)) {
+        return [pscustomobject]@{ Ok = $false; Result = 'invalid' }
+    }
+
+    $port = 23119
+    $timeoutMs = 800
+    if ($null -ne $Config) {
+        if ($Config -is [hashtable]) {
+            if ($Config.ContainsKey('BrokerPort')) { try { $port = [int]$Config['BrokerPort'] } catch {} }
+            elseif ($Config.ContainsKey('brokerPort')) { try { $port = [int]$Config['brokerPort'] } catch {} }
+            if ($Config.ContainsKey('BrokerRequestTimeoutMs')) { try { $timeoutMs = [int]$Config['BrokerRequestTimeoutMs'] } catch {} }
+            elseif ($Config.ContainsKey('brokerRequestTimeoutMs')) { try { $timeoutMs = [int]$Config['brokerRequestTimeoutMs'] } catch {} }
+        }
+        else {
+            if ($Config.PSObject.Properties['BrokerPort']) { try { $port = [int]$Config.BrokerPort } catch {} }
+            if ($Config.PSObject.Properties['BrokerRequestTimeoutMs']) { try { $timeoutMs = [int]$Config.BrokerRequestTimeoutMs } catch {} }
+        }
+    }
+    $timeoutMs = [Math]::Max(200, [Math]::Min(3000, $timeoutMs))
+
+    $payload = @{
+        originKind     = 'paseo'
+        version        = 1
+        notificationId = $NotificationId.Trim()
+    } | ConvertTo-Json -Depth 3 -Compress
+    $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($payload)
+
+    $client = $null
+    $connectHandle = $null
+    try {
+        $client = [System.Net.Sockets.TcpClient]::new()
+        $connectResult = $client.BeginConnect('127.0.0.1', $port, $null, $null)
+        $connectHandle = $connectResult.AsyncWaitHandle
+        if (-not $connectHandle.WaitOne($timeoutMs)) {
+            return [pscustomobject]@{ Ok = $true; Result = 'broker-absent' }
+        }
+        $client.EndConnect($connectResult)
+        $client.ReceiveTimeout = $timeoutMs
+        $client.SendTimeout = $timeoutMs
+        $requestHead = "POST /close HTTP/1.1`r`nHost: 127.0.0.1:$port`r`nContent-Type: application/json; charset=utf-8`r`nContent-Length: $($bodyBytes.Length)`r`nConnection: close`r`n`r`n"
+        $requestBytes = [System.Text.Encoding]::ASCII.GetBytes($requestHead)
+        $stream = $client.GetStream()
+        $stream.Write($requestBytes, 0, $requestBytes.Length)
+        $stream.Write($bodyBytes, 0, $bodyBytes.Length)
+        $stream.Flush()
+
+        $deadline = [DateTime]::UtcNow.AddMilliseconds([Math]::Min(150, $timeoutMs))
+        while (-not $stream.DataAvailable -and [DateTime]::UtcNow -lt $deadline) {
+            Start-Sleep -Milliseconds 10
+        }
+        # Broker absence/down is not a close failure: fallback/tombstone still apply.
+        return [pscustomobject]@{ Ok = $true; Result = 'ok' }
+    }
+    catch {
+        return [pscustomobject]@{ Ok = $true; Result = 'broker-unreachable' }
+    }
+    finally {
+        if ($null -ne $connectHandle) { try { $connectHandle.Close() } catch {} }
+        if ($null -ne $client) { try { $client.Close() } catch {} }
+    }
+}
+
+function Remove-NotifyPaseoSystemToast {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$NotificationId,
+        [string]$TargetFingerprint = '',
+        [string]$ToastAppId = 'Pi Remote'
+    )
+
+    if (-not (Test-NotifyRouteUuid -Value $NotificationId)) {
+        return [pscustomobject]@{ Ok = $false; Result = 'invalid' }
+    }
+
+    try {
+        [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null
+        $tag = $NotificationId.Trim()
+        $group = if (-not [string]::IsNullOrWhiteSpace($TargetFingerprint)) { $TargetFingerprint.Trim() } else { '' }
+        # Exact tag + agent-group only. Never clear an entire group (would remove newer same-agent toasts).
+        if (-not [string]::IsNullOrWhiteSpace($group)) {
+            [Windows.UI.Notifications.ToastNotificationManager]::History.Remove($tag, $group, $ToastAppId)
+        }
+        else {
+            [Windows.UI.Notifications.ToastNotificationManager]::History.Remove($tag)
+        }
+        return [pscustomobject]@{ Ok = $true; Result = 'ok' }
+    }
+    catch {
+        # Best-effort toast-history errors must never fail the overall close path.
+        return [pscustomobject]@{ Ok = $true; Result = 'toast-history-unavailable' }
+    }
+}
+
+function Invoke-NotifyPaseoCloseByNotificationId {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$NotificationId,
+        $Config = $null,
+        [string]$ToastAppId = 'Pi Remote'
+    )
+
+    if (-not (Test-NotifyRouteUuid -Value $NotificationId)) {
+        return [pscustomobject]@{
+            Ok = $false
+            Result = 'invalid'
+            NotificationFp = ''
+            RemovedActivations = 0
+        }
+    }
+
+    $notificationFp = Get-NotifyRouteFingerprint -Value $NotificationId
+    $ttlSeconds = Get-NotifyPaseoActivationTtlSeconds -Config $Config
+    $tombstone = Save-NotifyPaseoCloseTombstone -NotificationId $NotificationId -TtlSeconds $ttlSeconds
+    if (-not $tombstone.Ok) {
+        return [pscustomobject]@{
+            Ok = $false
+            Result = $(if ($tombstone.Result) { [string]$tombstone.Result } else { 'retry' })
+            NotificationFp = $notificationFp
+            RemovedActivations = 0
+        }
+    }
+
+    $revoke = Revoke-NotifyPaseoActivationByNotificationId -NotificationId $NotificationId
+    if (-not $revoke.Ok -and [string]$revoke.Result -eq 'retry') {
+        return [pscustomobject]@{
+            Ok = $false
+            Result = 'retry'
+            NotificationFp = $notificationFp
+            RemovedActivations = [int]$revoke.Removed
+        }
+    }
+
+    $pointerRevoke = Revoke-NotifyPaseoToastActivationPointers -NotificationId $NotificationId
+    if (-not $pointerRevoke.Ok) {
+        return [pscustomobject]@{
+            Ok = $false
+            Result = 'retry'
+            NotificationFp = $notificationFp
+            RemovedActivations = [int]$revoke.Removed
+            RemovedPointers = [int]$pointerRevoke.Removed
+        }
+    }
+
+    $agentFingerprint = if ($revoke.PSObject.Properties['TargetFingerprint']) { [string]$revoke.TargetFingerprint } else { '' }
+    [void](Invoke-NotifyBrokerPaseoCloseByNotificationId -NotificationId $NotificationId -Config $Config)
+    [void](Remove-NotifyPaseoSystemToast -NotificationId $NotificationId -TargetFingerprint $agentFingerprint -ToastAppId $ToastAppId)
+
+    return [pscustomobject]@{
+        Ok = $true
+        Result = 'ok'
+        NotificationFp = $notificationFp
+        RemovedActivations = [int]$revoke.Removed
+        RemovedPointers = [int]$pointerRevoke.Removed
+    }
+}
+
+function Get-NotifyPaseoPersistedElectronFlags {
+    [CmdletBinding()]
+    param()
+
+    try {
+        return [string][Environment]::GetEnvironmentVariable('PASEO_ELECTRON_FLAGS', 'User')
+    }
+    catch {
+        return ''
+    }
+}
+
+function Test-NotifyPaseoPersistedElectronFlags {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][int]$Port,
+        [string]$Flags = ''
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Flags)) {
+        return [pscustomobject]@{ Ok = $false; Result = 'flags-missing' }
+    }
+    $tokens = @($Flags -split '\s+' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    $hasPort = $false
+    $hasAddress = $false
+    $badAddress = $false
+    $badPort = $false
+    foreach ($token in $tokens) {
+        if ($token -match '^--remote-debugging-port=(.+)$') {
+            $portText = $Matches[1].Trim()
+            $parsed = 0
+            if ([int]::TryParse($portText, [ref]$parsed) -and $parsed -eq $Port) {
+                $hasPort = $true
+            }
+            else {
+                $badPort = $true
+            }
+        }
+        elseif ($token -eq '--remote-debugging-port') {
+            $badPort = $true
+        }
+        elseif ($token -match '^--remote-debugging-address=(.+)$') {
+            $addr = $Matches[1].Trim()
+            if ($addr -eq '127.0.0.1') {
+                $hasAddress = $true
+            }
+            else {
+                $badAddress = $true
+            }
+        }
+        elseif ($token -eq '--remote-debugging-address') {
+            $badAddress = $true
+        }
+    }
+    if ($badPort -or $badAddress) {
+        return [pscustomobject]@{ Ok = $false; Result = 'flags-mismatch' }
+    }
+    if (-not $hasPort -or -not $hasAddress) {
+        return [pscustomobject]@{ Ok = $false; Result = 'flags-incomplete' }
+    }
+    return [pscustomobject]@{ Ok = $true; Result = 'ok' }
+}
+
+function Get-NotifyPaseoDisplayReadyState {
+    [CmdletBinding()]
+    param(
+        $Config = $null,
+        [string]$DisplayMode = ''
+    )
+
+    $mode = ''
+    if (-not [string]::IsNullOrWhiteSpace($DisplayMode)) {
+        $mode = $DisplayMode.Trim().ToLowerInvariant()
+    }
+    elseif ($null -ne $Config) {
+        if ($Config -is [hashtable]) {
+            if ($Config.ContainsKey('DisplayMode')) { $mode = ([string]$Config['DisplayMode']).Trim().ToLowerInvariant() }
+            elseif ($Config.ContainsKey('displayMode')) { $mode = ([string]$Config['displayMode']).Trim().ToLowerInvariant() }
+        }
+        else {
+            if ($Config.PSObject.Properties['DisplayMode']) { $mode = ([string]$Config.DisplayMode).Trim().ToLowerInvariant() }
+            elseif ($Config.PSObject.Properties['displayMode']) { $mode = ([string]$Config.displayMode).Trim().ToLowerInvariant() }
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($mode)) { $mode = 'popup-focus' }
+
+    if ($mode -eq 'system-toast') {
+        return [pscustomobject]@{ Ready = $true; Result = 'system-toast' }
+    }
+
+    $popupScript = Join-Path (Get-NotifyBridgeBinDir) 'pi-notify-popup.ps1'
+    if (-not (Test-Path -LiteralPath $popupScript)) {
+        $popupScript = Join-Path $PSScriptRoot 'pi-notify-popup.ps1'
+    }
+    if (Test-Path -LiteralPath $popupScript) {
+        return [pscustomobject]@{ Ready = $true; Result = 'popup-script-present' }
+    }
+    return [pscustomobject]@{ Ready = $false; Result = 'popup-script-missing' }
+}
+
+function Get-NotifyPaseoCdpOwnerReadyState {
+    [CmdletBinding()]
+    param($Owner)
+
+    if ($null -eq $Owner -or -not $Owner.PSObject.Properties['Available']) {
+        return [pscustomobject]@{ Ready = $false; RouteState = 'probe-error'; Result = 'owner-response-malformed'; ProbeTargets = $false }
+    }
+    if ([bool]$Owner.Available) {
+        return [pscustomobject]@{ Ready = $false; RouteState = 'owner-ready'; Result = 'owner-ready'; ProbeTargets = $true }
+    }
+    if ([string]$Owner.Reason -eq 'no-listener') {
+        return [pscustomobject]@{ Ready = $true; RouteState = 'app-absent'; Result = 'app-absent'; ProbeTargets = $false }
+    }
+    if ([string]$Owner.Result -eq 'non-loopback') {
+        return [pscustomobject]@{ Ready = $false; RouteState = 'non-loopback'; Result = 'non-loopback'; ProbeTargets = $false }
+    }
+    if ([string]$Owner.Result -eq 'foreign-owner') {
+        return [pscustomobject]@{ Ready = $false; RouteState = 'foreign-owner'; Result = 'foreign-owner'; ProbeTargets = $false }
+    }
+    if ([string]$Owner.Result -eq 'ambiguous') {
+        return [pscustomobject]@{ Ready = $false; RouteState = 'ambiguous'; Result = 'ambiguous'; ProbeTargets = $false }
+    }
+    return [pscustomobject]@{ Ready = $false; RouteState = 'probe-error'; Result = [string]$Owner.Reason; ProbeTargets = $false }
+}
+
+function Get-NotifyPaseoCdpTargetReadyState {
+    [CmdletBinding()]
+    param(
+        $Response,
+        [Parameter(Mandatory = $true)][int]$Port
+    )
+
+    if ($null -eq $Response -or -not $Response.PSObject.Properties['Ok'] -or $Response.Ok -isnot [bool]) {
+        return [pscustomobject]@{ Ready = $false; RouteState = 'malformed'; Result = 'target-response-malformed' }
+    }
+    if (-not $Response.Ok) {
+        $reason = if ($Response.PSObject.Properties['Reason']) { [string]$Response.Reason } else { '' }
+        $routeState = if ($reason -eq 'malformed-target-list') { 'malformed' } else { 'cdp-unavailable' }
+        return [pscustomobject]@{ Ready = $false; RouteState = $routeState; Result = $(if ($reason) { $reason } else { 'target-probe-failed' }) }
+    }
+    if (-not $Response.PSObject.Properties['Targets']) {
+        return [pscustomobject]@{ Ready = $false; RouteState = 'malformed'; Result = 'targets-missing' }
+    }
+
+    $trusted = @(@($Response.Targets) | Where-Object { Test-NotifyPaseoTrustedPageTarget -Target $_ -Port $Port })
+    if ($trusted.Count -lt 1) {
+        return [pscustomobject]@{ Ready = $false; RouteState = 'target-missing'; Result = 'target-missing' }
+    }
+    return [pscustomobject]@{ Ready = $true; RouteState = 'ready'; Result = 'ready' }
+}
+
+function Get-NotifyPaseoRouteReadyState {
+    [CmdletBinding()]
+    param($Config = $null)
+
+    # Side-effect free readiness probe. Never launches, kills, restarts, navigates, or mutates env.
+    if (-not (Test-NotifyPaseoDesktopRoutingEnabled -Config $Config)) {
+        return [pscustomobject]@{
+            Ready = $false
+            RouteState = 'disabled'
+            Result = 'disabled'
+        }
+    }
+
+    $port = Get-NotifyPaseoCdpPort -Config $Config
+    if ($port -lt 1024 -or $port -gt 65535) {
+        return [pscustomobject]@{ Ready = $false; RouteState = 'config-invalid'; Result = 'port-out-of-range' }
+    }
+
+    $listenerPort = 23118
+    $brokerPort = 23119
+    if ($null -ne $Config) {
+        if ($Config -is [hashtable]) {
+            if ($Config.ContainsKey('Port')) { try { $listenerPort = [int]$Config['Port'] } catch {} }
+            elseif ($Config.ContainsKey('port')) { try { $listenerPort = [int]$Config['port'] } catch {} }
+            if ($Config.ContainsKey('BrokerPort')) { try { $brokerPort = [int]$Config['BrokerPort'] } catch {} }
+            elseif ($Config.ContainsKey('brokerPort')) { try { $brokerPort = [int]$Config['brokerPort'] } catch {} }
+        }
+        else {
+            if ($Config.PSObject.Properties['Port']) { try { $listenerPort = [int]$Config.Port } catch {} }
+            if ($Config.PSObject.Properties['BrokerPort']) { try { $brokerPort = [int]$Config.BrokerPort } catch {} }
+        }
+    }
+    if ($port -eq $listenerPort -or $port -eq $brokerPort) {
+        return [pscustomobject]@{ Ready = $false; RouteState = 'config-invalid'; Result = 'port-conflict' }
+    }
+
+    $controllerPath = Get-NotifyPaseoDesktopRouteScriptPath
+    if ([string]::IsNullOrWhiteSpace($controllerPath) -or -not (Test-Path -LiteralPath $controllerPath)) {
+        return [pscustomobject]@{ Ready = $false; RouteState = 'controller-missing'; Result = 'controller-missing' }
+    }
+
+    # Load controller helpers for owner/target/exe checks without side effects.
+    try {
+        if (-not (Get-Command -Name Get-NotifyPaseoCdpOwnerSnapshot -ErrorAction SilentlyContinue)) {
+            . $controllerPath
+        }
+    }
+    catch {
+        return [pscustomobject]@{ Ready = $false; RouteState = 'controller-error'; Result = 'controller-load-failed' }
+    }
+
+    $expectedExe = Get-NotifyPaseoExpectedExecutablePath -Config $Config
+    if ([string]::IsNullOrWhiteSpace($expectedExe) -or -not (Test-Path -LiteralPath $expectedExe)) {
+        return [pscustomobject]@{ Ready = $false; RouteState = 'executable-missing'; Result = 'executable-missing' }
+    }
+
+    $flags = Get-NotifyPaseoPersistedElectronFlags
+    $flagState = Test-NotifyPaseoPersistedElectronFlags -Port $port -Flags $flags
+    if (-not $flagState.Ok) {
+        return [pscustomobject]@{ Ready = $false; RouteState = 'flags-mismatch'; Result = [string]$flagState.Result }
+    }
+
+    $owner = Get-NotifyPaseoCdpOwnerSnapshot -Port $port -Config $Config
+    $ownerState = Get-NotifyPaseoCdpOwnerReadyState -Owner $owner
+    if (-not $ownerState.ProbeTargets) {
+        return [pscustomobject]@{ Ready = [bool]$ownerState.Ready; RouteState = [string]$ownerState.RouteState; Result = [string]$ownerState.Result }
+    }
+
+    try {
+        $response = Get-NotifyPaseoCdpTargetList -Port $port -TimeoutMs 1200
+        return Get-NotifyPaseoCdpTargetReadyState -Response $response -Port $port
+    }
+    catch {
+        return [pscustomobject]@{ Ready = $false; RouteState = 'probe-error'; Result = 'target-probe-error' }
+    }
+}
+
+function Get-NotifyPaseoHealthSnapshot {
+    [CmdletBinding()]
+    param(
+        $Config = $null,
+        [string]$DisplayMode = ''
+    )
+
+    $listenerReady = $true
+    $display = Get-NotifyPaseoDisplayReadyState -Config $Config -DisplayMode $DisplayMode
+    $route = Get-NotifyPaseoRouteReadyState -Config $Config
+    $ready = [bool]($listenerReady -and $display.Ready -and $route.Ready)
+
+    return [pscustomobject]@{
+        version       = 1
+        ready         = $ready
+        listenerReady = $listenerReady
+        displayReady  = [bool]$display.Ready
+        routeReady    = [bool]$route.Ready
+        routeState    = [string]$route.RouteState
+        capabilities  = [pscustomobject]@{
+            notifyV1            = $true
+            closeV1             = $true
+            existingClickEventV1 = $true
+        }
+    }
+}
+
+function ConvertTo-NotifyPaseoHealthJson {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$Snapshot
+    )
+
+    # Fixed schema only: never emit token/paths/ports/PIDs/URLs/route IDs/title/body.
+    $payload = [ordered]@{
+        version       = 1
+        ready         = [bool]$Snapshot.ready
+        listenerReady = [bool]$Snapshot.listenerReady
+        displayReady  = [bool]$Snapshot.displayReady
+        routeReady    = [bool]$Snapshot.routeReady
+        routeState    = [string]$Snapshot.routeState
+        capabilities  = [ordered]@{
+            notifyV1             = $true
+            closeV1              = $true
+            existingClickEventV1 = $true
+        }
+    }
+    return ($payload | ConvertTo-Json -Depth 4 -Compress)
+}
+
+function Resolve-NotifyPaseoCloseRequest {
+    [CmdletBinding()]
+    param($Payload)
+
+    $originKind = Get-NotifyPayloadStringField -Payload $Payload -Name 'originKind'
+    $notificationId = Get-NotifyPayloadStringField -Payload $Payload -Name 'notificationId'
+    $versionRaw = ''
+    if ($null -ne $Payload -and $Payload.PSObject.Properties['version']) {
+        try { $versionRaw = [string]$Payload.version } catch { $versionRaw = '' }
+        if ([string]::IsNullOrWhiteSpace($versionRaw)) {
+            $versionRaw = Get-NotifyPayloadStringField -Payload $Payload -Name 'version'
+        }
+    }
+
+    $result = [pscustomobject]@{
+        IsValid        = $false
+        OriginKind     = $originKind
+        NotificationId = $notificationId
+        Version        = $versionRaw
+        InvalidReason  = ''
+    }
+
+    # The external contract is exact: no benign-looking extension fields are accepted.
+    $properties = if ($null -eq $Payload) { @() } else { @($Payload.PSObject.Properties) }
+    $allowed = @('originKind', 'version', 'notificationId')
+    if ($properties.Count -ne $allowed.Count) {
+        $result.InvalidReason = 'unexpected-field'
+        return $result
+    }
+    foreach ($property in $properties) {
+        if ($allowed -cnotcontains [string]$property.Name) {
+            $result.InvalidReason = 'unexpected-field'
+            return $result
+        }
+    }
+    foreach ($required in $allowed) {
+        if ($properties.Name -cnotcontains $required) {
+            $result.InvalidReason = 'unexpected-field'
+            return $result
+        }
+    }
+
+    if ($originKind -ne 'paseo') {
+        $result.InvalidReason = 'origin-kind'
+        return $result
+    }
+    if (($versionRaw + '').Trim() -ne '1') {
+        $result.InvalidReason = 'version'
+        return $result
+    }
+    if (-not (Test-NotifyRouteUuid -Value $notificationId)) {
+        $result.InvalidReason = 'notification-id'
+        return $result
+    }
+
+    $result.IsValid = $true
+    $result.Version = '1'
+    $result.NotificationId = $notificationId.Trim()
+    return $result
 }

@@ -1,0 +1,9 @@
+{
+  "enabled": true,
+  "deliveryMode": "shadow",
+  "daemonUrl": "ws://127.0.0.1:8787",
+  "clientId": "paseo-sender",
+  "windowsEndpoint": "http://127.0.0.1:23118/notify",
+  "windowsToken": "",
+  "detailedSummary": false
+}

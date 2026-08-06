@@ -389,6 +389,451 @@ Write-Host "`n== Route host exe resolution =="
 $exe = Get-NotifyRouteHostExe
 Assert-True ($exe -match 'PiNotifyRouteHost') 'default-exe-contains-name'
 
+
+# --- Paseo payload / label / TTL / selection contracts ---
+Write-Host "`n== Paseo route metadata =="
+
+function New-ValidPaseoPayload {
+    param(
+        [string]$Kind = 'finished',
+        [string]$ServerId = 'server-alpha',
+        [string]$WorkspaceId = 'workspace-one',
+        [string]$AgentId = 'agent-42'
+    )
+    return [pscustomobject]@{
+        title            = 'Paseo agent'
+        body             = 'done'
+        originKind       = 'paseo'
+        notificationId   = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
+        notificationKind = $Kind
+        paseoRoute       = [pscustomobject]@{
+            version     = 1
+            serverId    = $ServerId
+            workspaceId = $WorkspaceId
+            agentId     = $AgentId
+        }
+    }
+}
+
+$paseoValid = Resolve-NotifyPaseoRouteMetadata -Payload (New-ValidPaseoPayload)
+Assert-True $paseoValid.IsValidPaseoExact 'paseo-valid-exact'
+Assert-equal 'paseo' $paseoValid.OriginKind 'paseo-valid-origin'
+Assert-equal 'finished' $paseoValid.NotificationKind 'paseo-valid-kind'
+Assert-equal '' $paseoValid.InvalidReason 'paseo-valid-reason'
+
+$paseoPerm = Resolve-NotifyPaseoRouteMetadata -Payload (New-ValidPaseoPayload -Kind 'permission')
+Assert-True $paseoPerm.IsValidPaseoExact 'paseo-permission-valid'
+
+$paseoError = Resolve-NotifyPaseoRouteMetadata -Payload (New-ValidPaseoPayload -Kind 'error')
+Assert-True (-not $paseoError.IsValidPaseoExact) 'paseo-error-rejected'
+Assert-Equal 'notification-kind' $paseoError.InvalidReason 'paseo-error-reason'
+
+$paseoBadVersion = New-ValidPaseoPayload
+$paseoBadVersion.paseoRoute.version = 2
+$meta = Resolve-NotifyPaseoRouteMetadata -Payload $paseoBadVersion
+Assert-True (-not $meta.IsValidPaseoExact) 'paseo-bad-version-rejected'
+Assert-equal 'route-version' $meta.InvalidReason 'paseo-bad-version-reason'
+
+$paseoNonCanonicalVersion = New-ValidPaseoPayload
+$paseoNonCanonicalVersion.paseoRoute.version = '01'
+$meta = Resolve-NotifyPaseoRouteMetadata -Payload $paseoNonCanonicalVersion
+Assert-True (-not $meta.IsValidPaseoExact) 'paseo-noncanonical-version-rejected'
+
+$paseoNonStringId = New-ValidPaseoPayload
+$paseoNonStringId.paseoRoute.serverId = [pscustomobject]@{ nested = 'not-an-id' }
+$meta = Resolve-NotifyPaseoRouteMetadata -Payload $paseoNonStringId
+Assert-True (-not $meta.IsValidPaseoExact) 'paseo-non-string-id-rejected'
+Assert-equal 'server-id' $meta.InvalidReason 'paseo-non-string-id-reason'
+
+$paseoOpaqueId = New-ValidPaseoPayload -ServerId 'server:alpha/path?opaque'
+$meta = Resolve-NotifyPaseoRouteMetadata -Payload $paseoOpaqueId
+Assert-True $meta.IsValidPaseoExact 'paseo-opaque-id-separators-accepted'
+
+$paseoLongId = New-ValidPaseoPayload -ServerId ('s' * 257)
+$meta = Resolve-NotifyPaseoRouteMetadata -Payload $paseoLongId
+Assert-True (-not $meta.IsValidPaseoExact) 'paseo-overlong-server-rejected'
+Assert-equal 'server-id' $meta.InvalidReason 'paseo-overlong-server-reason'
+
+$paseoCtrl = New-ValidPaseoPayload -AgentId ("agent`twith-control")
+$meta = Resolve-NotifyPaseoRouteMetadata -Payload $paseoCtrl
+Assert-True (-not $meta.IsValidPaseoExact) 'paseo-control-char-rejected'
+
+$paseoNoRoute = Resolve-NotifyPaseoRouteMetadata -Payload ([pscustomobject]@{ originKind = 'paseo'; notificationId = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'; notificationKind = 'finished' })
+Assert-True (-not $paseoNoRoute.IsValidPaseoExact) 'paseo-missing-route-rejected'
+
+Assert-equal 'Paseo' (Get-NotifyAppLabel -OriginKind 'paseo') 'app-label-paseo'
+Assert-equal 'Pi Remote' (Get-NotifyAppLabel -OriginKind 'pi-web') 'app-label-pi-web'
+Assert-equal 'Pi Remote' (Get-NotifyAppLabel -OriginKind 'terminal') 'app-label-terminal'
+Assert-equal 'Pi Remote' (Get-NotifyAppLabel -OriginKind '') 'app-label-empty'
+
+Write-Host "`n== Paseo TTL and fingerprint =="
+Assert-equal 1800 (Get-NotifyPaseoActivationTtlSeconds -PopupTimeoutSeconds 99999) 'paseo-ttl-hard-cap-30m'
+Assert-equal 30 (Get-NotifyPaseoActivationTtlSeconds -PopupTimeoutSeconds 30) 'paseo-ttl-follows-popup'
+Assert-equal 1800 (Get-NotifyPaseoActivationTtlSeconds -PopupTimeoutSeconds 0) 'paseo-ttl-default-when-missing'
+Assert-equal 1800 (Get-NotifyPaseoActivationTtlSeconds -Config @{ popupTimeoutSeconds = 5000 }) 'paseo-ttl-config-capped'
+
+$fp1 = Get-NotifyPaseoTargetFingerprint -ServerId 'srv' -AgentId 'ag'
+$fp2 = Get-NotifyPaseoTargetFingerprint -ServerId 'srv' -AgentId 'ag'
+$fp3 = Get-NotifyPaseoTargetFingerprint -ServerId 'srv' -AgentId 'other'
+Assert-equal $fp1 $fp2 'paseo-fp-stable'
+Assert-True ($fp1 -ne $fp3) 'paseo-fp-differs-by-agent'
+Assert-equal 64 $fp1.Length 'paseo-fp-sha256-hex-length'
+
+Write-Host "`n== Paseo target selection =="
+# Dot-source controller for pure selection helpers without network.
+. (Join-Path $scriptDir 'paseo-desktop-route.ps1')
+
+$tExact = [pscustomobject]@{ ServerId = 's1'; AgentId = 'a1'; WorkspaceId = 'w1' }
+$tServerOnly = [pscustomobject]@{ ServerId = 's1'; AgentId = 'other'; WorkspaceId = 'w1' }
+$tOther = [pscustomobject]@{ ServerId = 's2'; AgentId = 'a9'; WorkspaceId = 'w9' }
+
+$sel = Select-NotifyPaseoActivationTarget -Targets @($tExact, $tOther) -ServerId 's1' -AgentId 'a1'
+Assert-True $sel.Ok 'select-exact-agent-ok'
+Assert-equal 'exact-agent' $sel.Result 'select-exact-agent-result'
+
+$sel = Select-NotifyPaseoActivationTarget -Targets @($tServerOnly, $tOther) -ServerId 's1' -AgentId 'a1'
+Assert-True $sel.Ok 'select-exact-server-ok'
+Assert-equal 'exact-server' $sel.Result 'select-exact-server-result'
+
+$sel = Select-NotifyPaseoActivationTarget -Targets @($tExact, ([pscustomobject]@{ ServerId = 's1'; AgentId = 'a1'; WorkspaceId = 'w2' })) -ServerId 's1' -AgentId 'a1'
+Assert-True (-not $sel.Ok) 'select-ambiguous-exact-agent'
+Assert-equal 'ambiguous' $sel.Result 'select-ambiguous-result'
+
+$sel = Select-NotifyPaseoActivationTarget -Targets @($tServerOnly, ([pscustomobject]@{ ServerId = 's1'; AgentId = 'x'; WorkspaceId = 'w3' })) -ServerId 's1' -AgentId 'a1'
+Assert-True (-not $sel.Ok) 'select-ambiguous-exact-server'
+Assert-equal 'ambiguous' $sel.Result 'select-ambiguous-server-result'
+
+$sel = Select-NotifyPaseoActivationTarget -Targets @($tOther) -ServerId 's1' -AgentId 'a1'
+Assert-True (-not $sel.Ok) 'select-missing'
+Assert-equal 'target-missing' $sel.Result 'select-missing-result'
+
+Assert-True (Test-NotifyPaseoLoopbackAddress -Address '127.0.0.1') 'loopback-v4'
+Assert-True (Test-NotifyPaseoLoopbackAddress -Address '::1') 'loopback-v6'
+Assert-True (Test-NotifyPaseoLoopbackAddress -Address '[::1]') 'loopback-v6-bracketed-uri-host'
+Assert-True (-not (Test-NotifyPaseoLoopbackAddress -Address '192.168.1.10')) 'non-loopback-rejected'
+Assert-True (-not (Test-NotifyPaseoLoopbackAddress -Address '0.0.0.0')) 'zero-addr-rejected'
+Assert-True (-not (Test-NotifyPaseoLoopbackAddress -Address '127.0.0.2')) 'non-canonical-loopback-rejected'
+
+$trustedTarget = [pscustomobject]@{ id = 'page-1'; type = 'page'; url = 'paseo://app/h/server-alpha'; title = 'Paseo'; webSocketDebuggerUrl = 'ws://127.0.0.1:29318/devtools/page/page-1' }
+Assert-True (Test-NotifyPaseoTrustedPageTarget -Target $trustedTarget -Port 29318) 'trusted-page-target'
+$foreignTarget = [pscustomobject]@{ id = 'page-2'; type = 'page'; url = 'https://example.invalid/paseo'; title = 'Paseo'; webSocketDebuggerUrl = 'ws://127.0.0.1:29318/devtools/page/page-2' }
+Assert-True (-not (Test-NotifyPaseoTrustedPageTarget -Target $foreignTarget -Port 29318)) 'title-substring-not-trusted'
+$wrongPortTarget = [pscustomobject]@{ id = 'page-3'; type = 'page'; url = 'paseo://app/h/server-alpha'; title = 'Paseo'; webSocketDebuggerUrl = 'ws://127.0.0.1:29319/devtools/page/page-3' }
+Assert-True (-not (Test-NotifyPaseoTrustedPageTarget -Target $wrongPortTarget -Port 29318)) 'target-websocket-port-must-match'
+$mismatchedPageTarget = [pscustomobject]@{ id = 'page-4'; type = 'page'; url = 'paseo://app/h/server-alpha'; title = 'Paseo'; webSocketDebuggerUrl = 'ws://127.0.0.1:29318/devtools/page/other-page' }
+Assert-True (-not (Test-NotifyPaseoTrustedPageTarget -Target $mismatchedPageTarget -Port 29318)) 'target-websocket-page-id-must-match'
+
+$probeExpr = New-NotifyPaseoCdpEvaluateExpression -Mode probe
+Assert-True ($probeExpr -notmatch 'Page\.navigate') 'probe-no-page-navigate'
+Assert-True ($probeExpr -notmatch 'paseo://') 'probe-no-paseo-url'
+$dispatchExpr = New-NotifyPaseoCdpEvaluateExpression -Mode dispatch -ServerId 's' -WorkspaceId 'w' -AgentId 'a'
+Assert-True ($dispatchExpr -match 'paseo:web-notification-click') 'dispatch-uses-existing-event'
+Assert-True ($dispatchExpr -notmatch 'Page\.navigate') 'dispatch-no-page-navigate'
+Assert-True ($dispatchExpr -notmatch 'paseo://') 'dispatch-no-paseo-url'
+Assert-True ($dispatchExpr -match 'atob\(') 'dispatch-base64-payload'
+
+Write-Host "`n== Paseo activation state machine =="
+# Prefer an isolated temp base so tests never touch the real user runtime dir.
+$tempBase = Join-Path ([System.IO.Path]::GetTempPath()) ('paseo-route-test-' + [Guid]::NewGuid().ToString('N'))
+$tempConfig = Join-Path $tempBase 'config.json'
+New-Item -ItemType Directory -Force -Path $tempBase | Out-Null
+try {
+    $cfg = Ensure-NotifyBridgeConfig -ConfigPath $tempConfig -Port 23118
+    Assert-True (-not [bool]$cfg.PaseoDesktopRoutingEnabled) 'paseo-routing-default-disabled'
+    Assert-equal 29318 ([int]$cfg.PaseoCdpPort) 'paseo-cdp-default-port'
+
+    $activationId = [Guid]::NewGuid().ToString('N')
+    $saved = $null
+    $dpapiOk = $true
+    try {
+        $saved = Save-NotifyPaseoActivationState -ActivationId $activationId -NotificationId 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee' -NotificationKind 'finished' -ServerId 'server-alpha' -WorkspaceId 'workspace-one' -AgentId 'agent-42' -TtlSeconds 60
+    }
+    catch {
+        $dpapiOk = $false
+    }
+
+    if ($dpapiOk -and $null -ne $saved) {
+        $read = Resolve-NotifyPaseoActivationState -ActivationId $activationId
+        Assert-True $read.Available 'paseo-activation-read-available'
+        Assert-equal 'ready' $read.State 'paseo-activation-ready'
+        Assert-equal 'server-alpha' $read.ServerId 'paseo-activation-server'
+        Assert-equal 'workspace-one' $read.WorkspaceId 'paseo-activation-workspace'
+        Assert-equal 'agent-42' $read.AgentId 'paseo-activation-agent'
+
+        $lease1 = Acquire-NotifyPaseoActivationLease -ActivationId $activationId -LeaseSeconds 30
+        Assert-True $lease1.Acquired 'paseo-lease-first-ok'
+        $lease2 = Acquire-NotifyPaseoActivationLease -ActivationId $activationId -LeaseSeconds 30
+        Assert-True (-not $lease2.Acquired) 'paseo-lease-second-busy'
+        Assert-equal 'busy' $lease2.Result 'paseo-lease-busy-result'
+        Assert-True (-not (Release-NotifyPaseoActivationLease -ActivationId $activationId -LeaseId ([Guid]::NewGuid().ToString('N')))) 'paseo-wrong-owner-cannot-release'
+
+        [void](Release-NotifyPaseoActivationLease -ActivationId $activationId -LeaseId $lease1.LeaseId)
+        $afterRelease = Resolve-NotifyPaseoActivationState -ActivationId $activationId
+        Assert-True $afterRelease.Available 'paseo-after-release-available'
+        Assert-equal 'ready' $afterRelease.State 'paseo-after-release-ready'
+
+        $lease3 = Acquire-NotifyPaseoActivationLease -ActivationId $activationId -LeaseSeconds 30
+        Assert-True $lease3.Acquired 'paseo-lease-reacquire-ok'
+        Assert-True (-not (Consume-NotifyPaseoActivationState -ActivationId $activationId -LeaseId ([Guid]::NewGuid().ToString('N')))) 'paseo-wrong-owner-cannot-consume'
+        [void](Consume-NotifyPaseoActivationState -ActivationId $activationId -LeaseId $lease3.LeaseId)
+        $afterConsume = Resolve-NotifyPaseoActivationState -ActivationId $activationId
+        Assert-True (-not $afterConsume.Available) 'paseo-consumed-missing'
+
+        # Disabled routing remains retryable for a valid, unconsumed activation.
+        $disabledId = [Guid]::NewGuid().ToString('N')
+        [void](Save-NotifyPaseoActivationState -ActivationId $disabledId -NotificationId 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff' -NotificationKind 'finished' -ServerId 'server-alpha' -WorkspaceId 'workspace-one' -AgentId 'agent-42' -TtlSeconds 60)
+        $disabled = Invoke-NotifyPaseoRouteActivate -ActivationId $disabledId -Config @{ paseoDesktopRoutingEnabled = $false } -TimeoutMs 100
+        Assert-equal 'fail-closed' $disabled.Decision 'paseo-disabled-fail-closed'
+        Assert-equal 'disabled' $disabled.Result 'paseo-disabled-result'
+        Assert-equal 'paseo' $disabled.OriginKind 'paseo-disabled-origin-preserved'
+        Assert-True (Resolve-NotifyPaseoActivationState -ActivationId $disabledId).Available 'paseo-disabled-not-consumed'
+
+        $expiredId = [Guid]::NewGuid().ToString('N')
+        [void](Save-NotifyPaseoActivationState -ActivationId $expiredId -NotificationId 'cccccccc-dddd-4eee-8fff-aaaaaaaaaaaa' -NotificationKind 'finished' -ServerId 'server-alpha' -WorkspaceId 'workspace-one' -AgentId 'agent-42' -TtlSeconds 60)
+        $expiredPayload = Read-NotifyPaseoActivationPayload -ActivationId $expiredId
+        $expiredPayload.expiresAtTicks = 1
+        [void](Write-NotifyPaseoActivationPayload -ActivationId $expiredId -Payload $expiredPayload)
+        $expired = Resolve-NotifyPaseoActivationState -ActivationId $expiredId
+        Assert-True (-not $expired.Available) 'paseo-expired-unavailable'
+        Assert-equal 'expired' $expired.Result 'paseo-expired-result'
+    }
+    else {
+        Write-Host 'SKIP  paseo-dpapi-state-machine (ProtectedData unavailable on this host)'
+    }
+}
+finally {
+    try { Remove-Item -LiteralPath $tempBase -Recurse -Force -ErrorAction SilentlyContinue } catch {}
+}
+
+
+Write-Host "`n== Paseo close request and tombstone =="
+$closeValid = Resolve-NotifyPaseoCloseRequest -Payload ([pscustomobject]@{
+    originKind = 'paseo'
+    version = 1
+    notificationId = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
+})
+Assert-True $closeValid.IsValid 'paseo-close-valid'
+Assert-equal '1' $closeValid.Version 'paseo-close-version'
+
+$closeBadOrigin = Resolve-NotifyPaseoCloseRequest -Payload ([pscustomobject]@{
+    originKind = 'pi-web'
+    version = 1
+    notificationId = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
+})
+Assert-True (-not $closeBadOrigin.IsValid) 'paseo-close-rejects-non-paseo'
+Assert-equal 'origin-kind' $closeBadOrigin.InvalidReason 'paseo-close-bad-origin-reason'
+
+$closeBadUuid = Resolve-NotifyPaseoCloseRequest -Payload ([pscustomobject]@{
+    originKind = 'paseo'
+    version = 1
+    notificationId = 'not-a-uuid'
+})
+Assert-True (-not $closeBadUuid.IsValid) 'paseo-close-rejects-bad-uuid'
+Assert-equal 'notification-id' $closeBadUuid.InvalidReason 'paseo-close-bad-uuid-reason'
+
+$closeWithRoute = Resolve-NotifyPaseoCloseRequest -Payload ([pscustomobject]@{
+    originKind = 'paseo'
+    version = 1
+    notificationId = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
+    serverId = 'should-not-be-here'
+})
+Assert-True (-not $closeWithRoute.IsValid) 'paseo-close-rejects-route-fields'
+Assert-equal 'unexpected-field' $closeWithRoute.InvalidReason 'paseo-close-unexpected-field-reason'
+
+$closeWithBenignExtra = Resolve-NotifyPaseoCloseRequest -Payload ([pscustomobject]@{
+    originKind = 'paseo'
+    version = 1
+    notificationId = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
+    clientVersion = '1.0'
+})
+Assert-True (-not $closeWithBenignExtra.IsValid) 'paseo-close-rejects-benign-extra-field'
+Assert-equal 'unexpected-field' $closeWithBenignExtra.InvalidReason 'paseo-close-benign-extra-reason'
+
+$fpOld = Get-NotifyPaseoNotificationFingerprint -NotificationId 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
+$fpNew = Get-NotifyPaseoNotificationFingerprint -NotificationId 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff'
+Assert-equal 64 $fpOld.Length 'paseo-close-fp-length'
+Assert-True ($fpOld -ne $fpNew) 'paseo-close-fp-differs-by-uuid'
+Assert-True ((Get-NotifyPaseoCloseEventName -NotificationFingerprint $fpOld) -match '^Local\\PiRemotePaseoClose_[0-9a-f]{64}$') 'paseo-close-event-name'
+
+Write-Host "`n== Paseo health schema and readiness =="
+$flagsOk = Test-NotifyPaseoPersistedElectronFlags -Port 29318 -Flags '--remote-debugging-port=29318 --remote-debugging-address=127.0.0.1'
+Assert-True $flagsOk.Ok 'paseo-flags-exact-ok'
+$flagsBadHost = Test-NotifyPaseoPersistedElectronFlags -Port 29318 -Flags '--remote-debugging-port=29318 --remote-debugging-address=0.0.0.0'
+Assert-True (-not $flagsBadHost.Ok) 'paseo-flags-non-loopback-rejected'
+$flagsBadPort = Test-NotifyPaseoPersistedElectronFlags -Port 29318 -Flags '--remote-debugging-port=23118 --remote-debugging-address=127.0.0.1'
+Assert-True (-not $flagsBadPort.Ok) 'paseo-flags-wrong-port-rejected'
+$flagsMissing = Test-NotifyPaseoPersistedElectronFlags -Port 29318 -Flags ''
+Assert-True (-not $flagsMissing.Ok) 'paseo-flags-missing-rejected'
+
+$displayPopup = Get-NotifyPaseoDisplayReadyState -DisplayMode 'popup-focus'
+Assert-True $displayPopup.Ready 'paseo-display-popup-ready-when-script-present'
+$displayToast = Get-NotifyPaseoDisplayReadyState -DisplayMode 'system-toast'
+Assert-True $displayToast.Ready 'paseo-display-system-toast-ready'
+
+# Source-isolated owner/target probes cover Windows-only branches without live CDP.
+$ownerAbsent = Get-NotifyPaseoCdpOwnerSnapshot -Port 29318 -ConnectionProbe { param($Port) @() }
+Assert-equal 'no-listener' $ownerAbsent.Reason 'paseo-owner-proven-empty-listener'
+$ownerAbsentState = Get-NotifyPaseoCdpOwnerReadyState -Owner $ownerAbsent
+Assert-True $ownerAbsentState.Ready 'paseo-owner-app-absent-ready'
+Assert-equal 'app-absent' $ownerAbsentState.RouteState 'paseo-owner-app-absent-state'
+
+$ownerProbeError = Get-NotifyPaseoCdpOwnerSnapshot -Port 29318 -ConnectionProbe { param($Port) throw 'probe denied' }
+Assert-equal 'probe-error' $ownerProbeError.Result 'paseo-owner-probe-error-fail-closed'
+Assert-True (-not (Get-NotifyPaseoCdpOwnerReadyState -Owner $ownerProbeError).Ready) 'paseo-owner-probe-error-not-app-absent'
+
+$ownerNonLoopback = Get-NotifyPaseoCdpOwnerSnapshot -Port 29318 -ConnectionProbe {
+    param($Port)
+    @([pscustomobject]@{ LocalAddress = '0.0.0.0'; LocalPort = $Port; OwningProcess = 42 })
+}
+Assert-equal 'non-loopback' $ownerNonLoopback.Result 'paseo-owner-non-loopback'
+
+$ownerForeign = Get-NotifyPaseoCdpOwnerSnapshot -Port 29318 -ConnectionProbe {
+    param($Port)
+    @([pscustomobject]@{ LocalAddress = '127.0.0.1'; LocalPort = $Port; OwningProcess = 42 })
+} -ProcessProbe {
+    param($ProcessId)
+    [pscustomobject]@{ ProcessName = 'chrome'; Path = 'C:\foreign\chrome.exe' }
+}
+Assert-equal 'foreign-owner' $ownerForeign.Result 'paseo-owner-foreign-process'
+
+$trustedTargetResponse = [pscustomobject]@{ Ok = $true; Targets = @($trustedTarget); Reason = '' }
+$trustedTargetState = Get-NotifyPaseoCdpTargetReadyState -Response $trustedTargetResponse -Port 29318
+Assert-True $trustedTargetState.Ready 'paseo-health-live-target-wrapper-ready'
+Assert-equal 'ready' $trustedTargetState.RouteState 'paseo-health-live-target-wrapper-state'
+$malformedTargetState = Get-NotifyPaseoCdpTargetReadyState -Response ([pscustomobject]@{ Ok = $true }) -Port 29318
+Assert-True (-not $malformedTargetState.Ready) 'paseo-health-malformed-target-fail-closed'
+Assert-equal 'malformed' $malformedTargetState.RouteState 'paseo-health-malformed-target-state'
+$unavailableTargetState = Get-NotifyPaseoCdpTargetReadyState -Response ([pscustomobject]@{ Ok = $false; Targets = @(); Reason = 'cdp-unavailable' }) -Port 29318
+Assert-True (-not $unavailableTargetState.Ready) 'paseo-health-target-probe-unavailable-fail-closed'
+
+$disabledRoute = Get-NotifyPaseoRouteReadyState -Config @{ paseoDesktopRoutingEnabled = $false; paseoCdpPort = 29318; Port = 23118; BrokerPort = 23119 }
+Assert-True (-not $disabledRoute.Ready) 'paseo-route-disabled-not-ready'
+Assert-equal 'disabled' $disabledRoute.RouteState 'paseo-route-disabled-state'
+
+$conflictRoute = Get-NotifyPaseoRouteReadyState -Config @{ paseoDesktopRoutingEnabled = $true; paseoCdpPort = 23118; Port = 23118; BrokerPort = 23119 }
+Assert-True (-not $conflictRoute.Ready) 'paseo-route-port-conflict-not-ready'
+Assert-equal 'config-invalid' $conflictRoute.RouteState 'paseo-route-port-conflict-state'
+
+$healthDisabled = Get-NotifyPaseoHealthSnapshot -Config @{ paseoDesktopRoutingEnabled = $false; paseoCdpPort = 29318; Port = 23118; BrokerPort = 23119 } -DisplayMode 'popup-focus'
+Assert-True $healthDisabled.listenerReady 'paseo-health-listener-ready'
+Assert-True $healthDisabled.displayReady 'paseo-health-display-ready'
+Assert-True (-not $healthDisabled.routeReady) 'paseo-health-route-not-ready-when-disabled'
+Assert-True (-not $healthDisabled.ready) 'paseo-health-ready-false-when-disabled'
+Assert-equal 'disabled' $healthDisabled.routeState 'paseo-health-route-state-disabled'
+Assert-True $healthDisabled.capabilities.notifyV1 'paseo-health-cap-notify'
+Assert-True $healthDisabled.capabilities.closeV1 'paseo-health-cap-close'
+Assert-True $healthDisabled.capabilities.existingClickEventV1 'paseo-health-cap-click'
+
+$healthJson = ConvertTo-NotifyPaseoHealthJson -Snapshot $healthDisabled
+Assert-True ($healthJson -match '"version"\s*:\s*1') 'paseo-health-json-version'
+Assert-True ($healthJson -match '"routeState"\s*:\s*"disabled"') 'paseo-health-json-route-state'
+Assert-True ($healthJson -match '"notifyV1"\s*:\s*true') 'paseo-health-json-cap-notify'
+Assert-True ($healthJson -match '"closeV1"\s*:\s*true') 'paseo-health-json-cap-close'
+Assert-True ($healthJson -match '"existingClickEventV1"\s*:\s*true') 'paseo-health-json-cap-click'
+Assert-True ($healthJson -notmatch 'token|X-Pi-Notify|127\.0\.0\.1:|paseo://|notificationId|serverId|workspaceId|agentId|"title"|"body"|webSocketDebuggerUrl') 'paseo-health-json-no-secrets'
+
+# Isolated tombstone/revoke race tests under temp base.
+$tempCloseBase = Join-Path ([System.IO.Path]::GetTempPath()) ('paseo-close-test-' + [Guid]::NewGuid().ToString('N'))
+$tempCloseConfig = Join-Path $tempCloseBase 'config.json'
+New-Item -ItemType Directory -Force -Path $tempCloseBase | Out-Null
+try {
+    $null = Ensure-NotifyBridgeConfig -ConfigPath $tempCloseConfig -Port 23118
+    $oldId = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
+    $newId = 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff'
+    Assert-True (-not (Test-NotifyPaseoCloseTombstone -NotificationId $oldId)) 'paseo-tombstone-absent-initially'
+
+    # Corrupt/partial/tampered markers never suppress and are cleaned.
+    $corruptId = 'cccccccc-dddd-4eee-8fff-aaaaaaaaaaaa'
+    [void](Save-NotifyPaseoCloseTombstone -NotificationId $corruptId -TtlSeconds 60)
+    $corruptFp = Get-NotifyPaseoNotificationFingerprint -NotificationId $corruptId
+    $corruptPath = Get-NotifyPaseoCloseTombstonePath -NotificationFingerprint $corruptFp
+    [System.IO.File]::WriteAllText($corruptPath, '{"version":1}', [System.Text.UTF8Encoding]::new($false))
+    Assert-True (-not (Test-NotifyPaseoCloseTombstone -NotificationId $corruptId)) 'paseo-tombstone-partial-does-not-suppress'
+    Assert-True (-not (Test-Path -LiteralPath $corruptPath)) 'paseo-tombstone-partial-cleaned'
+
+    [void](Save-NotifyPaseoCloseTombstone -NotificationId $corruptId -TtlSeconds 60)
+    $tampered = [System.IO.File]::ReadAllText($corruptPath, [System.Text.UTF8Encoding]::new($false)) | ConvertFrom-Json
+    $tampered.fingerprint = Get-NotifyPaseoNotificationFingerprint -NotificationId $newId
+    [System.IO.File]::WriteAllText($corruptPath, ($tampered | ConvertTo-Json -Compress), [System.Text.UTF8Encoding]::new($false))
+    Assert-True (-not (Test-NotifyPaseoCloseTombstone -NotificationId $corruptId)) 'paseo-tombstone-fingerprint-mismatch-does-not-suppress'
+
+    $signalId = 'dddddddd-eeee-4fff-8aaa-bbbbbbbbbbbb'
+    [void](Save-NotifyPaseoCloseTombstone -NotificationId $signalId -TtlSeconds 60)
+    $activationInProgress = $true
+    Assert-True (Test-NotifyPaseoCloseSignal -NotificationId $signalId) 'paseo-close-signal-visible-during-activation'
+    Assert-True $activationInProgress 'paseo-close-signal-does-not-depend-on-activation-state'
+
+    $savedOld = $null
+    $savedNew = $null
+    $dpapiOk = $true
+    try {
+        $savedOld = Save-NotifyPaseoActivationState -ActivationId ([Guid]::NewGuid().ToString('N')) -NotificationId $oldId -NotificationKind 'permission' -ServerId 'server-alpha' -WorkspaceId 'workspace-one' -AgentId 'agent-42' -TtlSeconds 60
+        $savedNew = Save-NotifyPaseoActivationState -ActivationId ([Guid]::NewGuid().ToString('N')) -NotificationId $newId -NotificationKind 'permission' -ServerId 'server-alpha' -WorkspaceId 'workspace-one' -AgentId 'agent-42' -TtlSeconds 60
+    }
+    catch {
+        $dpapiOk = $false
+    }
+
+    if ($dpapiOk -and $null -ne $savedOld -and $null -ne $savedNew) {
+        # Toast pointer cache uses the same protected notification UUID and must close exactly.
+        $pointerDir = Get-NotifyBridgeLogDir
+        New-Item -ItemType Directory -Force -Path $pointerDir | Out-Null
+        $oldPointerPath = Join-Path $pointerDir ('activation-{0}.json' -f [Guid]::NewGuid().ToString('N'))
+        $newPointerPath = Join-Path $pointerDir ('activation-{0}.json' -f [Guid]::NewGuid().ToString('N'))
+        $pointerBase = @{ originKind = 'paseo'; expiresAtTicks = [DateTime]::UtcNow.AddSeconds(60).Ticks }
+        $oldPointer = $pointerBase.Clone()
+        $oldPointer['protectedNotificationId'] = Protect-NotifyBridgeValue -Value $oldId
+        $newPointer = $pointerBase.Clone()
+        $newPointer['protectedNotificationId'] = Protect-NotifyBridgeValue -Value $newId
+        [System.IO.File]::WriteAllText($oldPointerPath, ($oldPointer | ConvertTo-Json -Compress), [System.Text.UTF8Encoding]::new($false))
+        [System.IO.File]::WriteAllText($newPointerPath, ($newPointer | ConvertTo-Json -Compress), [System.Text.UTF8Encoding]::new($false))
+
+        $closeOld = Invoke-NotifyPaseoCloseByNotificationId -NotificationId $oldId -Config @{ popupTimeoutSeconds = 60 }
+        Assert-True $closeOld.Ok 'paseo-close-old-ok'
+        Assert-equal 'ok' $closeOld.Result 'paseo-close-old-result'
+        Assert-True (Test-NotifyPaseoCloseTombstone -NotificationId $oldId) 'paseo-tombstone-old-present'
+        Assert-True (-not (Test-NotifyPaseoCloseTombstone -NotificationId $newId)) 'paseo-tombstone-new-absent'
+        Assert-True (-not (Test-Path -LiteralPath $oldPointerPath)) 'paseo-close-revokes-exact-toast-pointer'
+        Assert-True (Test-Path -LiteralPath $newPointerPath) 'paseo-close-old-preserves-new-toast-pointer'
+
+        # Closing an already-missing id remains idempotent ok.
+        $closeAgain = Invoke-NotifyPaseoCloseByNotificationId -NotificationId $oldId -Config @{ popupTimeoutSeconds = 60 }
+        Assert-True $closeAgain.Ok 'paseo-close-idempotent-ok'
+
+        # A close that wins the race prevents a later activation cache resurrection.
+        $racedActivationId = [Guid]::NewGuid().ToString('N')
+        $racedSave = Save-NotifyPaseoActivationUnlessClosed -ActivationId $racedActivationId -NotificationId $oldId -NotificationKind 'permission' -ServerId 'server-alpha' -WorkspaceId 'workspace-one' -AgentId 'agent-42' -TtlSeconds 60
+        Assert-equal 'closed' $racedSave.Result 'paseo-close-wins-notify-race'
+        Assert-True (-not (Resolve-NotifyPaseoActivationState -ActivationId $racedActivationId).Available) 'paseo-close-race-does-not-create-activation'
+
+        # Exact old close must not revoke a newer same-agent activation.
+        $stillNew = $false
+        $dir = Get-NotifyPaseoActivationCacheDir
+        foreach ($item in @(Get-ChildItem -LiteralPath $dir -Filter 'activation-*.json' -File -ErrorAction SilentlyContinue)) {
+            try {
+                $payload = [System.IO.File]::ReadAllText($item.FullName, [System.Text.UTF8Encoding]::new($false)) | ConvertFrom-Json
+                $state = ConvertFrom-NotifyPaseoActivationPayload -Payload $payload -ActivationId ''
+                if ($state.Available -and [string]$state.NotificationId -eq $newId) { $stillNew = $true }
+            } catch {}
+        }
+        Assert-True $stillNew 'paseo-close-old-does-not-revoke-new'
+
+        # Notify after close hits tombstone contract helper.
+        Assert-True (Test-NotifyPaseoCloseTombstone -NotificationId $oldId) 'paseo-notify-after-close-dedup-helper'
+    }
+    else {
+        Write-Host 'SKIP  paseo-close-tombstone-dpapi (ProtectedData unavailable on this host)'
+    }
+}
+finally {
+    try { Remove-Item -LiteralPath $tempCloseBase -Recurse -Force -ErrorAction SilentlyContinue } catch {}
+}
+
+Write-Host "`n== Paseo foreground dismiss deny =="
+Assert-True (-not (Test-NotifyForegroundDismissAllowed -OriginKind 'paseo')) 'dismiss-denied-paseo'
+Assert-True (-not (Test-NotifyForegroundDismissAllowed -OriginKind 'PASEO')) 'dismiss-denied-paseo-case'
+
+
 # Summary
 Write-Host ""
 Write-Host ("Results: {0} passed, {1} failed" -f $script:TestPasses, $script:TestFailures)

@@ -9,6 +9,8 @@ import remoteWindowsNotify, {
   buildNotifyRouteFields,
   computePiWebRoutingKey,
   getRuntimeConfig,
+  isPaseoLeaseHealthy,
+  shouldSuppressLegacyPiPopup,
 } from "../linux/extensions/remote-windows-notify.ts";
 
 const ENV_KEYS = [
@@ -25,6 +27,10 @@ const ENV_KEYS = [
   "PI_NOTIFY_TIMEOUT_MS",
   "PI_NOTIFY_TITLE",
   "PI_NOTIFY_TOKEN",
+  "PI_NOTIFY_PASEO_LEASE_GATE",
+  "PI_NOTIFY_PASEO_LEASE_PATH",
+  "PI_NOTIFY_ALLOW_PASEO",
+  "PASEO_AGENT_ID",
   "PI_SUBAGENT_CHILD",
   "PI_WEB_NO_OPEN",
 ];
@@ -1151,4 +1157,141 @@ test("ask-user prompt sends one targeted notification before turn end", async (t
   };
   await runtime.emitEvent(ASK_USER_PROMPT_EVENT, { questions: [{ header: "retry" }] });
   assert.equal(failureCount, 1);
+});
+
+test("paseo lease health fails open on stale/schema/future", () => {
+  const now = 1_000_000;
+  assert.equal(
+    isPaseoLeaseHealthy({ schemaVersion: 1, lastHealthyAt: now - 1000, status: "healthy" }, { now, staleMs: 15_000 }),
+    true,
+  );
+  assert.equal(
+    isPaseoLeaseHealthy({ schemaVersion: 1, lastHealthyAt: now - 20_000, status: "healthy" }, { now, staleMs: 15_000 }),
+    false,
+  );
+  assert.equal(
+    isPaseoLeaseHealthy({ schemaVersion: 2, lastHealthyAt: now, status: "healthy" }, { now }),
+    false,
+  );
+  assert.equal(
+    isPaseoLeaseHealthy({ schemaVersion: 1, lastHealthyAt: now + 1, status: "healthy" }, { now }),
+    false,
+  );
+  assert.equal(isPaseoLeaseHealthy(null, { now }), false);
+});
+
+test("shouldSuppressLegacyPiPopup requires gate + PASEO_AGENT_ID + healthy lease", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-paseo-lease-"));
+  const leasePath = join(dir, "health.json");
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  writeFileSync(
+    leasePath,
+    JSON.stringify({ schemaVersion: 1, lastHealthyAt: Date.now(), status: "healthy" }),
+    "utf8",
+  );
+  chmodSync(leasePath, 0o600);
+
+  assert.equal(
+    await shouldSuppressLegacyPiPopup(
+      { paseoLeaseGateEnabled: false, paseoLeasePath: leasePath },
+      { env: { PASEO_AGENT_ID: "agent-1" } },
+    ),
+    false,
+  );
+  assert.equal(
+    await shouldSuppressLegacyPiPopup(
+      { paseoLeaseGateEnabled: true, paseoLeasePath: leasePath },
+      { env: {} },
+    ),
+    false,
+  );
+  assert.equal(
+    await shouldSuppressLegacyPiPopup(
+      { paseoLeaseGateEnabled: true, paseoLeasePath: leasePath },
+      { env: { PASEO_AGENT_ID: "agent-1", PI_NOTIFY_ALLOW_PASEO: "1" } },
+    ),
+    false,
+  );
+  assert.equal(
+    await shouldSuppressLegacyPiPopup(
+      { paseoLeaseGateEnabled: true, paseoLeasePath: leasePath },
+      { env: { PASEO_AGENT_ID: "agent-1" } },
+    ),
+    true,
+  );
+  assert.equal(
+    await shouldSuppressLegacyPiPopup(
+      { paseoLeaseGateEnabled: true, paseoLeasePath: join(dir, "missing.json") },
+      { env: { PASEO_AGENT_ID: "agent-1" } },
+    ),
+    false,
+  );
+});
+
+test("Paseo-managed Pi with healthy lease suppresses popup but keeps title hooks", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-paseo-lease-"));
+  const leasePath = join(dir, "health.json");
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  writeFileSync(
+    leasePath,
+    JSON.stringify({ schemaVersion: 1, lastHealthyAt: Date.now(), status: "healthy" }),
+    "utf8",
+  );
+
+  writeConfig(t, {
+    endpoint: "http://127.0.0.1:23118/notify",
+    token: "test-token",
+    messageMode: "static",
+    paseoLeaseGateEnabled: true,
+    paseoLeasePath: leasePath,
+  });
+  process.env.PASEO_AGENT_ID = "paseo-agent-xyz";
+
+  /** @type {any[]} */
+  const requests = [];
+  globalThis.fetch = async (_url, options) => {
+    requests.push(JSON.parse(options.body));
+    return { ok: true };
+  };
+
+  const writes = [];
+  const originalWrite = process.stdout.write;
+  process.stdout.write = (chunk, ...rest) => {
+    writes.push(String(chunk));
+    return true;
+  };
+  t.after(() => {
+    process.stdout.write = originalWrite;
+  });
+
+  const runtime = createFakePi();
+  remoteWindowsNotify(runtime.pi);
+  const context = createContext({ cwd: "/workspace/proj", mode: "tui" });
+  // Force TTY title path
+  const originalIsTTY = process.stdout.isTTY;
+  Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
+  t.after(() => {
+    Object.defineProperty(process.stdout, "isTTY", { value: originalIsTTY, configurable: true });
+  });
+
+  await runtime.emit("session_start", { type: "session_start" }, context);
+  await runtime.emit("agent_end", { type: "agent_end", messages: [] }, context);
+  await runtime.emitEvent(ASK_USER_PROMPT_EVENT, { questions: [] });
+
+  assert.equal(requests.length, 0, "healthy lease must suppress legacy Pi popups");
+  assert.ok(writes.some((w) => w.includes("\u001b]0;")), "title maintenance must still run");
+
+  // Override forces Pi fallback
+  process.env.PI_NOTIFY_ALLOW_PASEO = "1";
+  await runtime.emit("agent_end", { type: "agent_end", messages: [] }, context);
+  assert.equal(requests.length, 1, "PI_NOTIFY_ALLOW_PASEO=1 restores Pi popup");
+});
+
+test("factory still registers when PASEO_AGENT_ID is set", () => {
+  process.env.PASEO_AGENT_ID = "agent-1";
+  const runtime = createFakePi();
+  remoteWindowsNotify(runtime.pi);
+  assert.ok(runtime.count("agent_end") >= 1);
+  assert.ok(runtime.count("session_start") >= 1);
+  assert.ok(runtime.countEvent(ASK_USER_PROMPT_EVENT) >= 1);
 });

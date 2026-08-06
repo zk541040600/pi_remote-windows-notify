@@ -2,6 +2,8 @@
 .pi-notify/
 node_modules/
 package-lock.json
+# Sender package must commit its exact @getpaseo/client pin lockfile.
+!linux/paseo-sender/package-lock.json
 *.log
 *.tmp
 .DS_Store

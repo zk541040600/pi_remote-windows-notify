@@ -1,0 +1,16 @@
+[Unit]
+Description=Paseo unified Windows notify sender
+After=default.target
+
+[Service]
+Type=simple
+# install.mjs rewrites ExecStart with absolute node + cli paths.
+ExecStart=/usr/bin/node /path/to/linux/paseo-sender/src/cli.mjs run --config %h/.config/paseo-sender/config.json
+Restart=on-failure
+RestartSec=5
+Environment=PASEO_SENDER_STATE_DIR=%h/.local/state/paseo-sender
+# Secrets must come from the config file (mode 0600), never from unit Environment=.
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

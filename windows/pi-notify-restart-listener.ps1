@@ -21,6 +21,8 @@ $pidPath = Join-Path $baseDir 'listener.pid'
 function Sync-LocalRuntimeFiles {
     $runtimeFiles = @(
         'NotifyBridge.Common.ps1',
+        'paseo-desktop-route.ps1',
+        'set-paseo-desktop-routing.ps1',
         'NotifyBridge.Process.ps1',
         'NotifyBridge.Remote.ps1',
         'notify-listener.ps1',
