@@ -541,7 +541,7 @@ if ($popupCleanupMatch.Success -and $popupCleanupMatch.Value -match 'paseo-activ
 if ($commonText -notmatch 'function Get-NotifyPaseoTargetFingerprint' -or $commonText -notmatch '"paseo') {
     throw 'Paseo target fingerprint must hash serverId+agentId only (no workspace).'
 }
-$fpFnMatch = [regex]::Match($commonText, 'function Get-NotifyPaseoTargetFingerprint\s*\{[\s\S]{0,260}?param\(([\s\S]{0,200}?)\)')
+$fpFnMatch = [regex]::Match($commonText, 'function Get-NotifyPaseoTargetFingerprint\s*\{[\s\S]{0,260}?param\(([\s\S]{0,300}?)\r?\n\s*\)')
 if (-not $fpFnMatch.Success -or $fpFnMatch.Groups[1].Value -match 'Workspace' -or $fpFnMatch.Groups[1].Value -notmatch '\$ServerId' -or $fpFnMatch.Groups[1].Value -notmatch '\$AgentId') {
     throw 'Paseo target fingerprint parameters must be ServerId+AgentId only.'
 }
@@ -569,7 +569,7 @@ if ($setPaseoText -notmatch '\[switch\]\$Enable' -or $setPaseoText -notmatch '\[
 if ($listenerText -notmatch 'Resolve-NotifyPaseoRouteMetadata' -or $listenerText -notmatch 'suppressed-active-agent' -or $listenerText -notmatch "OriginKind 'paseo'" -or $listenerText -notmatch 'Get-NotifyPaseoTargetFingerprint' -or $listenerText -notmatch 'Save-NotifyPaseoActivationUnlessClosed' -or $listenerText -notmatch "routeOriginKind -ne 'paseo'" -or $listenerText -notmatch "OriginKind 'paseo' -CheckOnly" -or $listenerText -notmatch "FocusTarget '' -CwdBase '' -TabTitle '' -SessionName ''") {
     throw 'Listener must accept Paseo without terminal metadata, suppress only active exact-agent, delay dedup recording until display, and carry opaque activation only.'
 }
-if ($listenerText -notmatch "OriginKind \$routeOriginKind" -and $listenerText -notmatch "Test-NotifyDuplicateDrop[\s\S]{0,120}OriginKind") {
+if ($listenerText -notmatch 'OriginKind \$routeOriginKind' -and $listenerText -notmatch "Test-NotifyDuplicateDrop[\s\S]{0,120}OriginKind") {
     $true | Out-Null
 }
 if ($listenerText -notmatch 'Test-NotifyDuplicateDrop' -or $listenerText -notmatch '\$originPart') {
@@ -578,10 +578,10 @@ if ($listenerText -notmatch 'Test-NotifyDuplicateDrop' -or $listenerText -notmat
 if ($brokerText -notmatch 'Start-NotifyBrokerPaseoWorker' -or $brokerText -notmatch 'broker-paseo-retry-ready' -or $brokerText -notmatch "OriginKind -eq 'paseo'" -or $brokerText -notmatch 'Complete-NotifyBrokerPopupLifecycle[^\r\n]+-Retryable \$retryable' -or $popupText -notmatch 'Start-NotifyPopupPaseoWorker' -or $popupText -notmatch 'popup-paseo-retry-ready' -or $popupText -notmatch 'Complete-NotifyPopupLifecycle[^\r\n]+-Retryable \$retryable' -or $activateText -notmatch 'Invoke-NotifyPaseoRouteActivate') {
     throw 'Broker/popup/activate must share the Paseo handler, preserve authoritative retryability, and never fall back to Terminal.'
 }
-if ($brokerText -notmatch "originKind -eq 'paseo'[\s\S]{0,120}snapshotId" -or $popupText -notmatch "OriginKind -eq 'paseo'[\s\S]{0,120}SnapshotId" -or $popupText -notmatch 'NotifyPopupDidActivate = \$false' -or $activateText -notmatch "paseoOutcome.Result -ne 'busy'" -or $activateText -notmatch "PI_NOTIFY_NOTIFICATION_ID'\] = \$notificationId" -or $activateText -notmatch "'-ConfigPath', \(\[string\]\$config.ConfigPath\)") {
+if ($brokerText -notmatch "originKind -eq 'paseo'[\s\S]{0,120}snapshotId" -or $popupText -notmatch "OriginKind -eq 'paseo'[\s\S]{0,120}SnapshotId" -or $popupText -notmatch 'NotifyPopupDidActivate = \$false' -or $activateText -notmatch "paseoOutcome.Result -ne 'busy'" -or $activateText -notmatch 'PI_NOTIFY_NOTIFICATION_ID''] = \$notificationId' -or $activateText -notmatch '''-ConfigPath'', \(\[string\]\$config.ConfigPath\)') {
     throw 'Paseo broker/fallback must accept opaque handles, retain instance config, avoid busy duplicate retry UI, and restore clickability after retryable failures.'
 }
-if ($listenerText -notmatch 'TtlSeconds \$activationTtlSeconds' -or $listenerText -notmatch 'toast\.Tag = \$notificationId' -or $listenerText -notmatch 'toast\.Group = \$TargetFingerprint' -or $listenerText -notmatch "OriginKind 'paseo' -NotificationId \$routeNotificationId -SnapshotId") {
+if ($listenerText -notmatch 'TtlSeconds \$activationTtlSeconds' -or $listenerText -notmatch 'toast\.Tag = \$notificationId' -or $listenerText -notmatch 'toast\.Group = \$TargetFingerprint' -or $listenerText -notmatch 'OriginKind ''paseo'' -NotificationId \$routeNotificationId -SnapshotId') {
     throw 'Paseo toast lifetime/replacement and UUID-propagated close transport contracts are missing.'
 }
 if ($listenerText -notmatch '/paseo/health' -or $listenerText -notmatch '/paseo/close' -or $commonText -notmatch 'function Get-NotifyPaseoHealthSnapshot' -or $commonText -notmatch 'function Invoke-NotifyPaseoCloseByNotificationId' -or $commonText -notmatch 'function Save-NotifyPaseoCloseTombstone' -or $commonText -notmatch 'function Test-NotifyPaseoCloseTombstone' -or $commonText -notmatch 'function Revoke-NotifyPaseoToastActivationPointers' -or $commonText -notmatch "RouteState = 'app-absent'") {
@@ -617,7 +617,7 @@ if ($listenerText -match "'host=' \+ \[Uri\]::EscapeDataString" -or $listenerTex
 if ($listenerText -notmatch 'Get-NotifyCommandLineArgument' -or $listenerText -notmatch "Name 'ConfigPath'" -or $listenerText -notmatch "Name 'TargetFingerprint'" -or $listenerText -notmatch "Name 'StackIndex'" -or $listenerText -notmatch 'GetFullPath\(\$popupConfigPath\)\.Equals' -or $listenerText -match 'popup-payload\.\{0\}\.json') {
     throw 'Popup process scans must be limited by matching ConfigPath and non-sensitive TargetFingerprint/StackIndex command-line metadata, without live payload files.'
 }
-if ($listenerText -notmatch 'NotifyActivationCleanupTimers' -or $listenerText -notmatch 'TimerCallback' -or $listenerText -notmatch '\[TimeSpan\]::FromMinutes\(10\)' -or $listenerText -match 'Register-ObjectEvent' -or $listenerText -match 'system-toast-activation-events-unavailable') {
+if ($listenerText -notmatch 'NotifyActivationCleanupTimers' -or $listenerText -notmatch 'TimerCallback' -or $listenerText -notmatch '\[TimeSpan\]::FromSeconds\(\$ttl\)' -or $listenerText -match 'Register-ObjectEvent' -or $listenerText -match 'system-toast-activation-events-unavailable') {
     throw 'System-toast activation must use protocol activation plus bounded cache timers; do not attempt unsupported PS5 WinRT event subscriptions.'
 }
 if ($activateText -notmatch 'Resolve-NotifyActivationState' -or $activateText -notmatch 'ProtectedData\]::Unprotect' -or $activateText -notmatch 'Get-NotifyQueryValue -ParsedUri \$parsedUri -Name ''id''' -or $activateText -notmatch '\$keywords = @\(\$tabTitle, \$cwdBase, \$targetHost\) \| Where-Object') {
