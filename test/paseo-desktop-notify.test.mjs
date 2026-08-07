@@ -26,6 +26,20 @@ test("Paseo payload validation rejects error and keeps opaque IDs bounded", () =
   assert.match(listener, /\$originPart[\s\S]*\$signature/);
   assert.match(listener, /OriginKind 'paseo' -CheckOnly/);
   assert.match(listener, /Record five-second dedup only after the desktop path accepted the display/);
+  // QQ mirror includes Paseo after desktop display; exclusion branch must stay gone.
+  assert.match(listener, /Start-NotifyQqDispatch -Title \$title -Body \$body/);
+  assert.equal(
+    (listener.match(/^\s*Start-NotifyQqDispatch -Title \$title -Body \$body\s*$/gm) || []).length,
+    1,
+  );
+  assert.ok(
+    !/Paseo stays off the QQ mirror path/.test(listener),
+    "Paseo must not be excluded from QQ mirror",
+  );
+  assert.ok(
+    !/if \(\$routeOriginKind -ne 'paseo'\)\s*\{\s*Start-NotifyQqDispatch/.test(listener),
+    "QQ dispatch must not be gated behind originKind != paseo",
+  );
   const paseoFingerprint = listener.indexOf("Get-NotifyPaseoTargetFingerprint");
   const paseoDedup = listener.indexOf("Test-NotifyDuplicateDrop", paseoFingerprint);
   const paseoSave = listener.indexOf("Save-NotifyPaseoActivationUnlessClosed", paseoDedup);

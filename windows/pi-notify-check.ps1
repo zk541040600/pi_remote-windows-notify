@@ -353,6 +353,9 @@ $qqOkIndex = $listenerText.LastIndexOf("-Body 'ok'")
 if ($qqNoTargetIndex -lt 0 -or $qqNoTargetIndex -ge $qqDedupIndex -or $qqDedupIndex -ge $qqDesktopIndex -or $qqDesktopIndex -ge $qqDispatchIndex -or $qqDispatchIndex -ge $qqOkIndex -or ([regex]::Matches($listenerText, '(?m)^\s*Start-NotifyQqDispatch -Title \$title -Body \$body\s*$')).Count -ne 1 -or $listenerText -notmatch 'qq-send-drop reason=capacity' -or $listenerText -notmatch 'SetAccessRuleProtection\(\$true, \$false\)') {
     throw 'Listener QQ dispatch must run once after target/dedupe/desktop gates with private bounded worker resources.'
 }
+if ($listenerText -match 'Paseo stays off the QQ mirror path' -or $listenerText -match "if \(\$routeOriginKind -ne 'paseo'\)\s*\{[\s\S]{0,80}Start-NotifyQqDispatch") {
+    throw 'Listener QQ dispatch must include originKind=paseo after desktop display succeeds.'
+}
 foreach ($runtimeText in @($refreshText, $windowsInstallText, $restartText, $remoteInstallText)) {
     if ($runtimeText -notmatch "'pi-notify-qq-sender.ps1'") {
         throw 'QQ worker must be included in every Windows runtime sync path.'

@@ -1470,10 +1470,10 @@ try {
             }
             $notified = $true
             try {
-                # Paseo stays off the QQ mirror path; Terminal/Pi Web keep the single post-desktop dispatch.
-                if ($routeOriginKind -ne 'paseo') {
-                    Start-NotifyQqDispatch -Title $title -Body $body
-                }
+                # QQ mirror runs only after desktop display succeeds for every origin
+                # (Terminal / Pi Web / Paseo). Uses the same title/body as the popup;
+                # no-target, dedup, and suppressed-active-agent paths never reach here.
+                Start-NotifyQqDispatch -Title $title -Body $body
             }
             catch {
                 Write-NotifyListenerLog -Message ('qq-send-error reason={0}' -f $_.Exception.GetType().Name)
