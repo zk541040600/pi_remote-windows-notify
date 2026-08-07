@@ -1059,6 +1059,8 @@ function Ensure-NotifyBridgeConfig {
         PaseoDesktopRoutingEnabled = [bool]$config.paseoDesktopRoutingEnabled
         PaseoExecutablePath        = [string]$config.paseoExecutablePath
         PaseoCdpPort               = [int]$config.paseoCdpPort
+        PaseoLeaseGateEnabled      = if ($config.ContainsKey('paseoLeaseGateEnabled')) { ConvertTo-NotifyBridgeBoolean -Value $config.paseoLeaseGateEnabled -Default $false } else { $false }
+        PaseoLeasePath             = if ($config.ContainsKey('paseoLeasePath')) { [string]$config.paseoLeasePath } else { '' }
         BrokerUrl                  = ('http://127.0.0.1:{0}' -f $config.brokerPort)
         BrokerHealthUrl            = ('http://127.0.0.1:{0}/health' -f $config.brokerPort)
         BrokerPopupUrl             = ('http://127.0.0.1:{0}/popup' -f $config.brokerPort)
@@ -2356,7 +2358,7 @@ function Write-NotifyPaseoActivationPayload {
     try {
         [System.IO.File]::WriteAllText($tempPath, ($Payload | ConvertTo-Json -Depth 4), [System.Text.UTF8Encoding]::new($false))
         if (Test-Path -LiteralPath $path) {
-            [System.IO.File]::Replace($tempPath, $path, $null)
+            [System.IO.File]::Replace($tempPath, $path, [NullString]::Value)
         }
         else {
             [System.IO.File]::Move($tempPath, $path)
@@ -2848,12 +2850,14 @@ function Invoke-NotifyPaseoRouteActivate {
         }
     }
     catch {
+        $errorType = $_.Exception.GetType().Name
+        $errorLine = if ($_.InvocationInfo) { [int]$_.InvocationInfo.ScriptLineNumber } else { 0 }
         try { [void](Release-NotifyPaseoActivationLease -ActivationId $ActivationId -LeaseId $lease.LeaseId) } catch {}
         return [pscustomobject]@{
             Decision     = 'fail-closed'
             OriginKind   = 'paseo'
             Result       = 'controller-error'
-            Reason       = 'client-error'
+            Reason       = ('client-error-{0}-line{1}' -f $errorType, $errorLine)
             ActivationFp = $activationFp
             ElapsedMs    = [int]([DateTime]::UtcNow - $startedAt).TotalMilliseconds
             Retryable    = $true
@@ -3110,7 +3114,7 @@ function Save-NotifyPaseoCloseTombstone {
         try {
             [System.IO.File]::WriteAllText($tempPath, ($payload | ConvertTo-Json -Depth 3 -Compress), [System.Text.UTF8Encoding]::new($false))
             if (Test-Path -LiteralPath $path) {
-                [System.IO.File]::Replace($tempPath, $path, $null)
+                [System.IO.File]::Replace($tempPath, $path, [NullString]::Value)
             }
             else {
                 [System.IO.File]::Move($tempPath, $path)

@@ -32,8 +32,17 @@ export class DaemonAdapter {
       url: this.url,
       clientId: this.clientId,
       clientType: "cli",
-      appVersion: "paseo-sender/0.1.0",
+      // appVersion 必须是可解析的 semver 且 >= 0.1.45：daemon 用它做特性协商，
+      // 无法解析或过低会把客户端当作 legacy，只下发 claude/codex/opencode 的事件，
+      // pi/grok 等 provider 的 agent 列表与 attention 事件会被静默过滤。
+      // 与锁定的 @getpaseo/client 版本保持一致。
+      appVersion: "0.3.0-beta.2",
       password: this.password,
+      // COMPAT(selectiveAgentTimeline)：声明后 daemon 才会向本客户端无条件转发
+      // dedicated agent_attention_required；未声明时 attention 只随已订阅 timeline 的
+      // agent_stream 下发，sender 会漏事件。字面值须与 @getpaseo/protocol 的
+      // CLIENT_CAPS.selectiveAgentTimeline 保持一致（有契约测试守护）。
+      capabilities: { selective_agent_timeline: true },
       reconnect: { enabled: true, baseDelayMs: 1500, maxDelayMs: 30000 },
     });
 

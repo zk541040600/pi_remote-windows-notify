@@ -8,8 +8,9 @@ import { createLogger } from "../src/privacy.mjs";
 class FakeClient {
   static instance;
 
-  constructor() {
+  constructor(config) {
     FakeClient.instance = this;
+    this.config = config;
     this.connection = [];
     this.attention = [];
     this.events = [];
@@ -143,4 +144,28 @@ test("fetchAgent accepts only exact public {agent, project} identity", async () 
   assert.equal((await adapter.fetchAgent("a")).agent.id, "a");
   FakeClient.instance.fetchAgentResult = { id: "a" };
   await assert.rejects(adapter.fetchAgent("a"), /malformed/u);
+});
+
+test("adapter declares selectiveAgentTimeline capability matching protocol literal", async () => {
+  const { CLIENT_CAPS } = await import("@getpaseo/protocol/client-capabilities");
+  assert.equal(CLIENT_CAPS.selectiveAgentTimeline, "selective_agent_timeline");
+
+  const adapter = new DaemonAdapter({ url: "ws://127.0.0.1:8787", clientId: "test", DaemonClientImpl: FakeClient });
+  await adapter.connect();
+  assert.deepEqual(FakeClient.instance.config.capabilities, {
+    [CLIENT_CAPS.selectiveAgentTimeline]: true,
+  });
+});
+
+test("adapter appVersion stays parseable for daemon feature negotiation", async () => {
+  const adapter = new DaemonAdapter({ url: "ws://127.0.0.1:8787", clientId: "test", DaemonClientImpl: FakeClient });
+  await adapter.connect();
+  const appVersion = FakeClient.instance.config.appVersion;
+  // daemon 按 semver 比较 appVersion（>=0.1.45 才可见全部 provider）；非 semver 会被当作 legacy。
+  assert.match(appVersion, /^\d+\.\d+\.\d+/);
+  const [major, minor, patch] = appVersion.replace(/-.*$/, "").split(".").map(Number);
+  assert.ok(
+    major > 0 || (major === 0 && minor > 1) || (major === 0 && minor === 1 && patch >= 45),
+    `appVersion ${appVersion} must clear daemon MIN_VERSION_ALL_PROVIDERS 0.1.45`,
+  );
 });

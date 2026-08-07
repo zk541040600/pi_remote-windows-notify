@@ -38,6 +38,7 @@ $runtimeFiles = @(
     'NotifyBridge.Common.ps1',
     'paseo-desktop-route.ps1',
     'set-paseo-desktop-routing.ps1',
+    'set-paseo-built-in-notifications.ps1',
     'NotifyBridge.Process.ps1',
     'NotifyBridge.Remote.ps1',
     'notify-listener.ps1',
@@ -115,6 +116,10 @@ $remoteConfig = @{
     bodyTemplate    = 'host: {host} | cwd: {cwdBase}'
     messageMode     = 'dynamic'
     remoteHostAlias = $RemoteHostAlias
+    paseoLeaseGateEnabled = [bool]$config.PaseoLeaseGateEnabled
+}
+if (-not [string]::IsNullOrWhiteSpace([string]$config.PaseoLeasePath)) {
+    $remoteConfig.paseoLeasePath = [string]$config.PaseoLeasePath
 }
 $remoteConfigJson = $remoteConfig | ConvertTo-Json -Depth 6
 

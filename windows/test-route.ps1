@@ -491,6 +491,20 @@ $sel = Select-NotifyPaseoActivationTarget -Targets @($tExact, $tOther) -ServerId
 Assert-True $sel.Ok 'select-exact-agent-ok'
 Assert-equal 'exact-agent' $sel.Result 'select-exact-agent-result'
 
+$tMultiPanel = [pscustomobject]@{
+    ServerId = 's1'; AgentId = ''; WorkspaceId = 'w1'; SelectedAgentIds = @('a1', 'a2')
+}
+$sel = Select-NotifyPaseoActivationTarget -Targets @($tMultiPanel, $tOther) -ServerId 's1' -AgentId 'a2'
+Assert-True $sel.Ok 'select-multi-panel-agent-ok'
+Assert-equal 'exact-agent' $sel.Result 'select-multi-panel-agent-result'
+
+$tSecondSelectedPanel = [pscustomobject]@{
+    ServerId = 's1'; AgentId = 'other'; WorkspaceId = 'w2'; SelectedAgentIds = @('a2')
+}
+$sel = Select-NotifyPaseoActivationTarget -Targets @($tMultiPanel, $tSecondSelectedPanel) -ServerId 's1' -AgentId 'a2'
+Assert-True (-not $sel.Ok) 'select-multi-panel-agent-ambiguous'
+Assert-equal 'ambiguous' $sel.Result 'select-multi-panel-agent-ambiguous-result'
+
 $sel = Select-NotifyPaseoActivationTarget -Targets @($tServerOnly, $tOther) -ServerId 's1' -AgentId 'a1'
 Assert-True $sel.Ok 'select-exact-server-ok'
 Assert-equal 'exact-server' $sel.Result 'select-exact-server-result'
@@ -541,6 +555,20 @@ try {
     $cfg = Ensure-NotifyBridgeConfig -ConfigPath $tempConfig -Port 23118
     Assert-True (-not [bool]$cfg.PaseoDesktopRoutingEnabled) 'paseo-routing-default-disabled'
     Assert-equal 29318 ([int]$cfg.PaseoCdpPort) 'paseo-cdp-default-port'
+
+    # Ensure returns the same safe boolean semantics later used by install/check projection.
+    $leaseConfig = Get-Content -Raw -LiteralPath $tempConfig | ConvertFrom-Json
+    $leaseConfig | Add-Member -NotePropertyName 'paseoLeaseGateEnabled' -NotePropertyValue 'false'
+    $leaseConfig | Add-Member -NotePropertyName 'paseoLeasePath' -NotePropertyValue '/tmp/paseo-sender-health.json'
+    [System.IO.File]::WriteAllText($tempConfig, ($leaseConfig | ConvertTo-Json -Depth 8), [System.Text.UTF8Encoding]::new($false))
+    $cfg = Ensure-NotifyBridgeConfig -ConfigPath $tempConfig
+    Assert-True (-not [bool]$cfg.PaseoLeaseGateEnabled) 'paseo-lease-gate-string-false-safe'
+    Assert-equal '/tmp/paseo-sender-health.json' ([string]$cfg.PaseoLeasePath) 'paseo-lease-path-returned'
+    $leaseConfig = Get-Content -Raw -LiteralPath $tempConfig | ConvertFrom-Json
+    $leaseConfig.paseoLeaseGateEnabled = 'true'
+    [System.IO.File]::WriteAllText($tempConfig, ($leaseConfig | ConvertTo-Json -Depth 8), [System.Text.UTF8Encoding]::new($false))
+    $cfg = Ensure-NotifyBridgeConfig -ConfigPath $tempConfig
+    Assert-True ([bool]$cfg.PaseoLeaseGateEnabled) 'paseo-lease-gate-string-true-safe'
 
     $activationId = [Guid]::NewGuid().ToString('N')
     $saved = $null
@@ -832,6 +860,156 @@ finally {
 Write-Host "`n== Paseo foreground dismiss deny =="
 Assert-True (-not (Test-NotifyForegroundDismissAllowed -OriginKind 'paseo')) 'dismiss-denied-paseo'
 Assert-True (-not (Test-NotifyForegroundDismissAllowed -OriginKind 'PASEO')) 'dismiss-denied-paseo-case'
+
+Write-Host "`n== Paseo built-in notification helper (temp HKCU only) =="
+$builtInHelper = Join-Path $scriptDir 'set-paseo-built-in-notifications.ps1'
+Assert-True (Test-Path -LiteralPath $builtInHelper -PathType Leaf) 'paseo-built-in-helper-present'
+$builtInSource = [System.IO.File]::ReadAllText($builtInHelper, [System.Text.UTF8Encoding]::new($false))
+Assert-True ($builtInSource -match 'electron\.app\.Paseo') 'paseo-built-in-production-key'
+Assert-True ($builtInSource -match 'paseo-built-in-notification-state\.json') 'paseo-built-in-state-name'
+Assert-True ($builtInSource -match '\[NullString\]::Value') 'paseo-built-in-nullstring-replace'
+Assert-True ($builtInSource -notmatch '(?i)(New-ItemProperty|Get-Item|Remove-ItemProperty)[^\r\n]*(HKLM:|HKEY_LOCAL_MACHINE)') 'paseo-built-in-no-hklm-operations'
+Assert-True ($builtInSource -match 'RegistryPath and StatePath test overrides must be provided together') 'paseo-built-in-paired-overrides'
+Assert-True ($builtInSource -match 'backup belongs to a different registry path') 'paseo-built-in-backup-path-bound'
+Assert-True ($builtInSource -notmatch 'systemctl|ssh ') 'paseo-built-in-no-service-ssh'
+
+$registryProviderAvailable = $false
+try {
+    $null = Get-PSDrive -Name HKCU -ErrorAction Stop
+    $registryProviderAvailable = $true
+}
+catch {
+    $registryProviderAvailable = $false
+}
+
+if (-not $registryProviderAvailable) {
+    Write-Host 'SKIP  paseo-built-in-disable-restore-matrix (HKCU provider unavailable on this host)'
+}
+else {
+    $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('pi-notify-paseo-built-in-' + [Guid]::NewGuid().ToString('N'))
+    $tempStateDir = Join-Path $tempRoot 'state'
+    New-Item -ItemType Directory -Force -Path $tempStateDir | Out-Null
+    $tempKeyLeaf = 'PiNotifyPaseoBuiltInTest-' + [Guid]::NewGuid().ToString('N')
+    $tempRegistryPath = 'HKCU:\Software\PiNotifyTests\' + $tempKeyLeaf
+    $tempOtherRegistryPath = $tempRegistryPath + '-Other'
+    $tempStatePath = Join-Path $tempStateDir 'paseo-built-in-notification-state.json'
+
+    function Invoke-NotifyPaseoBuiltInHelper {
+        param(
+            [Parameter(Mandatory = $true)][ValidateSet('Disable', 'Restore')]$Action,
+            [Parameter(Mandatory = $true)][string]$RegistryPath,
+            [Parameter(Mandatory = $true)][string]$StatePath
+        )
+        $ok = $false
+        $errorText = ''
+        try {
+            if ($Action -eq 'Disable') {
+                & $builtInHelper -Disable -Force -RegistryPath $RegistryPath -StatePath $StatePath | Out-Null
+            }
+            else {
+                & $builtInHelper -Restore -Force -RegistryPath $RegistryPath -StatePath $StatePath | Out-Null
+            }
+            $ok = $true
+        }
+        catch {
+            $errorText = [string]$_.Exception.Message
+            $ok = $false
+        }
+        return [pscustomobject]@{
+            Ok = $ok
+            Error = $errorText
+        }
+    }
+
+    function Get-NotifyPaseoBuiltInEnabledSnapshot {
+        param([Parameter(Mandatory = $true)][string]$RegistryPath)
+        if (-not (Test-Path -LiteralPath $RegistryPath)) {
+            return [pscustomobject]@{ KeyExists = $false; HadEnabled = $false; EnabledValue = $null }
+        }
+        $item = Get-Item -LiteralPath $RegistryPath
+        $names = @($item.GetValueNames())
+        $had = $names -contains 'Enabled'
+        $value = $null
+        if ($had) { $value = [int]$item.GetValue('Enabled') }
+        return [pscustomobject]@{ KeyExists = $true; HadEnabled = $had; EnabledValue = $value }
+    }
+
+    try {
+        # Reject HKLM overrides without mutating anything.
+        $hklm = Invoke-NotifyPaseoBuiltInHelper -Action Disable -RegistryPath 'HKLM:\Software\PiNotifyForbidden' -StatePath $tempStatePath
+        Assert-True (-not $hklm.Ok) 'paseo-built-in-reject-hklm'
+
+        # Restore with no backup must fail closed.
+        if (Test-Path -LiteralPath $tempRegistryPath) { Remove-Item -LiteralPath $tempRegistryPath -Recurse -Force -ErrorAction SilentlyContinue }
+        if (Test-Path -LiteralPath $tempStatePath) { Remove-Item -LiteralPath $tempStatePath -Force -ErrorAction SilentlyContinue }
+        New-Item -Path $tempRegistryPath -Force | Out-Null
+        New-ItemProperty -LiteralPath $tempRegistryPath -Name 'Enabled' -PropertyType DWord -Value 1 -Force | Out-Null
+        $noBackup = Invoke-NotifyPaseoBuiltInHelper -Action Restore -RegistryPath $tempRegistryPath -StatePath $tempStatePath
+        Assert-True (-not $noBackup.Ok) 'paseo-built-in-restore-no-backup-fails'
+        $stillOne = Get-NotifyPaseoBuiltInEnabledSnapshot -RegistryPath $tempRegistryPath
+        Assert-True ($stillOne.HadEnabled -and [int]$stillOne.EnabledValue -eq 1) 'paseo-built-in-restore-no-backup-registry-unchanged'
+
+        # Disable with original Enabled=1: backup once, write 0, second Disable keeps original backup.
+        $disable1 = Invoke-NotifyPaseoBuiltInHelper -Action Disable -RegistryPath $tempRegistryPath -StatePath $tempStatePath
+        Assert-True $disable1.Ok 'paseo-built-in-disable-ok'
+        $afterDisable = Get-NotifyPaseoBuiltInEnabledSnapshot -RegistryPath $tempRegistryPath
+        Assert-True ($afterDisable.HadEnabled -and [int]$afterDisable.EnabledValue -eq 0) 'paseo-built-in-disable-sets-zero'
+        Assert-True (Test-Path -LiteralPath $tempStatePath -PathType Leaf) 'paseo-built-in-backup-created'
+        $backup1 = Get-Content -Raw -LiteralPath $tempStatePath | ConvertFrom-Json
+        Assert-True ([bool]$backup1.hadEnabled -eq $true) 'paseo-built-in-backup-had-enabled'
+        Assert-True ([int]$backup1.enabledValue -eq 1) 'paseo-built-in-backup-value-one'
+        Assert-equal $tempRegistryPath ([string]$backup1.registryPath) 'paseo-built-in-backup-registry-bound'
+
+        $disable2 = Invoke-NotifyPaseoBuiltInHelper -Action Disable -RegistryPath $tempRegistryPath -StatePath $tempStatePath
+        Assert-True $disable2.Ok 'paseo-built-in-disable-idempotent'
+        $backup2 = Get-Content -Raw -LiteralPath $tempStatePath | ConvertFrom-Json
+        Assert-True ([bool]$backup2.hadEnabled -eq $true -and [int]$backup2.enabledValue -eq 1) 'paseo-built-in-backup-not-overwritten-with-zero'
+
+        New-Item -Path $tempOtherRegistryPath -Force | Out-Null
+        New-ItemProperty -LiteralPath $tempOtherRegistryPath -Name 'Enabled' -PropertyType DWord -Value 1 -Force | Out-Null
+        $wrongKeyRestore = Invoke-NotifyPaseoBuiltInHelper -Action Restore -RegistryPath $tempOtherRegistryPath -StatePath $tempStatePath
+        Assert-True (-not $wrongKeyRestore.Ok) 'paseo-built-in-restore-wrong-key-fails'
+        $wrongKeyAfter = Get-NotifyPaseoBuiltInEnabledSnapshot -RegistryPath $tempOtherRegistryPath
+        Assert-True ($wrongKeyAfter.HadEnabled -and [int]$wrongKeyAfter.EnabledValue -eq 1) 'paseo-built-in-restore-wrong-key-unchanged'
+
+        $restore1 = Invoke-NotifyPaseoBuiltInHelper -Action Restore -RegistryPath $tempRegistryPath -StatePath $tempStatePath
+        Assert-True $restore1.Ok 'paseo-built-in-restore-ok'
+        $afterRestore = Get-NotifyPaseoBuiltInEnabledSnapshot -RegistryPath $tempRegistryPath
+        Assert-True ($afterRestore.HadEnabled -and [int]$afterRestore.EnabledValue -eq 1) 'paseo-built-in-restore-original-value'
+        Assert-True (-not (Test-Path -LiteralPath $tempStatePath)) 'paseo-built-in-backup-deleted-after-restore'
+
+        # Original property absent: Disable creates Enabled=0; Restore removes Enabled.
+        Remove-ItemProperty -LiteralPath $tempRegistryPath -Name 'Enabled' -ErrorAction SilentlyContinue
+        $absentBefore = Get-NotifyPaseoBuiltInEnabledSnapshot -RegistryPath $tempRegistryPath
+        Assert-True (-not $absentBefore.HadEnabled) 'paseo-built-in-absent-before'
+        $disableAbsent = Invoke-NotifyPaseoBuiltInHelper -Action Disable -RegistryPath $tempRegistryPath -StatePath $tempStatePath
+        Assert-True $disableAbsent.Ok 'paseo-built-in-disable-absent-ok'
+        $backupAbsent = Get-Content -Raw -LiteralPath $tempStatePath | ConvertFrom-Json
+        Assert-True ([bool]$backupAbsent.hadEnabled -eq $false) 'paseo-built-in-backup-absent-flag'
+        $restoreAbsent = Invoke-NotifyPaseoBuiltInHelper -Action Restore -RegistryPath $tempRegistryPath -StatePath $tempStatePath
+        Assert-True $restoreAbsent.Ok 'paseo-built-in-restore-absent-ok'
+        $afterAbsent = Get-NotifyPaseoBuiltInEnabledSnapshot -RegistryPath $tempRegistryPath
+        Assert-True (-not $afterAbsent.HadEnabled) 'paseo-built-in-restore-removes-enabled'
+        Assert-True (-not (Test-Path -LiteralPath $tempStatePath)) 'paseo-built-in-absent-backup-deleted'
+    }
+    finally {
+        try {
+            foreach ($path in @($tempRegistryPath, $tempOtherRegistryPath)) {
+                if (Test-Path -LiteralPath $path) {
+                    Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue
+                }
+            }
+            $parent = 'HKCU:\Software\PiNotifyTests'
+            if (Test-Path -LiteralPath $parent) {
+                $remaining = @(Get-ChildItem -LiteralPath $parent -ErrorAction SilentlyContinue)
+                if ($remaining.Count -eq 0) {
+                    Remove-Item -LiteralPath $parent -Force -ErrorAction SilentlyContinue
+                }
+            }
+        } catch {}
+        try { Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue } catch {}
+    }
+}
 
 
 # Summary

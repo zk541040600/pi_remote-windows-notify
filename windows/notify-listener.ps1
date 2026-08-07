@@ -577,7 +577,7 @@ function Start-NotifyToastRecoveryWorker {
                     $payload | Add-Member -NotePropertyName protectedSnapshotId -NotePropertyValue $protectedSnapshot -Force
                     $tempPath = Join-Path (Split-Path -Parent $path) ('.activation-{0}-{1}.tmp' -f $activationId, [Guid]::NewGuid().ToString('N'))
                     [System.IO.File]::WriteAllText($tempPath, ($payload | ConvertTo-Json -Depth 4), [System.Text.UTF8Encoding]::new($false))
-                    [System.IO.File]::Replace($tempPath, $path, $null)
+                    [System.IO.File]::Replace($tempPath, $path, [NullString]::Value)
                     $tempPath = ''
                 }
                 catch {

@@ -90,6 +90,198 @@ function Get-NotifyPaseoExpectedExecutablePath {
     return $standardPath
 }
 
+function Get-NotifyPaseoLimitedProcessPath {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][int]$ProcessId)
+
+    $nativeType = [System.Management.Automation.PSTypeName]'PiNotify.PaseoProcessNative'
+    if ($null -eq $nativeType.Type) {
+        $source = @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+
+namespace PiNotify {
+    public static class PaseoProcessNative {
+        private const uint ProcessQueryLimitedInformation = 0x1000;
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr OpenProcess(uint desiredAccess, bool inheritHandle, int processId);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool QueryFullProcessImageName(IntPtr process, int flags, StringBuilder path, ref int size);
+
+        [DllImport("kernel32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool CloseHandle(IntPtr handle);
+
+        public static string GetPath(int processId) {
+            IntPtr handle = OpenProcess(ProcessQueryLimitedInformation, false, processId);
+            if (handle == IntPtr.Zero) {
+                return null;
+            }
+
+            try {
+                int size = 32768;
+                var path = new StringBuilder(size);
+                return QueryFullProcessImageName(handle, 0, path, ref size) ? path.ToString() : null;
+            }
+            finally {
+                CloseHandle(handle);
+            }
+        }
+    }
+}
+'@
+        try { Add-Type -TypeDefinition $source -ErrorAction Stop } catch {
+            $nativeType = [System.Management.Automation.PSTypeName]'PiNotify.PaseoProcessNative'
+            if ($null -eq $nativeType.Type) { return '' }
+        }
+    }
+
+    try { return [string][PiNotify.PaseoProcessNative]::GetPath($ProcessId) } catch { return '' }
+}
+
+function Invoke-NotifyPaseoWindowForeground {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][int]$OwnerProcessId,
+        [int]$TimeoutMs = 2500
+    )
+
+    $nativeType = [System.Management.Automation.PSTypeName]'PiNotify.PaseoWindowNative'
+    if ($null -eq $nativeType.Type) {
+        $source = @'
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Text;
+
+namespace PiNotify {
+    public static class PaseoWindowNative {
+        private delegate bool EnumWindowsProc(IntPtr window, IntPtr state);
+
+        [DllImport("user32.dll")]
+        private static extern bool EnumWindows(EnumWindowsProc callback, IntPtr state);
+
+        [DllImport("user32.dll")]
+        private static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
+
+        [DllImport("kernel32.dll")]
+        private static extern uint GetCurrentThreadId();
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool AttachThreadInput(uint fromThread, uint toThread, bool attach);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool BringWindowToTop(IntPtr window);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        private static extern int GetClassName(IntPtr window, StringBuilder className, int maxCount);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool IsWindowVisible(IntPtr window);
+
+        [DllImport("user32.dll")]
+        public static extern IntPtr GetForegroundWindow();
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool ShowWindowAsync(IntPtr window, int command);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool SetForegroundWindow(IntPtr window);
+
+        public static IntPtr[] FindMainWindows(int processId) {
+            var windows = new List<IntPtr>();
+            EnumWindows(delegate(IntPtr window, IntPtr state) {
+                uint owner;
+                GetWindowThreadProcessId(window, out owner);
+                if (owner != (uint)processId) {
+                    return true;
+                }
+
+                var className = new StringBuilder(128);
+                GetClassName(window, className, className.Capacity);
+                if (String.Equals(className.ToString(), "Chrome_WidgetWin_1", StringComparison.Ordinal)) {
+                    windows.Add(window);
+                }
+                return true;
+            }, IntPtr.Zero);
+            return windows.ToArray();
+        }
+
+        public static bool FocusWindow(IntPtr window) {
+            IntPtr foreground = GetForegroundWindow();
+            uint ignored;
+            uint foregroundThread = foreground == IntPtr.Zero ? 0 : GetWindowThreadProcessId(foreground, out ignored);
+            uint targetThread = GetWindowThreadProcessId(window, out ignored);
+            uint currentThread = GetCurrentThreadId();
+            bool foregroundAttached = false;
+            bool targetAttached = false;
+
+            try {
+                if (foregroundThread != 0 && foregroundThread != currentThread) {
+                    foregroundAttached = AttachThreadInput(currentThread, foregroundThread, true);
+                }
+                if (targetThread != 0 && targetThread != currentThread) {
+                    targetAttached = AttachThreadInput(currentThread, targetThread, true);
+                }
+                ShowWindowAsync(window, 9);
+                BringWindowToTop(window);
+                SetForegroundWindow(window);
+                return GetForegroundWindow() == window;
+            }
+            finally {
+                if (targetAttached) {
+                    AttachThreadInput(currentThread, targetThread, false);
+                }
+                if (foregroundAttached) {
+                    AttachThreadInput(currentThread, foregroundThread, false);
+                }
+            }
+        }
+    }
+}
+'@
+        try { Add-Type -TypeDefinition $source -ErrorAction Stop } catch {
+            $nativeType = [System.Management.Automation.PSTypeName]'PiNotify.PaseoWindowNative'
+            if ($null -eq $nativeType.Type) {
+                return [pscustomobject]@{ Ok = $false; Result = 'foreground-denied'; Reason = 'window-api-unavailable'; Count = 0 }
+            }
+        }
+    }
+
+    $windows = @([PiNotify.PaseoWindowNative]::FindMainWindows($OwnerProcessId))
+    if ($windows.Count -eq 0) {
+        return [pscustomobject]@{ Ok = $false; Result = 'foreground-denied'; Reason = 'window-missing'; Count = 0 }
+    }
+    if ($windows.Count -ne 1) {
+        return [pscustomobject]@{ Ok = $false; Result = 'ambiguous'; Reason = 'multiple-main-windows'; Count = $windows.Count }
+    }
+
+    $window = [IntPtr]$windows[0]
+    [void][PiNotify.PaseoWindowNative]::ShowWindowAsync($window, 9)
+    try { [void](New-Object -ComObject WScript.Shell).AppActivate($OwnerProcessId) } catch {}
+    [void][PiNotify.PaseoWindowNative]::SetForegroundWindow($window)
+    [void][PiNotify.PaseoWindowNative]::FocusWindow($window)
+
+    $deadline = [DateTime]::UtcNow.AddMilliseconds([Math]::Max(500, [Math]::Min(5000, $TimeoutMs)))
+    while ([DateTime]::UtcNow -lt $deadline) {
+        if ([PiNotify.PaseoWindowNative]::IsWindowVisible($window) -and [PiNotify.PaseoWindowNative]::GetForegroundWindow() -eq $window) {
+            return [pscustomobject]@{ Ok = $true; Result = 'foreground-ready'; Reason = ''; Count = 1 }
+        }
+        Start-Sleep -Milliseconds 50
+    }
+
+    return [pscustomobject]@{ Ok = $false; Result = 'foreground-denied'; Reason = 'window-not-foreground'; Count = 1 }
+}
+
 function Get-NotifyPaseoCdpOwnerSnapshot {
     [CmdletBinding()]
     param(
@@ -113,6 +305,12 @@ function Get-NotifyPaseoCdpOwnerSnapshot {
     # Enumerate all listeners before filtering so an empty result is proven and
     # cannot be confused with Get-NetTCPConnection lookup/access failures.
     if ($null -eq $ConnectionProbe) {
+        if (-not (Get-Command -Name Get-NetTCPConnection -ErrorAction SilentlyContinue)) {
+            # Bare runspaces (e.g. broker workers) may lack module auto-loading; import explicitly.
+            try { Import-Module NetTCPIP -ErrorAction Stop } catch {
+                $result.Reason = ('listener-probe-import-' + $_.Exception.GetType().Name)
+            }
+        }
         if (-not (Get-Command -Name Get-NetTCPConnection -ErrorAction SilentlyContinue)) {
             return $result
         }
@@ -180,6 +378,12 @@ function Get-NotifyPaseoCdpOwnerSnapshot {
         return $result
     }
 
+    if ([string]::IsNullOrWhiteSpace($ownerPath)) {
+        # Get-Process .Path can be empty under a filtered token. QueryFullProcessImageName
+        # needs only PROCESS_QUERY_LIMITED_INFORMATION and preserves exact-path trust.
+        $ownerPath = Get-NotifyPaseoLimitedProcessPath -ProcessId $ownerId
+    }
+
     $result.OwnerProcessId = $ownerId
     $result.OwnerProcessName = $ownerName
     if ($ownerName -notmatch '(?i)^paseo$') {
@@ -191,7 +395,8 @@ function Get-NotifyPaseoCdpOwnerSnapshot {
 
     $expectedPath = Get-NotifyPaseoExpectedExecutablePath -Config $Config
     if ([string]::IsNullOrWhiteSpace($expectedPath) -or [string]::IsNullOrWhiteSpace($ownerPath)) {
-        $result.Reason = 'owner-path-unverified'
+        # Diagnostics record boolean flags only; never log raw paths.
+        $result.Reason = ('owner-path-unverified expectedEmpty={0} ownerPathEmpty={1}' -f [int][string]::IsNullOrWhiteSpace($expectedPath), [int][string]::IsNullOrWhiteSpace($ownerPath))
         return $result
     }
     try { $ownerPath = [System.IO.Path]::GetFullPath($ownerPath) } catch {
@@ -366,16 +571,25 @@ function New-NotifyPaseoCdpEvaluateExpression {
     )
 
     if ($Mode -eq 'probe') {
-        # Minimal read-only state probe. No route IDs embedded.
+        # Read the app's selected agent marker as well as the route. The exact data-testid
+        # survives after Expo Router consumes and removes the transient open=agent query.
         return @'
 (() => {
   try {
+    const prefix = 'workspace-tab-agent_';
+    const selected = Array.from(new Set(Array.from(document.querySelectorAll('[data-testid][aria-selected="true"]'))
+      .map((element) => String(element.getAttribute('data-testid') || ''))
+      .filter((value) => value.startsWith(prefix))
+      .map((value) => value.slice(prefix.length))));
     return JSON.stringify({
       ok: true,
       pathname: String(location.pathname || ''),
       search: String(location.search || ''),
       visibilityState: String(document.visibilityState || ''),
-      hasFocus: !!document.hasFocus()
+      hasFocus: !!document.hasFocus(),
+      selectedAgentCount: selected.length,
+      selectedAgentIds: selected,
+      selectedAgentId: selected.length === 1 ? selected[0] : ''
     });
   } catch (err) {
     return JSON.stringify({ ok: false, reason: 'probe-error' });
@@ -630,18 +844,31 @@ function Get-NotifyPaseoTrustedTargetsWithState {
             continue
         }
         $routeState = ConvertFrom-NotifyPaseoRendererRouteState -Pathname ([string]$probe.Value.pathname) -Search ([string]$probe.Value.search)
+        $selectedAgentIds = @()
+        if ($probe.Value.PSObject.Properties['selectedAgentIds']) {
+            foreach ($candidate in @($probe.Value.selectedAgentIds)) {
+                $candidateAgentId = [string]$candidate
+                if (-not [string]::IsNullOrWhiteSpace($candidateAgentId) -and $candidateAgentId.Length -le 256 -and $candidateAgentId -notmatch '[\x00-\x1F\x7F-\x9F]') {
+                    $selectedAgentIds += $candidateAgentId
+                }
+            }
+        }
+        $selectedAgentIds = @($selectedAgentIds | Select-Object -Unique)
+        $selectedAgentId = if ($selectedAgentIds.Count -eq 1) { [string]$selectedAgentIds[0] } else { '' }
         $trusted += [pscustomobject]@{
-            Id              = if ($target.PSObject.Properties['id']) { [string]$target.id } else { '' }
-            Title           = if ($target.PSObject.Properties['title']) { [string]$target.title } else { '' }
-            Url             = if ($target.PSObject.Properties['url']) { [string]$target.url } else { '' }
-            WebSocketUrl    = $wsUrl
-            Pathname        = [string]$probe.Value.pathname
-            Search          = [string]$probe.Value.search
-            VisibilityState = [string]$probe.Value.visibilityState
-            HasFocus        = [bool]$probe.Value.hasFocus
-            ServerId        = [string]$routeState.ServerId
-            WorkspaceId     = [string]$routeState.WorkspaceId
-            AgentId         = [string]$routeState.AgentId
+            Id                 = if ($target.PSObject.Properties['id']) { [string]$target.id } else { '' }
+            Title              = if ($target.PSObject.Properties['title']) { [string]$target.title } else { '' }
+            Url                = if ($target.PSObject.Properties['url']) { [string]$target.url } else { '' }
+            WebSocketUrl       = $wsUrl
+            Pathname           = [string]$probe.Value.pathname
+            Search             = [string]$probe.Value.search
+            VisibilityState    = [string]$probe.Value.visibilityState
+            HasFocus           = [bool]$probe.Value.hasFocus
+            ServerId           = [string]$routeState.ServerId
+            WorkspaceId        = [string]$routeState.WorkspaceId
+            AgentId            = $(if (-not [string]::IsNullOrWhiteSpace($selectedAgentId)) { $selectedAgentId } else { [string]$routeState.AgentId })
+            SelectedAgentCount = $selectedAgentIds.Count
+            SelectedAgentIds   = $selectedAgentIds
         }
     }
 
@@ -664,10 +891,10 @@ function Select-NotifyPaseoActivationTarget {
     $server = $ServerId.Trim()
     $agent = $AgentId.Trim()
     $exactAgent = @($Targets | Where-Object {
+            $selectedAgentIds = if ($_.PSObject.Properties['SelectedAgentIds']) { @($_.SelectedAgentIds) } else { @() }
             (-not [string]::IsNullOrWhiteSpace([string]$_.ServerId)) -and
-            (-not [string]::IsNullOrWhiteSpace([string]$_.AgentId)) -and
             ([string]$_.ServerId -eq $server) -and
-            ([string]$_.AgentId -eq $agent)
+            (([string]$_.AgentId -eq $agent) -or ($selectedAgentIds -contains $agent))
         })
     if ($exactAgent.Count -eq 1) {
         return [pscustomobject]@{
@@ -771,8 +998,9 @@ function Get-NotifyPaseoForegroundAgentState {
     }
 
     $active = @($targets.Targets | Where-Object {
+            $selectedAgentIds = if ($_.PSObject.Properties['SelectedAgentIds']) { @($_.SelectedAgentIds) } else { @() }
             ([string]$_.ServerId -eq $ServerId.Trim()) -and
-            ([string]$_.AgentId -eq $AgentId.Trim()) -and
+            (([string]$_.AgentId -eq $AgentId.Trim()) -or ($selectedAgentIds -contains $AgentId.Trim())) -and
             ([string]$_.VisibilityState -eq 'visible') -and
             ([bool]$_.HasFocus)
         })
@@ -889,6 +1117,14 @@ function Invoke-NotifyPaseoDesktopRouteActivate {
     }
 
     $target = $selection.Target
+    $window = Invoke-NotifyPaseoWindowForeground -OwnerProcessId ([int]$owner.OwnerProcessId) -TimeoutMs 2500
+    if (-not $window.Ok) {
+        return [pscustomobject]@{
+            Result = $window.Result; Reason = $window.Reason; RouteFp = $routeFp; CandidateCount = [int]$window.Count
+            ElapsedMs = [int]([DateTime]::UtcNow - $startedAt).TotalMilliseconds
+        }
+    }
+
     $bring = Invoke-NotifyPaseoCdpBringToFront -WebSocketUrl $target.WebSocketUrl -TimeoutMs 2000
     if (-not $bring.Ok) {
         return [pscustomobject]@{
@@ -922,6 +1158,7 @@ function Invoke-NotifyPaseoDesktopRouteActivate {
     $deadline = [DateTime]::UtcNow.AddMilliseconds([Math]::Min(8000, [Math]::Max(1000, $TimeoutMs / 2)))
     $accepted = $false
     $routeAccepted = $false
+    $refocusAttempted = $false
     while ([DateTime]::UtcNow -lt $deadline) {
         Start-Sleep -Milliseconds 200
         $probeExpr = New-NotifyPaseoCdpEvaluateExpression -Mode probe
@@ -930,11 +1167,20 @@ function Invoke-NotifyPaseoDesktopRouteActivate {
             continue
         }
         $routeState = ConvertFrom-NotifyPaseoRendererRouteState -Pathname ([string]$probe.Value.pathname) -Search ([string]$probe.Value.search)
-        if ([string]$routeState.ServerId -eq $serverId -and [string]$routeState.AgentId -eq $agentId) {
+        $probedAgentIds = @([string]$routeState.AgentId)
+        if ($probe.Value.PSObject.Properties['selectedAgentIds']) {
+            $probedAgentIds += @($probe.Value.selectedAgentIds | ForEach-Object { [string]$_ })
+        }
+        $probedAgentIds = @($probedAgentIds | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
+        if ([string]$routeState.ServerId -eq $serverId -and [string]$routeState.WorkspaceId -eq $workspaceId -and $probedAgentIds -contains $agentId) {
             $routeAccepted = $true
             if ([string]$probe.Value.visibilityState -eq 'visible' -and [bool]$probe.Value.hasFocus) {
                 $accepted = $true
                 break
+            }
+            if (-not $refocusAttempted) {
+                $refocusAttempted = $true
+                [void](Invoke-NotifyPaseoWindowForeground -OwnerProcessId ([int]$owner.OwnerProcessId) -TimeoutMs 1500)
             }
         }
     }

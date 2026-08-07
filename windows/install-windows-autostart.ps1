@@ -121,6 +121,7 @@ $filesToCopy = @(
     'NotifyBridge.Common.ps1',
     'paseo-desktop-route.ps1',
     'set-paseo-desktop-routing.ps1',
+    'set-paseo-built-in-notifications.ps1',
     'NotifyBridge.Process.ps1',
     'NotifyBridge.Remote.ps1',
     'notify-listener.ps1',

@@ -522,8 +522,9 @@ if ($activateText -notmatch 'Get-NotifyActivateFingerprint \$targetHost' -or $ac
 # --- Paseo desktop routing contract (offline static) ---
 $paseoRouteText = if ($sourceText.ContainsKey('paseo-desktop-route.ps1')) { [string]$sourceText['paseo-desktop-route.ps1'] } else { '' }
 $setPaseoText = if ($sourceText.ContainsKey('set-paseo-desktop-routing.ps1')) { [string]$sourceText['set-paseo-desktop-routing.ps1'] } else { '' }
-if ([string]::IsNullOrWhiteSpace($paseoRouteText) -or [string]::IsNullOrWhiteSpace($setPaseoText)) {
-    throw 'Paseo controller and set-paseo-desktop-routing.ps1 must exist in the windows source tree.'
+$setPaseoBuiltInText = if ($sourceText.ContainsKey('set-paseo-built-in-notifications.ps1')) { [string]$sourceText['set-paseo-built-in-notifications.ps1'] } else { '' }
+if ([string]::IsNullOrWhiteSpace($paseoRouteText) -or [string]::IsNullOrWhiteSpace($setPaseoText) -or [string]::IsNullOrWhiteSpace($setPaseoBuiltInText)) {
+    throw 'Paseo controller, set-paseo-desktop-routing.ps1, and set-paseo-built-in-notifications.ps1 must exist in the windows source tree.'
 }
 if ($commonText -notmatch 'function Resolve-NotifyPaseoRouteMetadata' -or $commonText -notmatch 'function Invoke-NotifyPaseoRouteActivate' -or $commonText -notmatch 'function Get-NotifyPaseoTargetFingerprint' -or $commonText -notmatch 'function Acquire-NotifyPaseoActivationLease' -or $commonText -notmatch 'function Consume-NotifyPaseoActivationState' -or $commonText -notmatch 'paseoDesktopRoutingEnabled' -or $commonText -notmatch 'paseoCdpPort' -or $commonText -notmatch 'function Get-NotifyAppLabel') {
     throw 'NotifyBridge.Common must expose Paseo metadata, DPAPI activation state machine, app label, and disabled-by-default CDP config.'
@@ -533,6 +534,10 @@ if ($commonText -notmatch 'function Get-NotifyPaseoActivationTtlSeconds' -or $co
 }
 if ($commonText -notmatch 'Local\\PiRemotePaseoActivationCache' -or $commonText -notmatch 'leaseId' -or $commonText -notmatch 'File\]::Replace' -or $commonText -notmatch 'MaxAgeSeconds 1800 -MaxCount 95' -or $commonText -notmatch 'activation-\*\.json\.tmp-\*') {
     throw 'Paseo activation acquire/release/consume must use a cross-process lock, owner lease, atomic replace, and bounded cache/temp cleanup.'
+}
+# PS5.1 binding converts $null to empty string; File.Replace then throws on the empty backup path.
+if ($commonText -match 'File\]::Replace\([^\r\n]*\$null\)' -or $listenerText -match 'File\]::Replace\([^\r\n]*\$null\)' -or $brokerText -match 'File\]::Replace\([^\r\n]*\$null\)' -or $popupText -match 'File\]::Replace\([^\r\n]*\$null\)' -or $activateText -match 'File\]::Replace\([^\r\n]*\$null\)' -or $setPaseoBuiltInText -match 'File\]::Replace\([^\r\n]*\$null\)') {
+    throw 'File.Replace backup argument must be [NullString]::Value, not $null (PS5.1 throws illegal-path).'
 }
 $popupCleanupMatch = [regex]::Match($commonText, 'function Clear-NotifyBridgePopupArtifacts\s*\{[\s\S]{0,5000}?\n\}')
 if ($popupCleanupMatch.Success -and $popupCleanupMatch.Value -match 'paseo-activation') {
@@ -566,6 +571,12 @@ if ($paseoRouteText -match 'remote-debugging-port' -or $setPaseoText -notmatch '
 if ($setPaseoText -notmatch '\[switch\]\$Enable' -or $setPaseoText -notmatch '\[switch\]\$Disable' -or $setPaseoText -notmatch 'remote-debugging-address=127\.0\.0\.1' -or $setPaseoText -notmatch 'Get-NotifyPaseoCdpOwnerSnapshot' -or $setPaseoText -match 'install-windows-autostart' -or $setPaseoText -match 'pi-notify-refresh') {
     throw 'set-paseo-desktop-routing.ps1 must be an explicit Enable/Disable helper with loopback owner checks and no auto install/refresh.'
 }
+if ($setPaseoBuiltInText -notmatch '\[switch\]\$Disable' -or $setPaseoBuiltInText -notmatch '\[switch\]\$Restore' -or $setPaseoBuiltInText -notmatch 'electron\.app\.Paseo' -or $setPaseoBuiltInText -notmatch 'paseo-built-in-notification-state\.json' -or $setPaseoBuiltInText -notmatch '\[NullString\]::Value' -or $setPaseoBuiltInText -notmatch 'Only HKCU registry paths are allowed' -or $setPaseoBuiltInText -notmatch 'HKLM registry paths are forbidden' -or $setPaseoBuiltInText -match 'install-windows-autostart' -or $setPaseoBuiltInText -match 'pi-notify-refresh' -or $setPaseoBuiltInText -match 'systemctl' -or $setPaseoBuiltInText -match 'ssh ' -or $setPaseoBuiltInText -match 'New-ItemProperty[^\r\n]*HKLM' -or $setPaseoBuiltInText -match 'Remove-ItemProperty[^\r\n]*HKLM') {
+    throw 'set-paseo-built-in-notifications.ps1 must be an explicit Disable/Restore HKCU helper with atomic backup state and no auto install/refresh/service/SSH side effects.'
+}
+if ($setPaseoBuiltInText -match 'File\]::Replace\([^\r\n]*\$null\)') {
+    throw 'Built-in notification helper File.Replace backup argument must be [NullString]::Value, not $null.'
+}
 if ($listenerText -notmatch 'Resolve-NotifyPaseoRouteMetadata' -or $listenerText -notmatch 'suppressed-active-agent' -or $listenerText -notmatch "OriginKind 'paseo'" -or $listenerText -notmatch 'Get-NotifyPaseoTargetFingerprint' -or $listenerText -notmatch 'Save-NotifyPaseoActivationUnlessClosed' -or $listenerText -notmatch "routeOriginKind -ne 'paseo'" -or $listenerText -notmatch "OriginKind 'paseo' -CheckOnly" -or $listenerText -notmatch "FocusTarget '' -CwdBase '' -TabTitle '' -SessionName ''") {
     throw 'Listener must accept Paseo without terminal metadata, suppress only active exact-agent, delay dedup recording until display, and carry opaque activation only.'
 }
@@ -596,13 +607,22 @@ if ($commonText -match 'function Get-NotifyPaseoHealthSnapshot[\s\S]{0,1200}SetE
 if ($brokerText -match "OriginKind -eq 'paseo'[\s\S]{0,200}Windows Terminal" -or $activateText -match "originKind -eq 'paseo'[\s\S]{0,120}pi-web") {
     throw 'Paseo activation branches must not fall through into terminal/Pi Web routing.'
 }
-foreach ($requiredRuntimeName in @('paseo-desktop-route.ps1', 'set-paseo-desktop-routing.ps1')) {
+foreach ($requiredRuntimeName in @('paseo-desktop-route.ps1', 'set-paseo-desktop-routing.ps1', 'set-paseo-built-in-notifications.ps1')) {
     if ($refreshText -notmatch [regex]::Escape($requiredRuntimeName) -or $windowsInstallText -notmatch [regex]::Escape($requiredRuntimeName) -or $restartText -notmatch [regex]::Escape($requiredRuntimeName) -or $remoteInstallText -notmatch [regex]::Escape($requiredRuntimeName)) {
         throw ('Runtime copy lists must include {0} without auto-executing the enable helper.' -f $requiredRuntimeName)
     }
 }
 if ($refreshText -match 'set-paseo-desktop-routing\.ps1\s+-Enable' -or $windowsInstallText -match 'set-paseo-desktop-routing\.ps1\s+-Enable' -or $restartText -match 'set-paseo-desktop-routing\.ps1\s+-Enable') {
     throw 'Install/refresh/restart must never auto-enable Paseo desktop routing.'
+}
+if ($refreshText -match 'set-paseo-built-in-notifications\.ps1\s+-(Disable|Restore)' -or $windowsInstallText -match 'set-paseo-built-in-notifications\.ps1\s+-(Disable|Restore)' -or $restartText -match 'set-paseo-built-in-notifications\.ps1\s+-(Disable|Restore)' -or $remoteInstallText -match 'set-paseo-built-in-notifications\.ps1\s+-(Disable|Restore)') {
+    throw 'Install/refresh/restart must never auto-run Paseo built-in notification Disable/Restore.'
+}
+$builtInHelperPattern = [regex]::Escape(('set-paseo-built-in-' + 'notifications.ps1'))
+$checkInvokePattern = '(?m)&\s*\$?[A-Za-z][^\r\n]*' + $builtInHelperPattern
+$checkStartPattern = ('Start-' + 'Process[^\r\n]*') + $builtInHelperPattern
+if ($checkText -match $checkInvokePattern -or $checkText -match $checkStartPattern) {
+    throw 'pi-notify-check must not invoke Paseo built-in notification helper.'
 }
 
 if ($activateText -notmatch 'focus-ambiguous' -or $activateText -notmatch '\$eligibleCount -gt 1') {
@@ -839,7 +859,15 @@ else {
 Write-Host '[7/10] remote extension copies...'
 if ($null -ne $cfg -and -not [string]::IsNullOrWhiteSpace([string]$cfg.remoteHostAlias)) {
     $remoteSsh = if ($cfg.PSObject.Properties['sshExecutable'] -and -not [string]::IsNullOrWhiteSpace([string]$cfg.sshExecutable)) { [string]$cfg.sshExecutable } else { 'ssh.exe' }
-    $remoteCommand = 'node_exe="$(command -v node)" && "$node_exe" "$HOME/.local/share/pi-notify/pi-notify-ensure.mjs" --check --managed-dir "$HOME/.local/share/pi-notify"'
+    $expectedPaseoLeaseGate = if ($cfg.PSObject.Properties['paseoLeaseGateEnabled']) {
+        ConvertTo-NotifyBridgeBoolean -Value $cfg.paseoLeaseGateEnabled -Default $false
+    }
+    else {
+        $false
+    }
+    $expectedPaseoLeaseGateJs = if ($expectedPaseoLeaseGate) { 'true' } else { 'false' }
+    $remoteGateScript = 'const fs=require("fs");const p=process.env.HOME+"/.local/share/pi-notify/remote-windows-notify.json";const d=JSON.parse(fs.readFileSync(p,"utf8"));const actual=d.paseoLeaseGateEnabled===true;if(actual!==' + $expectedPaseoLeaseGateJs + ')process.exit(41);console.log("OK paseo lease gate enabled="+actual);'
+    $remoteCommand = 'node_exe="$(command -v node)" && "$node_exe" "$HOME/.local/share/pi-notify/pi-notify-ensure.mjs" --check --managed-dir "$HOME/.local/share/pi-notify" && "$node_exe" -e ' + (ConvertTo-NotifyBridgeRemoteShellLiteral -Value $remoteGateScript)
     $remoteArgs = Join-NotifyBridgeProcessArguments @(
         '-T',
         '-o', 'BatchMode=yes',
@@ -872,8 +900,9 @@ if ($null -ne $cfg -and -not [string]::IsNullOrWhiteSpace([string]$cfg.remoteHos
     $remoteText = $remoteOutput -join "`n"
     $remoteExitCodeText = ''
     try { $remoteExitCodeText = [string]$remoteProcess.ExitCode } catch { $remoteExitCodeText = '' }
-    $remoteSuccessByOutput = ($remoteText -match '^OK Pi notify bridge verified mode=(package|standalone) packageCopies=\d+ active=' -and $remoteText -notmatch '^BAD ')
-    if ($remoteExitCodeText -eq '0' -or $remoteSuccessByOutput) {
+    $remoteGateSuccess = $remoteText -match (('(?m)^OK paseo lease gate enabled={0}\s*$' -f $expectedPaseoLeaseGateJs))
+    $remoteSuccessByOutput = ($remoteText -match '^OK Pi notify bridge verified mode=(package|standalone) packageCopies=\d+ active=' -and $remoteText -notmatch '(?m)^BAD ' -and $remoteGateSuccess)
+    if (($remoteExitCodeText -eq '0' -and $remoteGateSuccess) -or $remoteSuccessByOutput) {
         $remoteOutput | ForEach-Object { Write-Host $_ }
     }
     else {

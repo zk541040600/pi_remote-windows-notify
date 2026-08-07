@@ -48,10 +48,16 @@ test("Windows listener implements authenticated health and close contracts", () 
 test("sender package pins @getpaseo/client 0.3.0-beta.2 and does not import from Pi extension", () => {
   const pkg = JSON.parse(read("linux/paseo-sender/package.json"));
   assert.equal(pkg.dependencies["@getpaseo/client"], "0.3.0-beta.2");
+  assert.equal(pkg.dependencies["@getpaseo/protocol"], "0.3.0-beta.2");
   assert.equal(existsSync(join(root, "linux/paseo-sender/package-lock.json")), true);
   const lock = JSON.parse(read("linux/paseo-sender/package-lock.json"));
+  const rootDependencies = lock.packages?.[""]?.dependencies;
   const client = lock.packages?.["node_modules/@getpaseo/client"];
+  const protocol = lock.packages?.["node_modules/@getpaseo/protocol"];
+  assert.equal(rootDependencies?.["@getpaseo/client"], "0.3.0-beta.2");
+  assert.equal(rootDependencies?.["@getpaseo/protocol"], "0.3.0-beta.2");
   assert.equal(client?.version, "0.3.0-beta.2");
+  assert.equal(protocol?.version, "0.3.0-beta.2");
 
   const extension = read("linux/extensions/remote-windows-notify.ts");
   // Pi extension must not import the Paseo SDK (path name for health lease is OK).

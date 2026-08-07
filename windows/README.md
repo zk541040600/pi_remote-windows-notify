@@ -25,6 +25,7 @@ This folder implements a reliable **Windows local notification bridge** for runn
 - `test-route.ps1` — Windows PowerShell 5.1 route metadata and fail-closed decision regression (includes Paseo contracts)
 - `paseo-desktop-route.ps1` — loopback-only Paseo CDP controller (event dispatch; no Page.navigate)
 - `set-paseo-desktop-routing.ps1` — explicit user-confirmed Enable/Disable helper for persistent `PASEO_ELECTRON_FLAGS` + config flag (never auto-run by install/refresh)
+- `set-paseo-built-in-notifications.ps1` — explicit user-confirmed Disable/Restore helper for Paseo built-in Windows notifications (HKCU `Enabled`; never auto-run by install/refresh/check)
 - `../browser-extension/` — shared opt-in Chrome/Edge Manifest V3 route adapter
 
 ## Architecture
@@ -186,9 +187,40 @@ powershell.exe -ExecutionPolicy Bypass -File .\windows\set-paseo-desktop-routing
 
 Enable persists user-level `PASEO_ELECTRON_FLAGS` with loopback-only remote debugging flags, saves a backup of the previous flags, and requires a **manual Paseo restart**. Notification clicks never set environment variables. Disable restores the backup and turns the config flag off.
 
+### Final controlled takeover (built-in notifications)
+
+After Linux sender live delivery, exact click routing, and Pi/Codex/Grok Build probes are confirmed, disable Paseo built-in Windows notifications with the **manual** helper only. Install, refresh, restart, and check copy the helper but **never execute** `-Disable` or `-Restore`.
+
+```powershell
+# Explicit interactive takeover. Writes HKCU Enabled=0 for electron.app.Paseo.
+# First Disable atomically saves original presence/value under:
+#   %USERPROFILE%\.pi-notify\paseo-built-in-notification-state.json
+# Repeated Disable is idempotent and never overwrites the original backup with 0.
+powershell.exe -ExecutionPolicy Bypass -File .\windows\set-paseo-built-in-notifications.ps1 -Disable
+
+# One-shot restore from the saved backup (deletes backup after success).
+# If the property was originally absent, Restore removes Enabled.
+# Missing backup fails closed and does not modify the registry.
+powershell.exe -ExecutionPolicy Bypass -File .\windows\set-paseo-built-in-notifications.ps1 -Restore
+```
+
+Recommended takeover order (all manual):
+
+1. Keep sender `deliveryMode=live` and Windows bridge healthy.
+2. Enable Pi lease gate only after explicit confirmation (`paseoLeaseGateEnabled` / `PI_NOTIFY_PASEO_LEASE_GATE=1`).
+3. Run `set-paseo-built-in-notifications.ps1 -Disable`.
+4. Observe for 24 hours; keep `PI_NOTIFY_ALLOW_PASEO=1` as emergency Pi fallback.
+
+One-shot rollback:
+
+1. `set-paseo-built-in-notifications.ps1 -Restore`
+2. Disable Pi lease gate / set `PI_NOTIFY_ALLOW_PASEO=1` if needed
+3. Stop or shadow the Linux sender if required
+4. `set-paseo-desktop-routing.ps1 -Disable` if CDP routing must also roll back
+
 ### Security residual risk and rollback
 
-CDP has no authentication; any same-user local process that can reach the loopback port can control the page. Keep routing disabled until Windows live verification confirms loopback binding, owner checks, multi-window fail-closed behavior, and privacy. On any safety failure: keep/disable routing, run `-Disable`, do not kill Paseo, and re-enable built-in notifications if they were turned off manually.
+CDP has no authentication; any same-user local process that can reach the loopback port can control the page. Keep routing disabled until Windows live verification confirms loopback binding, owner checks, multi-window fail-closed behavior, and privacy. On any safety failure: keep/disable routing, run desktop-routing `-Disable`, restore built-in notifications with `set-paseo-built-in-notifications.ps1 -Restore`, and do not kill Paseo.
 
 
 ## First-time remote install

@@ -44,7 +44,10 @@ test("Paseo activation cache is DPAPI protected, bounded, atomic, and owner leas
   assert.match(common, /Local\\PiRemotePaseoActivationCache/);
   assert.match(common, /Clear-NotifyPaseoActivationCache -MaxAgeSeconds 1800 -MaxCount 95/);
   assert.match(common, /activation-\*\.json\.tmp-\*/);
-  assert.match(common, /\[System\.IO\.File\]::Replace\(\$tempPath, \$path, \$null\)/);
+  // PS5.1 binding turns $null into an empty string and File.Replace then throws
+  // "illegal path" while normalizing the backup argument; [NullString]::Value is required.
+  assert.match(common, /\[System\.IO\.File\]::Replace\(\$tempPath, \$path, \[NullString\]::Value\)/);
+  assert.doesNotMatch(common, /\[System\.IO\.File\]::Replace\([^\r\n]*\$null\)/);
   assert.match(common, /\$payload\.leaseId = \$leaseId/);
   assert.match(common, /\[string\]\$payload\.leaseId -ne \$LeaseId/);
   assert.match(common, /Consume-NotifyPaseoActivationState -ActivationId \$ActivationId -LeaseId \$lease\.LeaseId/);
@@ -55,6 +58,24 @@ test("Paseo activation cache is DPAPI protected, bounded, atomic, and owner leas
 
 test("Paseo CDP controller trusts only the expected process, app target, and exact port", () => {
   assert.match(controller, /owner-path-mismatch/);
+  assert.match(controller, /Import-Module NetTCPIP -ErrorAction Stop/);
+  assert.match(controller, /ProcessQueryLimitedInformation = 0x1000/);
+  assert.match(controller, /QueryFullProcessImageName/);
+  assert.match(controller, /Get-NotifyPaseoLimitedProcessPath -ProcessId \$ownerId/);
+  assert.match(controller, /Chrome_WidgetWin_1/);
+  assert.match(controller, /FindMainWindows\(\$OwnerProcessId\)/);
+  assert.match(controller, /multiple-main-windows/);
+  assert.match(controller, /ShowWindowAsync/);
+  assert.match(controller, /AttachThreadInput/);
+  assert.match(controller, /BringWindowToTop/);
+  assert.match(controller, /FocusWindow/);
+  assert.match(controller, /\$refocusAttempted/);
+  assert.match(controller, /workspace-tab-agent_/);
+  assert.match(controller, /Array\.from\(new Set\(/);
+  assert.match(controller, /aria-selected=\"true\"/);
+  assert.match(controller, /selectedAgentCount/);
+  assert.match(controller, /selectedAgentIds/);
+  assert.match(controller, /\$selectedAgentIds -contains \$agent/);
   assert.match(controller, /pageUri\.Scheme -ne 'paseo'/);
   assert.match(controller, /pageUri\.Host -ne 'app'/);
   assert.match(controller, /wsUri\.Port -ne \$Port/);
@@ -70,6 +91,8 @@ test("Paseo CDP controller trusts only the expected process, app target, and exa
   assert.match(controller, /atob\('\$b64'\)/);
   assert.match(controller, /handlerAck: !!event\.defaultPrevented/);
   assert.match(controller, /exact-agent-not-foreground/);
+  assert.match(routeTests, /select-multi-panel-agent-ok/);
+  assert.match(routeTests, /select-multi-panel-agent-ambiguous/);
   assert.doesNotMatch(controller, /Page\.navigate/);
   assert.doesNotMatch(controller, /paseo:\/\//);
 });
@@ -112,13 +135,56 @@ test("Paseo runtime files are copied everywhere but never auto-enabled", () => {
     const source = readWindows(name);
     assert.match(source, /paseo-desktop-route\.ps1/, `${name} must copy the controller`);
     assert.match(source, /set-paseo-desktop-routing\.ps1/, `${name} must copy the deployment helper`);
+    assert.match(source, /set-paseo-built-in-notifications\.ps1/, `${name} must copy the built-in notification helper`);
     assert.doesNotMatch(source, /set-paseo-desktop-routing\.ps1[^\r\n]*-Enable/);
+    assert.doesNotMatch(source, /set-paseo-built-in-notifications\.ps1[^\r\n]*-(Disable|Restore)/);
   }
   const helper = readWindows("set-paseo-desktop-routing.ps1");
   assert.match(helper, /remote-debugging-address=127\.0\.0\.1/);
   assert.match(helper, /Standard Paseo executable was not found/);
   assert.match(helper, /Get-NotifyPaseoCdpOwnerSnapshot/);
   assert.doesNotMatch(helper, /Stop-Process|taskkill/);
+
+  const builtIn = readWindows("set-paseo-built-in-notifications.ps1");
+  assert.match(builtIn, /\[switch\]\$Disable/);
+  assert.match(builtIn, /\[switch\]\$Restore/);
+  assert.match(
+    builtIn,
+    /HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Notifications\\Settings\\electron\.app\.Paseo/,
+  );
+  assert.match(builtIn, /paseo-built-in-notification-state\.json/);
+  assert.match(builtIn, /\[System\.IO\.File\]::Replace\(\$tempPath, \$Path, \[NullString\]::Value\)/);
+  assert.doesNotMatch(builtIn, /\[System\.IO\.File\]::Replace\([^\r\n]*\$null\)/);
+  assert.match(builtIn, /Only HKCU registry paths are allowed/);
+  assert.match(builtIn, /HKLM registry paths are forbidden/);
+  assert.match(builtIn, /RegistryPath and StatePath test overrides must be provided together/);
+  assert.match(builtIn, /StatePath override must stay under USERPROFILE or TEMP/);
+  assert.match(builtIn, /backup belongs to a different registry path/);
+  assert.match(builtIn, /registryPath = \$RegistryPath/);
+  assert.doesNotMatch(builtIn, /systemctl|Stop-Process|taskkill|ssh /);
+  assert.doesNotMatch(builtIn, /install-windows-autostart|pi-notify-refresh/);
+  // Must not open or write HKLM; rejection text is allowed.
+  assert.doesNotMatch(builtIn, /New-ItemProperty[^\n]*HKLM|Get-Item[^\n]*HKLM|Remove-ItemProperty[^\n]*HKLM/i);
+  // Backup must capture original presence/value before writing 0, and never overwrite an existing backup.
+  assert.match(builtIn, /Save-NotifyPaseoBuiltInOriginalStateOnce/);
+  assert.match(builtIn, /never overwrite an existing original backup with 0/);
+  assert.match(builtIn, /Restore fail-closed: no built-in notification backup state exists/);
+  assert.match(builtIn, /Remove-ItemProperty -LiteralPath \$RegistryPath -Name 'Enabled'/);
+
+  const remoteInstaller = readWindows("install-remote-windows-notify.ps1");
+  assert.match(remoteInstaller, /paseoLeaseGateEnabled = \[bool\]\$config\.PaseoLeaseGateEnabled/);
+  assert.match(remoteInstaller, /paseoLeasePath = \[string\]\$config\.PaseoLeasePath/);
+
+  const check = readWindows("pi-notify-check.ps1");
+  assert.match(check, /set-paseo-built-in-notifications\.ps1/);
+  assert.match(check, /expectedPaseoLeaseGate/);
+  assert.match(check, /ConvertTo-NotifyBridgeBoolean -Value \$cfg\.paseoLeaseGateEnabled -Default \$false/);
+  assert.match(check, /OK paseo lease gate enabled=/);
+  assert.match(check, /\$remoteGateSuccess = \$remoteText -match/);
+  assert.match(check, /\$remoteSuccessByOutput = \([^\r\n]*\$remoteGateSuccess\)/);
+  assert.match(check, /\$remoteExitCodeText -eq '0' -and \$remoteGateSuccess/);
+  assert.match(check, /must never auto-run Paseo built-in notification Disable\/Restore/);
+  assert.doesNotMatch(check, /set-paseo-built-in-notifications\.ps1\s+-(Disable|Restore)/);
 });
 
 

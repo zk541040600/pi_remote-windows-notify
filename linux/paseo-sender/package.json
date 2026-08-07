@@ -15,6 +15,7 @@
     "node": ">=20"
   },
   "dependencies": {
-    "@getpaseo/client": "0.3.0-beta.2"
+    "@getpaseo/client": "0.3.0-beta.2",
+    "@getpaseo/protocol": "0.3.0-beta.2"
   }
 }
