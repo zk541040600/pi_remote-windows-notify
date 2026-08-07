@@ -150,7 +150,8 @@ function Invoke-NotifyPaseoWindowForeground {
         [int]$TimeoutMs = 2500
     )
 
-    $nativeType = [System.Management.Automation.PSTypeName]'PiNotify.PaseoWindowNative'
+    # Versioned type name so long-lived broker workers reload after script copy without process restart.
+    $nativeType = [System.Management.Automation.PSTypeName]'PiNotify.PaseoWindowNativeV2'
     if ($null -eq $nativeType.Type) {
         $source = @'
 using System;
@@ -159,7 +160,7 @@ using System.Runtime.InteropServices;
 using System.Text;
 
 namespace PiNotify {
-    public static class PaseoWindowNative {
+    public static class PaseoWindowNativeV2 {
         private delegate bool EnumWindowsProc(IntPtr window, IntPtr state);
 
         [DllImport("user32.dll")]
@@ -189,9 +190,17 @@ namespace PiNotify {
         [DllImport("user32.dll")]
         public static extern IntPtr GetForegroundWindow();
 
+        // SW_RESTORE (9) unmaximizes a maximized window. Only use it for minimized
+        // (iconic) windows; keep maximized/normal geometry intact on click focus.
+        private const int SwRestore = 9;
+
         [DllImport("user32.dll")]
         [return: MarshalAs(UnmanagedType.Bool)]
         public static extern bool ShowWindowAsync(IntPtr window, int command);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool IsIconic(IntPtr window);
 
         [DllImport("user32.dll")]
         [return: MarshalAs(UnmanagedType.Bool)]
@@ -216,6 +225,13 @@ namespace PiNotify {
             return windows.ToArray();
         }
 
+        // Restore only when minimized. Never force SW_RESTORE on a maximized window.
+        public static void RestoreIfMinimized(IntPtr window) {
+            if (IsIconic(window)) {
+                ShowWindowAsync(window, SwRestore);
+            }
+        }
+
         public static bool FocusWindow(IntPtr window) {
             IntPtr foreground = GetForegroundWindow();
             uint ignored;
@@ -232,7 +248,7 @@ namespace PiNotify {
                 if (targetThread != 0 && targetThread != currentThread) {
                     targetAttached = AttachThreadInput(currentThread, targetThread, true);
                 }
-                ShowWindowAsync(window, 9);
+                RestoreIfMinimized(window);
                 BringWindowToTop(window);
                 SetForegroundWindow(window);
                 return GetForegroundWindow() == window;
@@ -250,14 +266,14 @@ namespace PiNotify {
 }
 '@
         try { Add-Type -TypeDefinition $source -ErrorAction Stop } catch {
-            $nativeType = [System.Management.Automation.PSTypeName]'PiNotify.PaseoWindowNative'
+            $nativeType = [System.Management.Automation.PSTypeName]'PiNotify.PaseoWindowNativeV2'
             if ($null -eq $nativeType.Type) {
                 return [pscustomobject]@{ Ok = $false; Result = 'foreground-denied'; Reason = 'window-api-unavailable'; Count = 0 }
             }
         }
     }
 
-    $windows = @([PiNotify.PaseoWindowNative]::FindMainWindows($OwnerProcessId))
+    $windows = @([PiNotify.PaseoWindowNativeV2]::FindMainWindows($OwnerProcessId))
     if ($windows.Count -eq 0) {
         return [pscustomobject]@{ Ok = $false; Result = 'foreground-denied'; Reason = 'window-missing'; Count = 0 }
     }
@@ -266,14 +282,15 @@ namespace PiNotify {
     }
 
     $window = [IntPtr]$windows[0]
-    [void][PiNotify.PaseoWindowNative]::ShowWindowAsync($window, 9)
+    # Preserve maximized size: SW_RESTORE only when iconic/minimized.
+    [void][PiNotify.PaseoWindowNativeV2]::RestoreIfMinimized($window)
     try { [void](New-Object -ComObject WScript.Shell).AppActivate($OwnerProcessId) } catch {}
-    [void][PiNotify.PaseoWindowNative]::SetForegroundWindow($window)
-    [void][PiNotify.PaseoWindowNative]::FocusWindow($window)
+    [void][PiNotify.PaseoWindowNativeV2]::SetForegroundWindow($window)
+    [void][PiNotify.PaseoWindowNativeV2]::FocusWindow($window)
 
     $deadline = [DateTime]::UtcNow.AddMilliseconds([Math]::Max(500, [Math]::Min(5000, $TimeoutMs)))
     while ([DateTime]::UtcNow -lt $deadline) {
-        if ([PiNotify.PaseoWindowNative]::IsWindowVisible($window) -and [PiNotify.PaseoWindowNative]::GetForegroundWindow() -eq $window) {
+        if ([PiNotify.PaseoWindowNativeV2]::IsWindowVisible($window) -and [PiNotify.PaseoWindowNativeV2]::GetForegroundWindow() -eq $window) {
             return [pscustomobject]@{ Ok = $true; Result = 'foreground-ready'; Reason = ''; Count = 1 }
         }
         Start-Sleep -Milliseconds 50

@@ -562,6 +562,13 @@ if ($paseoRouteText -notmatch 'paseo:web-notification-click' -or $paseoRouteText
 if ($paseoRouteText -notmatch 'owner-path-mismatch' -or $paseoRouteText -notmatch "pageUri.Scheme -ne 'paseo'" -or $paseoRouteText -notmatch 'wsUri.Port -ne \$Port' -or $paseoRouteText -notmatch "expectedWsPath = '/devtools/page/\{0\}'" -or $paseoRouteText -notmatch 'actualWsPath.Equals\(\$expectedWsPath' -or $paseoRouteText -notmatch 'foreground-denied') {
     throw 'Paseo controller must verify executable path, app-scheme target, exact WebSocket page identity/port, and foreground acceptance.'
 }
+# SW_RESTORE (9) unmaximizes maximized windows; only restore when IsIconic.
+if ($paseoRouteText -notmatch 'IsIconic' -or $paseoRouteText -notmatch 'RestoreIfMinimized' -or $paseoRouteText -notmatch 'if \(IsIconic\(window\)\)') {
+    throw 'Paseo foreground must restore only minimized windows and preserve maximized geometry.'
+}
+if ($paseoRouteText -match 'ShowWindowAsync\(window,\s*9\);\s*[\r\n]+\s*BringWindowToTop' -or ($paseoRouteText -match 'ShowWindowAsync\(\$window,\s*9\)' -and $paseoRouteText -notmatch 'RestoreIfMinimized\(\$window\)')) {
+    throw 'Paseo foreground must not force SW_RESTORE on non-minimized windows.'
+}
 if ($paseoRouteText -match 'remote-debugging-port' -or $setPaseoText -notmatch 'PASEO_ELECTRON_FLAGS' -or $setPaseoText -match 'Stop-Process' -or $setPaseoText -match 'taskkill') {
     # controller must not mutate flags; helper may set user env only
     if ($paseoRouteText -match 'PASEO_ELECTRON_FLAGS') {

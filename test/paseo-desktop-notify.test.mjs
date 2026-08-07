@@ -66,6 +66,23 @@ test("Paseo CDP controller trusts only the expected process, app target, and exa
   assert.match(controller, /FindMainWindows\(\$OwnerProcessId\)/);
   assert.match(controller, /multiple-main-windows/);
   assert.match(controller, /ShowWindowAsync/);
+  assert.match(controller, /IsIconic/);
+  assert.match(controller, /RestoreIfMinimized/);
+  assert.match(controller, /PaseoWindowNativeV2/);
+  // SW_RESTORE unmaximizes; only restore when iconic/minimized.
+  assert.match(controller, /if \(IsIconic\(window\)\)/);
+  assert.ok(
+    controller.includes("RestoreIfMinimized(window)"),
+    "foreground path must call RestoreIfMinimized",
+  );
+  assert.ok(
+    !/ShowWindowAsync\(window,\s*9\);\s*[\r\n]+\s*BringWindowToTop/.test(controller),
+    "FocusWindow must not force SW_RESTORE before BringWindowToTop",
+  );
+  assert.ok(
+    !/ShowWindowAsync\(\$window,\s*9\)/.test(controller),
+    "outer foreground path must not force SW_RESTORE on $window",
+  );
   assert.match(controller, /AttachThreadInput/);
   assert.match(controller, /BringWindowToTop/);
   assert.match(controller, /FocusWindow/);
