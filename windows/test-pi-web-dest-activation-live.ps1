@@ -759,7 +759,10 @@ function Get-CapturedRowRoutingFingerprints {
     $proofs = @($events | Where-Object {
         [string]$_.eventName -eq 'route-session-proof' -and
         (Test-EventField $_ 'accepted' $true) -and
-        (Test-EventField $_ 'reason' 'api-response-confirmed') -and
+        $_.fields.PSObject.Properties['reason'] -and
+        [string]$_.fields.reason -in @(
+            'api-response-confirmed',
+            'api-response-confirmed-source-promoted') -and
         $_.fields.PSObject.Properties['routingFp'] -and
         -not [string]::IsNullOrWhiteSpace([string]$_.fields.routingFp)
     })
@@ -985,6 +988,38 @@ function Invoke-LiveExactActivation {
         (Test-EventField $_ 'notificationFp' $notificationFp) -and
         (Test-EventField $_ 'result' 'session-url-confirmed')
     })
+    $issuedUtc = if ($rowIssued.Count -eq 1) {
+        ConvertTo-EventUtc -EventRecord $rowIssued[0]
+    } else { [DateTime]::MinValue }
+    $historyUtc = if ($history.Count -gt 0) {
+        ConvertTo-EventUtc -EventRecord @(
+            $history | Sort-Object { ConvertTo-EventUtc -EventRecord $_ }
+        )[0]
+    } else { [DateTime]::MinValue }
+    $proofUtc = if ($proof.Count -eq 1) {
+        ConvertTo-EventUtc -EventRecord $proof[0]
+    } else { [DateTime]::MinValue }
+    $committedUtc = if ($committed.Count -eq 1) {
+        ConvertTo-EventUtc -EventRecord $committed[0]
+    } else { [DateTime]::MinValue }
+    $confirmedUtc = if ($confirmed.Count -eq 1) {
+        ConvertTo-EventUtc -EventRecord $confirmed[0]
+    } else { [DateTime]::MinValue }
+    $acknowledgedUtc = if ($acknowledged.Count -eq 1) {
+        ConvertTo-EventUtc -EventRecord $acknowledged[0]
+    } else { [DateTime]::MinValue }
+    $completedUtc = if ($completed.Count -eq 1) {
+        ConvertTo-EventUtc -EventRecord $completed[0]
+    } else { [DateTime]::MinValue }
+    $activationEventOrderValid =
+        $readyUtc -ne [DateTime]::MinValue -and
+        $readyUtc -le $issuedUtc -and
+        $issuedUtc -le $historyUtc -and
+        $historyUtc -le $proofUtc -and
+        $proofUtc -le $committedUtc -and
+        $committedUtc -le $confirmedUtc -and
+        $confirmedUtc -le $acknowledgedUtc -and
+        $acknowledgedUtc -le $completedUtc
 
     $fallbacks = @($events | Where-Object {
         [string]$_.eventName -eq 'route-row-activation-fallback' -and
@@ -1084,6 +1119,9 @@ function Invoke-LiveExactActivation {
         if ($history.Count -lt 1) { [void]$failures.Add('SAME_DOCUMENT_HISTORY_TARGET_MISSING') }
         if ($proof.Count -ne 1) { [void]$failures.Add('EXACT_SESSION_GET_PROOF_MISSING') }
         if ($committed.Count -ne 1) { [void]$failures.Add('ROW_ACTIVATION_COMMIT_MISSING') }
+        if (-not $activationEventOrderValid) {
+            [void]$failures.Add('ACTIVATION_EVENT_ORDER_INVALID')
+        }
         if ($fallbacks.Count -ne 0) { [void]$failures.Add('UNEXPECTED_FRESH_NAV_FALLBACK') }
         if ($navigationStarts.Count -ne 0) { [void]$failures.Add('FRESH_DOCUMENT_NAVIGATION_OBSERVED') }
         if ($documentReady.Count -ne 0) { [void]$failures.Add('NEW_DOCUMENT_READY_OBSERVED') }
@@ -1291,6 +1329,7 @@ function Get-SafeRouteEvidence {
         'route-activation-ui-start',
         'route-row-activation-issued',
         'route-row-activation-result',
+        'route-row-binding-diagnostic',
         'route-row-activation-provisional-focus',
         'route-row-activation-progress',
         'activate-progress-result',

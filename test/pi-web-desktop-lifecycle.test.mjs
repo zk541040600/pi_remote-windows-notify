@@ -129,7 +129,57 @@ test("PiWebDesktop notification routing reuses a verified live sidebar row", () 
     source,
     /latestLoadedSession=\{sessionId:proof\.sessionId,url:currentUrl\.href\}/,
   );
+  assert.match(source, /const deferredUserApiProofs=new Map\(\)/);
+  assert.match(source, /const maxDeferredUserApiProofs=16/);
+  assert.match(source, /const deferUserApiProof=\(proof\)=>/);
+  assert.match(
+    source,
+    /deferredUserApiProofs\.get\(proof\.sessionId\)!==proof/,
+  );
+  assert.match(
+    source,
+    /deferredUserApiProofs\.size>=maxDeferredUserApiProofs/,
+  );
+  assert.match(source, /deferredProof\.requestGesture===gesture/);
+  assert.match(source, /emitSessionApiProof\(deferredProof,false\)/);
+  assert.match(source, /rejectDeferredUserApiProof\(proof,'deferred-expired'\)/);
+  assert.match(source, /let deferredProgrammaticApiProof=null/);
+  assert.match(source, /const deferProgrammaticApiProof=\(proof\)=>/);
+  assert.match(
+    source,
+    /activation\.kind!=='row'[\s\S]{0,180}pendingRowActivation!==activation[\s\S]{0,180}activation\.sessionId!==proof\.sessionId/,
+  );
+  assert.match(
+    source,
+    /const deferredApiProofExpired=\(proof\)=>\{[\s\S]{0,220}Date\.now\(\)>=proof\.deferredExpiresAtMs/,
+  );
+  assert.match(source, /proof\.deferredExpiresAtMs=deferredAtMs\+5000/);
+  assert.match(
+    source,
+    /Math\.max\(0,proof\.deferredExpiresAtMs-Date\.now\(\)\)/,
+  );
+  assert.match(
+    source,
+    /const expireDeferredApiProof=\(proof\)=>\{[\s\S]{0,500}clearDeferredApiProof\(proof\)[\s\S]{0,500}outcome:'deferred-expired'/,
+  );
+  assert.match(
+    source,
+    /const emitSessionApiProof=\(proof,allowDefer\)=>\{try\{[\s\S]{0,120}expireDeferredApiProof\(proof\)/,
+  );
+  assert.match(
+    source,
+    /activation\.historyAcked=true;[\s\S]{0,420}programmaticProof\.activation===activation[\s\S]{0,220}emitSessionApiProof\(programmaticProof,false\)[\s\S]{0,120}maybeClearPendingActivation\(activation\)/,
+  );
   assert.match(source, /pendingLaggingUserSessionProof/);
+  assert.match(source, /ShouldPromoteLaggingUserSessionProof/);
+  assert.match(
+    source,
+    /ConsumeLaggingUserSessionProof[\s\S]*candidateSlot = null;[\s\S]*ShouldPromoteLaggingUserSessionProof/,
+  );
+  assert.match(
+    source,
+    /candidateDocumentGeneration == currentDocumentGeneration[\s\S]*candidateDocumentNonce,[\s\S]*activeDocumentNonce[\s\S]*IsFreshRouteIntent[\s\S]*candidateRoutingKey,[\s\S]*observedRoutingKey/,
+  );
   assert.match(source, /api-response-confirmed-source-promoted/);
   assert.match(source, /result = "trusted-user-intent-pending"/);
   assert.match(
@@ -160,6 +210,26 @@ test("PiWebDesktop notification routing reuses a verified live sidebar row", () 
   assert.ok(
     commandSupersede > userPriorityGuard,
     "checking real-user priority must not discard an older synthetic tombstone",
+  );
+  const commandHandler = source.slice(commandStart, syntheticClick);
+  assert.match(
+    commandHandler,
+    /clearProgrammaticProofForActivation\([\s\S]{0,160}pendingRowActivation,'proof-superseded'/,
+  );
+  const trustedClickStart = source.indexOf(
+    "document.addEventListener('click'",
+  );
+  const historyHookStart = source.indexOf(
+    "for(const method of ['pushState','replaceState'])",
+    trustedClickStart,
+  );
+  assert.ok(
+    trustedClickStart >= 0 && historyHookStart > trustedClickStart,
+    "missing trusted click proof ownership window",
+  );
+  assert.match(
+    source.slice(trustedClickStart, historyHookStart),
+    /clearProgrammaticProofForActivation\([\s\S]{0,160}pendingRowActivation,'proof-superseded'/,
   );
 
   const userRouteStart = source.indexOf("private void HandleUserRouteMessage");
@@ -259,5 +329,39 @@ test("live Dest activation evidence strips PowerShell provider metadata", () => 
     source,
     /if \(\$closedObserved -and \$adapterCompleteObserved\) \{ break \}/,
   );
+  assert.match(
+    source,
+    /'api-response-confirmed',[\s\S]*'api-response-confirmed-source-promoted'/,
+  );
+  const captureStart = source.indexOf(
+    "function Get-CapturedRowRoutingFingerprints",
+  );
+  const captureEnd = source.indexOf("\nfunction ", captureStart + 1);
+  const captureContract = source.slice(
+    captureStart,
+    captureEnd > captureStart ? captureEnd : undefined,
+  );
+  assert.ok(captureStart >= 0, "missing captured-row proof contract");
+  assert.match(captureContract, /processId -eq \$script:DesktopPid/);
+  assert.match(captureContract, /runId -eq \$script:DesktopRunId/);
+  assert.match(
+    captureContract,
+    /Get-EventDocumentGeneration[\s\S]*-eq \$DocumentGeneration/,
+  );
+  assert.match(captureContract, /intentKind' 'sidebar'/);
+  assert.match(
+    captureContract,
+    /Test-EventField \$_ 'routingFp' \$routingFp/,
+  );
+  assert.match(
+    captureContract,
+    /ConvertTo-EventUtc -EventRecord \$_\) -ge \$intentUtc/,
+  );
+  assert.match(
+    source,
+    /\$readyUtc -le \$issuedUtc[\s\S]*\$issuedUtc -le \$historyUtc[\s\S]*\$historyUtc -le \$proofUtc[\s\S]*\$proofUtc -le \$committedUtc[\s\S]*\$committedUtc -le \$confirmedUtc[\s\S]*\$confirmedUtc -le \$acknowledgedUtc[\s\S]*\$acknowledgedUtc -le \$completedUtc/,
+  );
+  assert.match(source, /ACTIVATION_EVENT_ORDER_INVALID/);
   assert.match(source, /FOCUSED_POPUP_CLOSE_EXCEEDED_2S/);
+  assert.match(source, /'route-row-binding-diagnostic'/);
 });

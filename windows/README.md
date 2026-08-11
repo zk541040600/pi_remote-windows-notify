@@ -519,6 +519,10 @@ powershell -ExecutionPolicy Bypass -File .\verify.ps1
 
 The desktop app registers only after a successful trusted-origin WebView2 navigation containing `?session=`. It heartbeats its adapter/owner lease and uses the existing window restore/focus path; it does not navigate notifications to an arbitrary URL or create a second window.
 
+After `route-config.json` exists, `install-remote-windows-notify.ps1` reads its validated `instanceKey` and projects `originKind=pi-web` plus the same key into the managed Linux notification config. `pi-notify-refresh.ps1 -SyncRemote` uses that installer. Restart or reload the Pi Web host after synchronization so new session runtimes consume the updated config. `pi-notify-check.ps1` compares only the key fingerprints and fails when the Windows route authority and managed Linux config drift; it never prints the raw key.
+
+A test that posts an already-frozen popup directly to the broker verifies click activation only. It does not prove that a real Pi Web session emitted exact-route metadata. End-to-end acceptance additionally requires a newly created Pi Web session notification to produce `notify-received originKind=pi-web`, a ready/recovering freeze, and a final handled click without Terminal fallback.
+
 ### Chrome and Edge adapters
 
 ```bash

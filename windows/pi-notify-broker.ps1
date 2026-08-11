@@ -8,6 +8,8 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 . "$PSScriptRoot/NotifyBridge.Common.ps1"
+. "$PSScriptRoot/terminal-route.ps1"
+. "$PSScriptRoot/NotifyBridge.Activation.ps1"
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
@@ -954,10 +956,30 @@ function Complete-NotifyBrokerPopupLifecycle {
     )
 
     if ($null -eq $Tag -or $null -eq $Tag.Form -or $Tag.Form.IsDisposed) { return $false }
-    $paseoRetryAllowed = $Reason -notin @('expired', 'invalid', 'activation-missing', 'foreign-owner', 'non-loopback', 'ambiguous')
-    if ($null -ne $Retryable) { $paseoRetryAllowed = [bool]$Retryable }
-    $isPaseoRetryable = ($Outcome -eq 'failed') -and ([string]$Tag.OriginKind -eq 'paseo') -and $paseoRetryAllowed
-    $keepPaseoExpiryTimer = ($Outcome -eq 'failed') -and ([string]$Tag.OriginKind -eq 'paseo') -and ($isPaseoRetryable -or $Reason -in @('expired', 'invalid', 'activation-missing'))
+    $remainingMs = Get-NotifyActivationRemainingMs -ExpiresAtUtc ([DateTime]$Tag.ExpiresAtUtc)
+    if ($Outcome -ne 'dismissed' -and $remainingMs -le 0) {
+        $Tag.TerminalState.Value = $true
+        $Tag.TerminalOutcome = 'dismissed'
+        $Tag.TerminalReason = 'expired'
+        $Tag.Activating.Value = $false
+        $Tag.Timer.Stop()
+        $Tag.FocusWatchTimer.Stop()
+        $Tag.FailureCloseTimer.Stop()
+        $Tag.ActivationWatchdogTimer.Stop()
+        Write-NotifyBrokerLog -Message ('broker-popup-expired popupId={0} ignoredOutcome={1} reason={2}' -f $Tag.PopupId, $Outcome, $Reason)
+        if (-not $Tag.CloseRequested.Value) {
+            $Tag.CloseRequested.Value = $true
+            $Tag.Form.Close()
+        }
+        return $true
+    }
+
+    $originKind = if ($null -eq $Tag.OriginKind) { '' } else { ([string]$Tag.OriginKind).Trim() }
+    $retryAllowed = $Reason -notin @('expired', 'invalid', 'activation-missing', 'foreign-owner', 'non-loopback', 'ambiguous')
+    if ($null -ne $Retryable) { $retryAllowed = [bool]$Retryable }
+    $supportsRetry = ($originKind -eq 'paseo') -or ($originKind -eq 'terminal') -or [string]::IsNullOrWhiteSpace($originKind)
+    $isRetryableFailure = ($Outcome -eq 'failed') -and $supportsRetry -and $retryAllowed
+    $keepPaseoExpiryTimer = ($Outcome -eq 'failed') -and ($originKind -eq 'paseo') -and ($isRetryableFailure -or $Reason -in @('expired', 'invalid', 'activation-missing'))
     $alreadyTerminal = $Tag.TerminalState.Value
     if (-not $alreadyTerminal) {
         $Tag.TerminalState.Value = $true
@@ -972,8 +994,8 @@ function Complete-NotifyBrokerPopupLifecycle {
 
     if ($Outcome -eq 'failed') {
         if ($alreadyTerminal) { return $false }
-        if ($isPaseoRetryable) {
-            # Temporary Paseo failures keep activation state and restore clickable retry UI.
+        if ($isRetryableFailure) {
+            # Temporary failures restore clickable retry UI without extending original expiry.
             $Tag.TerminalState.Value = $false
             $Tag.TerminalOutcome = ''
             $Tag.TerminalReason = ''
@@ -986,8 +1008,22 @@ function Complete-NotifyBrokerPopupLifecycle {
             $Tag.TitleLabel.Text = $retryText
             $Tag.BodyLabel.Text = $Tag.OriginalBody
             $Tag.FailureCloseTimer.Stop()
-            # The original expiry timer never stops for Paseo, so retry UI cannot outlive activation TTL.
-            Write-NotifyBrokerLog -Message ('broker-paseo-retry-ready popupId={0} reason={1}' -f $Tag.PopupId, $Reason)
+            $remainingMs = Get-NotifyActivationRemainingMs -ExpiresAtUtc ([DateTime]$Tag.ExpiresAtUtc)
+            if ($remainingMs -le 0) {
+                $Tag.TerminalState.Value = $true
+                $Tag.TerminalOutcome = 'dismissed'
+                $Tag.TerminalReason = 'expired'
+                if (-not $Tag.CloseRequested.Value) {
+                    $Tag.CloseRequested.Value = $true
+                    $Tag.Form.Close()
+                }
+                return $true
+            }
+            $Tag.Timer.Stop()
+            $Tag.Timer.Interval = $remainingMs
+            $Tag.Timer.Start()
+            $Tag.FocusWatchTimer.Start()
+            Write-NotifyBrokerLog -Message ('broker-retry-ready popupId={0} originKind={1} reason={2} remainingMs={3}' -f $Tag.PopupId, $(if ([string]::IsNullOrWhiteSpace($originKind)) { 'terminal' } else { $originKind }), $Reason, $remainingMs)
             return $true
         }
         if (([string]$Tag.OriginKind -eq 'paseo') -and ($Reason -in @('expired', 'invalid', 'activation-missing'))) {
@@ -1000,6 +1036,7 @@ function Complete-NotifyBrokerPopupLifecycle {
         }
         Set-NotifyBrokerRecoveryUiState -Tag $Tag -State 'unavailable'
         $Tag.FailureCloseTimer.Stop()
+        $Tag.FailureCloseTimer.Interval = [Math]::Max(1, [Math]::Min([int]$script:NotifyBrokerFailureCloseDelayMs, $remainingMs))
         $Tag.FailureCloseTimer.Start()
         return $true
     }
@@ -1017,8 +1054,10 @@ function Invoke-NotifyBrokerActivationWatchdog {
     param([Parameter(Mandatory = $true)][hashtable]$Tag)
 
     if ($Tag.TerminalState.Value) { return $false }
-    Write-NotifyBrokerLog -Message ('broker-activation-watchdog popupId={0}' -f $Tag.PopupId)
-    [void](Complete-NotifyBrokerPopupLifecycle -Tag $Tag -Outcome 'failed' -Reason 'activation-watchdog')
+    $originKind = if ($Tag.ContainsKey('OriginKind')) { [string]$Tag.OriginKind } else { '' }
+    $failure = New-NotifyActivationWorkerFailureOutcome -Operation 'activate' -OriginKind $originKind -Reason 'activation-watchdog'
+    Write-NotifyBrokerLog -Message ('broker-activation-watchdog popupId={0} result={1}' -f $Tag.PopupId, $failure.Result)
+    [void](Complete-NotifyBrokerPopupLifecycle -Tag $Tag -Outcome 'failed' -Reason $failure.Reason -Retryable $failure.Retryable)
     [void](Remove-NotifyBrokerDeferredActivationForPopup -PopupId $Tag.PopupId)
     Stop-NotifyBrokerExactWorkersForPopup -PopupId $Tag.PopupId -Reason 'activation-watchdog'
     return $true
@@ -1027,17 +1066,20 @@ function Invoke-NotifyBrokerActivationWatchdog {
 function Set-NotifyBrokerExactWorkerFailClosed {
     param(
         [Parameter(Mandatory = $true)][string]$PopupId,
-        [Parameter(Mandatory = $true)][string]$Reason
+        [Parameter(Mandatory = $true)][string]$Reason,
+        [string]$Operation = 'activate',
+        [string]$OriginKind = ''
     )
 
-    Write-NotifyBrokerLog -Message ('broker-exact-worker-rejected popupId={0} reason={1} active={2} max={3}' -f $PopupId, $Reason, $script:NotifyBrokerExactWorkers.Count, $script:NotifyBrokerExactWorkerMax)
+    $failure = New-NotifyActivationWorkerFailureOutcome -Operation $Operation -OriginKind $OriginKind -Reason $Reason
+    Write-NotifyBrokerLog -Message ('broker-exact-worker-rejected popupId={0} result={1} reason={2} active={3} max={4}' -f $PopupId, $failure.Result, $failure.Reason, $script:NotifyBrokerExactWorkers.Count, $script:NotifyBrokerExactWorkerMax)
     if (-not $script:NotifyBrokerActivePopups.ContainsKey($PopupId)) { return }
 
     $entry = $script:NotifyBrokerActivePopups[$PopupId]
     if ($null -eq $entry -or $null -eq $entry.Form -or $entry.Form.IsDisposed -or $null -eq $entry.Form.Tag) { return }
 
     $tag = $entry.Form.Tag
-    [void](Complete-NotifyBrokerPopupLifecycle -Tag $tag -Outcome 'failed' -Reason $Reason)
+    [void](Complete-NotifyBrokerPopupLifecycle -Tag $tag -Outcome 'failed' -Reason $failure.Reason -Retryable $failure.Retryable)
 }
 
 function Close-NotifyBrokerExactWorkerResources {
@@ -1072,7 +1114,9 @@ function Request-NotifyBrokerExactWorkerStop {
     }
     catch {
         $Worker.CancelReason = ''
-        Write-NotifyBrokerLog -Message ('broker-exact-worker-cancel-error popupId={0} mode={1} reason={2}' -f $Worker.PopupId, $Worker.Mode, $Reason)
+        $failure = New-NotifyActivationWorkerFailureOutcome -Operation $Worker.Operation -OriginKind $Worker.OriginKind -Reason 'worker-cancel-error'
+        Write-NotifyBrokerLog -Message ('broker-exact-worker-cancel-error popupId={0} mode={1} reason={2} result={3}' -f $Worker.PopupId, $Worker.Mode, $Reason, $failure.Result)
+        Set-NotifyBrokerExactWorkerFailClosed -PopupId $Worker.PopupId -Reason $failure.Reason -Operation $Worker.Operation -OriginKind $Worker.OriginKind
         return $false
     }
 }
@@ -1159,7 +1203,24 @@ function Start-NotifyBrokerNextDeferredActivation {
             continue
         }
 
-        [void](Start-NotifyBrokerExactWorker -PopupId $deferred.PopupId -Mode 'activate' -NotificationId $deferred.NotificationId -SnapshotId $deferred.SnapshotId -RecoveryTicketId $deferred.RecoveryTicketId)
+        $originKind = 'pi-web'
+        $targetHost = ''
+        $cwdBase = ''
+        $tabTitle = ''
+        $targetFingerprint = ''
+        if ($script:NotifyBrokerActivePopups.ContainsKey([string]$deferred.PopupId)) {
+            $deferredTag = $script:NotifyBrokerActivePopups[[string]$deferred.PopupId].Form.Tag
+            if ($null -ne $deferredTag) {
+                if ($deferredTag.ContainsKey('OriginKind') -and -not [string]::IsNullOrWhiteSpace([string]$deferredTag.OriginKind)) {
+                    $originKind = [string]$deferredTag.OriginKind
+                }
+                if ($deferredTag.ContainsKey('TargetHost')) { $targetHost = [string]$deferredTag.TargetHost }
+                if ($deferredTag.ContainsKey('TargetCwdBase')) { $cwdBase = [string]$deferredTag.TargetCwdBase }
+                if ($deferredTag.ContainsKey('TargetSourceTabTitle')) { $tabTitle = [string]$deferredTag.TargetSourceTabTitle }
+                if ($deferredTag.ContainsKey('TargetFingerprint')) { $targetFingerprint = [string]$deferredTag.TargetFingerprint }
+            }
+        }
+        [void](Start-NotifyBrokerExactWorker -PopupId $deferred.PopupId -Mode 'activate' -OriginKind $originKind -NotificationId $deferred.NotificationId -SnapshotId $deferred.SnapshotId -RecoveryTicketId $deferred.RecoveryTicketId -TargetHost $targetHost -CurrentDirBase $cwdBase -SourceTabTitleValue $tabTitle -TargetFingerprint $targetFingerprint)
         return
     }
 }
@@ -1222,16 +1283,16 @@ function Ensure-NotifyBrokerExactWorkerTimer {
 
             $cancelReason = [string]$worker.CancelReason
             $result = $null
+            $rows = @()
             try {
                 if ($null -ne $worker.StopAsync) { $worker.PowerShell.EndStop($worker.StopAsync) }
                 if ($worker.Async.IsCompleted) {
                     $rows = @($worker.PowerShell.EndInvoke($worker.Async))
-                    if ($rows.Count -gt 0) { $result = $rows[-1] }
                 }
             }
             catch {
                 if ([string]::IsNullOrWhiteSpace($cancelReason)) {
-                    $result = [pscustomobject]@{ Decision = 'fail-closed'; Result = 'adapter-unavailable'; Reason = 'worker-error'; SnapshotId = '' }
+                    $result = New-NotifyActivationWorkerFailureOutcome -Operation $worker.Operation -OriginKind $worker.OriginKind -Reason 'worker-endinvoke-error' -ElapsedMs ([int]([DateTime]::UtcNow - $worker.StartedAtUtc).TotalMilliseconds)
                 }
             }
             finally {
@@ -1239,57 +1300,57 @@ function Ensure-NotifyBrokerExactWorkerTimer {
                 [void]$script:NotifyBrokerExactWorkers.Remove($id)
             }
 
+            $elapsedMs = [int]([DateTime]::UtcNow - $worker.StartedAtUtc).TotalMilliseconds
             if (-not [string]::IsNullOrWhiteSpace($cancelReason)) {
-                $elapsedMs = [int]([DateTime]::UtcNow - $worker.StartedAtUtc).TotalMilliseconds
-                Write-NotifyBrokerLog -Message ('broker-exact-worker-cancelled popupId={0} mode={1} reason={2} elapsedMs={3}' -f $worker.PopupId, $worker.Mode, $cancelReason, $elapsedMs)
+                $cancelled = New-NotifyActivationWorkerFailureOutcome -Operation $worker.Operation -OriginKind $worker.OriginKind -Reason 'worker-cancelled' -ElapsedMs $elapsedMs
+                Write-NotifyBrokerLog -Message ('broker-exact-worker-cancelled popupId={0} mode={1} reason={2} result={3} elapsedMs={4}' -f $worker.PopupId, $worker.Mode, $cancelReason, $cancelled.Result, $cancelled.ElapsedMs)
                 if ($cancelReason -eq 'preempted-by-activation' -and
                     -not (Test-NotifyBrokerActivationIntent -PopupId $worker.PopupId)) {
-                    Set-NotifyBrokerExactWorkerFailClosed -PopupId $worker.PopupId -Reason $cancelReason
+                    Set-NotifyBrokerExactWorkerFailClosed -PopupId $worker.PopupId -Reason $cancelReason -Operation $worker.Operation -OriginKind $worker.OriginKind
                 }
                 Start-NotifyBrokerNextDeferredActivation
                 continue
             }
 
             if ($null -eq $result) {
-                $result = [pscustomobject]@{ Decision = 'fail-closed'; Result = 'adapter-unavailable'; Reason = 'worker-empty'; SnapshotId = '' }
+                $result = Resolve-NotifyActivationWorkerOutput -Rows $rows -Operation $worker.Operation -OriginKind $worker.OriginKind -ElapsedMs $elapsedMs
             }
 
-            $elapsedMs = [int]([DateTime]::UtcNow - $worker.StartedAtUtc).TotalMilliseconds
-            Write-NotifyBrokerLog -Message ('broker-exact-worker-complete popupId={0} mode={1} decision={2} result={3} reason={4} snapshotFp={5} elapsedMs={6}' -f $worker.PopupId, $worker.Mode, $result.Decision, $result.Result, $(if ([string]::IsNullOrWhiteSpace([string]$result.Reason)) { 'none' } else { [string]$result.Reason }), (Get-NotifyRouteFingerprint -Value ([string]$result.SnapshotId)), $elapsedMs)
+            $snapshotFp = Get-NotifyRouteFingerprint -Value ([string]$result.SnapshotId)
+            Write-NotifyBrokerLog -Message ('broker-exact-worker-complete popupId={0} mode={1} decision={2} result={3} reason={4} snapshotFp={5} elapsedMs={6} scrollAttempted={7} scrolledToBottom={8}' -f $worker.PopupId, $worker.Mode, $result.Decision, $result.Result, $(if ([string]::IsNullOrWhiteSpace([string]$result.Reason)) { 'none' } else { [string]$result.Reason }), $snapshotFp, $elapsedMs, $result.ScrollAttempted, $result.ScrolledToBottom)
             Start-NotifyBrokerNextDeferredActivation
             if (-not $script:NotifyBrokerActivePopups.ContainsKey($worker.PopupId)) { continue }
             $entry = $script:NotifyBrokerActivePopups[$worker.PopupId]
             $tag = $entry.Form.Tag
-            if ($worker.Mode -eq 'paseo-activate') {
-                if ($result.Decision -eq 'handled') {
-                    [void](Complete-NotifyBrokerPopupLifecycle -Tag $tag -Outcome 'handled' -Reason $(if ([string]::IsNullOrWhiteSpace([string]$result.Result)) { 'activated' } else { [string]$result.Result }))
+            $deferredIntent = Test-NotifyBrokerActivationIntent -PopupId $worker.PopupId
+            $ui = ConvertTo-NotifyActivationUiOutcome -Outcome $result -HasDeferredActivateIntent:$deferredIntent
+            if ($ui.Action -eq 'store-ready') {
+                if (-not [string]::IsNullOrWhiteSpace([string]$ui.SnapshotId)) {
+                    $tag.SnapshotId = [string]$ui.SnapshotId
                 }
-                else {
-                    $reason = if (-not [string]::IsNullOrWhiteSpace([string]$result.Result)) { [string]$result.Result } elseif (-not [string]::IsNullOrWhiteSpace([string]$result.Reason)) { [string]$result.Reason } else { 'activation-failed' }
-                    $retryable = if ($result.PSObject.Properties['Retryable']) { [bool]$result.Retryable } else { $null }
-                    [void](Complete-NotifyBrokerPopupLifecycle -Tag $tag -Outcome 'failed' -Reason $reason -Retryable $retryable)
+                if (-not $tag.TerminalState.Value) {
+                    Set-NotifyBrokerRecoveryUiState -Tag $tag -State 'ready'
                 }
-            }
-            elseif ($worker.Mode -eq 'resolve') {
-                if ($result.Decision -eq 'exact-ready' -and -not [string]::IsNullOrWhiteSpace([string]$result.SnapshotId)) {
-                    $tag.SnapshotId = [string]$result.SnapshotId
-                    if (-not $tag.TerminalState.Value) {
-                        Set-NotifyBrokerRecoveryUiState -Tag $tag -State 'ready'
-                    }
+                if ($ui.StartActivate) {
+                    [void](Start-NotifyBrokerExactWorker -PopupId $worker.PopupId -Mode 'activate' -OriginKind 'pi-web' -NotificationId $tag.NotificationId -SnapshotId $tag.SnapshotId -RecoveryTicketId $tag.RecoveryTicketId)
                 }
-                else {
-                    [void](Complete-NotifyBrokerPopupLifecycle -Tag $tag -Outcome 'failed' -Reason $(if ([string]::IsNullOrWhiteSpace([string]$result.Reason)) { 'resolve-failed' } else { [string]$result.Reason }))
-                }
+                continue
             }
-            elseif ($result.Decision -eq 'focused') {
-                [void](Complete-NotifyBrokerPopupLifecycle -Tag $tag -Outcome 'focused' -Reason $(if ([string]::IsNullOrWhiteSpace([string]$result.Reason)) { 'background-proof-pending' } else { [string]$result.Reason }))
+            if ($ui.Action -eq 'close-handled') {
+                [void](Complete-NotifyBrokerPopupLifecycle -Tag $tag -Outcome 'handled' -Reason $(if ([string]::IsNullOrWhiteSpace([string]$ui.Result)) { 'activation-handled' } else { [string]$ui.Result }))
+                continue
             }
-            elseif ($result.Decision -eq 'handled') {
-                [void](Complete-NotifyBrokerPopupLifecycle -Tag $tag -Outcome 'handled' -Reason $(if ([string]::IsNullOrWhiteSpace([string]$result.Result)) { 'activation-handled' } else { [string]$result.Result }))
+            if ($ui.Action -eq 'close-focused') {
+                [void](Complete-NotifyBrokerPopupLifecycle -Tag $tag -Outcome 'focused' -Reason $(if ([string]::IsNullOrWhiteSpace([string]$ui.Reason)) { 'background-proof-pending' } else { [string]$ui.Reason }))
+                continue
             }
-            else {
-                [void](Complete-NotifyBrokerPopupLifecycle -Tag $tag -Outcome 'failed' -Reason $(if ([string]::IsNullOrWhiteSpace([string]$result.Reason)) { 'activation-failed' } else { [string]$result.Reason }))
+            if ($ui.Action -eq 'restore-retryable') {
+                $reason = if (-not [string]::IsNullOrWhiteSpace([string]$ui.Result)) { [string]$ui.Result } elseif (-not [string]::IsNullOrWhiteSpace([string]$ui.Reason)) { [string]$ui.Reason } else { 'activation-failed' }
+                [void](Complete-NotifyBrokerPopupLifecycle -Tag $tag -Outcome 'failed' -Reason $reason -Retryable $true)
+                continue
             }
+            $failReason = if (-not [string]::IsNullOrWhiteSpace([string]$ui.Result)) { [string]$ui.Result } elseif (-not [string]::IsNullOrWhiteSpace([string]$ui.Reason)) { [string]$ui.Reason } else { 'activation-failed' }
+            [void](Complete-NotifyBrokerPopupLifecycle -Tag $tag -Outcome 'failed' -Reason $failReason -Retryable $false)
         }
         if ($script:NotifyBrokerExactWorkers.Count -eq 0) { $this.Stop() }
     })
@@ -1299,10 +1360,22 @@ function Start-NotifyBrokerExactWorker {
     param(
         [Parameter(Mandatory = $true)][string]$PopupId,
         [Parameter(Mandatory = $true)][ValidateSet('resolve', 'activate')][string]$Mode,
-        [Parameter(Mandatory = $true)][string]$NotificationId,
+        [string]$OriginKind = '',
+        [string]$NotificationId = '',
         [string]$SnapshotId = '',
-        [string]$RecoveryTicketId = ''
+        [string]$RecoveryTicketId = '',
+        [string]$TargetHost = '',
+        [string]$CurrentDirBase = '',
+        [string]$SourceTabTitleValue = '',
+        [string]$TargetFingerprint = ''
     )
+
+    $resolvedOrigin = if ([string]::IsNullOrWhiteSpace($OriginKind)) {
+        if ($Mode -eq 'resolve') { 'pi-web' } else { '' }
+    } else {
+        $OriginKind.Trim()
+    }
+    $operation = if ($Mode -eq 'resolve') { 'resolve' } else { 'activate' }
 
     $existing = @($script:NotifyBrokerExactWorkers.Values | Where-Object { $_.PopupId -eq $PopupId -and $_.Mode -eq $Mode })
     if ($existing.Count -gt 0) {
@@ -1322,12 +1395,12 @@ function Start-NotifyBrokerExactWorker {
         } | Select-Object -First 1)
         if ($resolvers.Count -gt 0) {
             if (-not (Add-NotifyBrokerDeferredActivation -PopupId $PopupId -NotificationId $NotificationId -SnapshotId $SnapshotId -RecoveryTicketId $RecoveryTicketId)) {
-                Set-NotifyBrokerExactWorkerFailClosed -PopupId $PopupId -Reason 'activation-queue-cap-reached'
+                Set-NotifyBrokerExactWorkerFailClosed -PopupId $PopupId -Reason 'activation-queue-cap-reached' -Operation $operation -OriginKind $resolvedOrigin
                 return $false
             }
             if (-not (Request-NotifyBrokerExactWorkerStop -Worker $resolvers[0] -Reason 'superseded-by-activation')) {
                 [void](Remove-NotifyBrokerDeferredActivationForPopup -PopupId $PopupId)
-                Set-NotifyBrokerExactWorkerFailClosed -PopupId $PopupId -Reason 'activation-cancel-error'
+                Set-NotifyBrokerExactWorkerFailClosed -PopupId $PopupId -Reason 'activation-cancel-error' -Operation $operation -OriginKind $resolvedOrigin
                 return $false
             }
             Write-NotifyBrokerLog -Message ('broker-exact-worker-activation-deferred popupId={0} active={1} max={2}' -f $PopupId, $script:NotifyBrokerExactWorkers.Count, $script:NotifyBrokerExactWorkerMax)
@@ -1346,7 +1419,7 @@ function Start-NotifyBrokerExactWorker {
                 Select-Object -First 1)
             if ($resolverVictim.Count -gt 0) {
                 if (-not (Add-NotifyBrokerDeferredActivation -PopupId $PopupId -NotificationId $NotificationId -SnapshotId $SnapshotId -RecoveryTicketId $RecoveryTicketId)) {
-                    Set-NotifyBrokerExactWorkerFailClosed -PopupId $PopupId -Reason 'activation-queue-cap-reached'
+                    Set-NotifyBrokerExactWorkerFailClosed -PopupId $PopupId -Reason 'activation-queue-cap-reached' -Operation $operation -OriginKind $resolvedOrigin
                     return $false
                 }
                 if (Request-NotifyBrokerExactWorkerStop -Worker $resolverVictim[0] -Reason 'preempted-by-activation') {
@@ -1358,7 +1431,7 @@ function Start-NotifyBrokerExactWorker {
         }
 
         $reason = if ($Mode -eq 'resolve') { 'resolve-cap-reached' } else { 'activate-cap-reached' }
-        Set-NotifyBrokerExactWorkerFailClosed -PopupId $PopupId -Reason $reason
+        Set-NotifyBrokerExactWorkerFailClosed -PopupId $PopupId -Reason $reason -Operation $operation -OriginKind $resolvedOrigin
         return $false
     }
 
@@ -1366,29 +1439,7 @@ function Start-NotifyBrokerExactWorker {
     $workerId = ('exact-{0}' -f $script:NotifyBrokerExactWorkerSequence)
     $runspace = $null
     $powerShell = $null
-    $workerScript = @'
-param($CommonPath, $ConfigPath, $Mode, $NotificationId, $SnapshotId, $RecoveryTicketId, $ActivationRecoveryWaitMs)
-$ErrorActionPreference = 'Stop'
-. $CommonPath
-$configArgs = @{}
-if (-not [string]::IsNullOrWhiteSpace($ConfigPath)) { $configArgs.ConfigPath = $ConfigPath }
-$workerConfig = Ensure-NotifyBridgeConfig @configArgs
-if ($Mode -eq 'resolve') {
-    $outcome = Wait-NotifyExactRouteRecovery -NotificationId $NotificationId -RecoveryTicketId $RecoveryTicketId -Config $workerConfig -WaitMs 125000
-    $decision = $outcome.Decision
-}
-else {
-    $outcome = Invoke-NotifyExactRouteRecoveryAndActivate -NotificationId $NotificationId -SnapshotId $SnapshotId -RecoveryTicketId $RecoveryTicketId -Config $workerConfig -RecoveryWaitMs $ActivationRecoveryWaitMs -ActivateWaitMs 45000 -ActivateTimeoutMs 48000
-    $decision = $outcome.Decision
-}
-[pscustomobject]@{
-    Decision = [string]$decision.Decision
-    Result = [string]$decision.Result
-    Reason = [string]$decision.Reason
-    SnapshotId = if ($outcome.PSObject.Properties['SnapshotId']) { [string]$outcome.SnapshotId } elseif ($decision.PSObject.Properties['SnapshotId']) { [string]$decision.SnapshotId } else { '' }
-    RecoveryTicketId = $RecoveryTicketId
-}
-'@
+    $workerScript = Get-NotifyActivationWorkerScript
     try {
         $runspace = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
         $runspace.Open()
@@ -1396,11 +1447,19 @@ else {
         $powerShell.Runspace = $runspace
         [void]$powerShell.AddScript($workerScript)
         [void]$powerShell.AddParameter('CommonPath', (Join-Path $PSScriptRoot 'NotifyBridge.Common.ps1'))
+        [void]$powerShell.AddParameter('TerminalRoutePath', (Join-Path $PSScriptRoot 'terminal-route.ps1'))
+        [void]$powerShell.AddParameter('ActivationPath', (Join-Path $PSScriptRoot 'NotifyBridge.Activation.ps1'))
         [void]$powerShell.AddParameter('ConfigPath', $ConfigPath)
-        [void]$powerShell.AddParameter('Mode', $Mode)
+        [void]$powerShell.AddParameter('Operation', $operation)
+        [void]$powerShell.AddParameter('OriginKind', $resolvedOrigin)
         [void]$powerShell.AddParameter('NotificationId', $NotificationId)
         [void]$powerShell.AddParameter('SnapshotId', $SnapshotId)
         [void]$powerShell.AddParameter('RecoveryTicketId', $RecoveryTicketId)
+        [void]$powerShell.AddParameter('TargetHost', $TargetHost)
+        [void]$powerShell.AddParameter('CwdBase', $CurrentDirBase)
+        [void]$powerShell.AddParameter('TabTitle', $SourceTabTitleValue)
+        [void]$powerShell.AddParameter('TargetFingerprint', $TargetFingerprint)
+        [void]$powerShell.AddParameter('TimeoutMs', 3000)
         [void]$powerShell.AddParameter('ActivationRecoveryWaitMs', $script:NotifyBrokerActivationRecoveryWaitMs)
         $async = $powerShell.BeginInvoke()
     }
@@ -1410,13 +1469,15 @@ else {
             try { $runspace.Close() } catch {}
             try { $runspace.Dispose() } catch {}
         }
-        Set-NotifyBrokerExactWorkerFailClosed -PopupId $PopupId -Reason 'worker-start-error'
+        Set-NotifyBrokerExactWorkerFailClosed -PopupId $PopupId -Reason 'worker-start-error' -Operation $operation -OriginKind $resolvedOrigin
         return $false
     }
     $script:NotifyBrokerExactWorkers[$workerId] = [pscustomobject]@{
         WorkerId = $workerId
         PopupId = $PopupId
         Mode = $Mode
+        Operation = $operation
+        OriginKind = $resolvedOrigin
         PowerShell = $powerShell
         Runspace = $runspace
         Async = $async
@@ -1437,75 +1498,11 @@ function Start-NotifyBrokerPaseoWorker {
     )
 
     if ([string]::IsNullOrWhiteSpace($ActivationId)) {
-        Set-NotifyBrokerExactWorkerFailClosed -PopupId $PopupId -Reason 'activation-missing'
+        Set-NotifyBrokerExactWorkerFailClosed -PopupId $PopupId -Reason 'activation-missing' -Operation 'activate' -OriginKind 'paseo'
         return $false
     }
 
-    $existing = @($script:NotifyBrokerExactWorkers.Values | Where-Object { $_.PopupId -eq $PopupId -and $_.Mode -eq 'paseo-activate' })
-    if ($existing.Count -gt 0) {
-        return $true
-    }
-    if ($script:NotifyBrokerExactWorkers.Count -ge $script:NotifyBrokerExactWorkerMax) {
-        Set-NotifyBrokerExactWorkerFailClosed -PopupId $PopupId -Reason 'activate-cap-reached'
-        return $false
-    }
-
-    $script:NotifyBrokerExactWorkerSequence += 1
-    $workerId = ('paseo-{0}' -f $script:NotifyBrokerExactWorkerSequence)
-    $runspace = $null
-    $powerShell = $null
-    $workerScript = @'
-param($CommonPath, $ConfigPath, $ActivationId)
-$ErrorActionPreference = 'Stop'
-. $CommonPath
-$configArgs = @{}
-if (-not [string]::IsNullOrWhiteSpace($ConfigPath)) { $configArgs.ConfigPath = $ConfigPath }
-$workerConfig = Ensure-NotifyBridgeConfig @configArgs
-$outcome = Invoke-NotifyPaseoRouteActivate -ActivationId $ActivationId -Config $workerConfig -TimeoutMs 20000
-[pscustomobject]@{
-    Decision = [string]$outcome.Decision
-    Result = [string]$outcome.Result
-    Reason = [string]$outcome.Reason
-    Retryable = [bool]$outcome.Retryable
-    SnapshotId = $ActivationId
-}
-'@
-    try {
-        $runspace = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
-        $runspace.Open()
-        $powerShell = [System.Management.Automation.PowerShell]::Create()
-        $powerShell.Runspace = $runspace
-        [void]$powerShell.AddScript($workerScript)
-        [void]$powerShell.AddParameter('CommonPath', (Join-Path $PSScriptRoot 'NotifyBridge.Common.ps1'))
-        [void]$powerShell.AddParameter('ConfigPath', $ConfigPath)
-        [void]$powerShell.AddParameter('ActivationId', $ActivationId)
-        $async = $powerShell.BeginInvoke()
-    }
-    catch {
-        if ($null -ne $powerShell) { try { $powerShell.Dispose() } catch {} }
-        if ($null -ne $runspace) {
-            try { $runspace.Close() } catch {}
-            try { $runspace.Dispose() } catch {}
-        }
-        Set-NotifyBrokerExactWorkerFailClosed -PopupId $PopupId -Reason 'worker-start-error'
-        return $false
-    }
-
-    $script:NotifyBrokerExactWorkers[$workerId] = [pscustomobject]@{
-        WorkerId = $workerId
-        PopupId = $PopupId
-        Mode = 'paseo-activate'
-        PowerShell = $powerShell
-        Runspace = $runspace
-        Async = $async
-        StartedAtUtc = [DateTime]::UtcNow
-        StopAsync = $null
-        CancelReason = ''
-    }
-
-    Ensure-NotifyBrokerExactWorkerTimer
-    $script:NotifyBrokerExactWorkerTimer.Start()
-    return $true
+    return (Start-NotifyBrokerExactWorker -PopupId $PopupId -Mode 'activate' -OriginKind 'paseo' -SnapshotId $ActivationId)
 }
 
 function Queue-NotifyBrokerActivation {
@@ -1522,214 +1519,11 @@ function Queue-NotifyBrokerActivation {
         [string]$RecoveryTicketId = ''
     )
 
-    if ($OriginKind -eq 'pi-web') {
-        return Start-NotifyBrokerExactWorker -PopupId $PopupId -Mode 'activate' -NotificationId $NotificationId -SnapshotId $SnapshotId -RecoveryTicketId $RecoveryTicketId
-    }
     if ($OriginKind -eq 'paseo') {
         return Start-NotifyBrokerPaseoWorker -PopupId $PopupId -ActivationId $SnapshotId
     }
 
-    if ($null -eq $script:NotifyBrokerActivationQueue) {
-        $script:NotifyBrokerActivationQueue = [System.Collections.Generic.Queue[object]]::new()
-    }
-    if ($null -eq $script:NotifyBrokerActivationTimer) {
-        $script:NotifyBrokerActivationTimer = New-Object System.Windows.Forms.Timer
-        $script:NotifyBrokerActivationTimer.Interval = 1
-        $script:NotifyBrokerActivationTimer.Add_Tick({
-            $this.Stop()
-            if ($null -eq $script:NotifyBrokerActivationQueue -or $script:NotifyBrokerActivationQueue.Count -le 0) {
-                return
-            }
-            $request = $script:NotifyBrokerActivationQueue.Dequeue()
-            try {
-                Invoke-NotifyBrokerActivation -TargetHost $request.TargetHost -CurrentDirBase $request.CurrentDirBase -SourceTabTitleValue $request.SourceTabTitleValue -TargetFingerprint $request.TargetFingerprint -OriginKind $request.OriginKind -NotificationId $request.NotificationId -SnapshotId $request.SnapshotId
-            }
-            finally {
-                if ($null -ne $request.FormToClose -and -not $request.FormToClose.IsDisposed) {
-                    try {
-                        Write-NotifyBrokerLog -Message ('broker-activation-feedback-close popupId={0}' -f $request.PopupId)
-                        [void](Complete-NotifyBrokerPopupLifecycle -Tag $request.FormToClose.Tag -Outcome 'handled' -Reason 'legacy-activation-complete')
-                    }
-                    catch {
-                        Write-NotifyBrokerLog -Message ('broker-activation-feedback-close-error popupId={0} "{1}"' -f $request.PopupId, $_.Exception.Message)
-                    }
-                }
-            }
-            if ($script:NotifyBrokerActivationQueue.Count -gt 0) {
-                $this.Start()
-            }
-        })
-    }
-
-    $script:NotifyBrokerActivationQueue.Enqueue([pscustomobject]@{
-        TargetHost = $TargetHost
-        CurrentDirBase = $CurrentDirBase
-        SourceTabTitleValue = $SourceTabTitleValue
-        TargetFingerprint = $TargetFingerprint
-        PopupId = $PopupId
-        FormToClose = $FormToClose
-        OriginKind = $OriginKind
-        NotificationId = $NotificationId
-        SnapshotId = $SnapshotId
-        RecoveryTicketId = $RecoveryTicketId
-    })
-    $script:NotifyBrokerActivationTimer.Start()
-}
-
-function Invoke-NotifyBrokerActivation {
-    param(
-        [string]$TargetHost,
-        [string]$CurrentDirBase,
-        [string]$SourceTabTitleValue,
-        [string]$TargetFingerprint = '',
-        [string]$OriginKind = '',
-        [string]$NotificationId = '',
-        [string]$SnapshotId = '',
-        [string]$RecoveryTicketId = ''
-    )
-
-    try {
-        $startedAt = [DateTime]::UtcNow
-        $requiresCwdMatch = -not [string]::IsNullOrWhiteSpace($CurrentDirBase)
-        $hasPreciseSourceTitle = -not [string]::IsNullOrWhiteSpace($SourceTabTitleValue)
-        Write-NotifyBrokerLog -Message ('broker-activate targetFingerprint={0} cwdFingerprint={1} sourceTabFingerprint={2} originKind={3} notificationFp={4} snapshotFp={5}' -f (Get-NotifyBrokerContextFingerprint -Value $TargetHost), (Get-NotifyBrokerContextFingerprint -Value $CurrentDirBase), (Get-NotifyBrokerContextFingerprint -Value $SourceTabTitleValue), $(if ([string]::IsNullOrWhiteSpace($OriginKind)) { 'none' } else { $OriginKind }), (Get-NotifyRouteFingerprint -Value $NotificationId), (Get-NotifyRouteFingerprint -Value $SnapshotId))
-
-        if ($OriginKind -eq 'pi-web') {
-            Write-NotifyBrokerLog -Message 'broker-route-activate-invariant exact-route-must-use-background-worker'
-            return
-        }
-        if ($OriginKind -eq 'paseo') {
-            Write-NotifyBrokerLog -Message 'broker-paseo-activate-invariant paseo-must-use-background-worker'
-            return
-        }
-
-        if (-not $requiresCwdMatch -and -not $hasPreciseSourceTitle) {
-            Write-NotifyBrokerLog -Message ('broker-focus-miss missing-target-metadata no-target-open-skipped targetFingerprint={0} elapsedMs={1}' -f (Get-NotifyBrokerContextFingerprint -Value $TargetHost), [int]([DateTime]::UtcNow - $startedAt).TotalMilliseconds)
-            return
-        }
-        Write-NotifyBrokerLog -Message ('broker-focus-policy requiresCwdMatch={0} requiresSourceTabTitle={1}' -f $requiresCwdMatch, $hasPreciseSourceTitle)
-
-        $keywords = @($SourceTabTitleValue, $CurrentDirBase, $TargetHost) |
-            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
-            ForEach-Object { $_.Trim() } |
-            Select-Object -Unique
-        Write-NotifyBrokerLog -Message ('broker-keywords count={0}' -f @($keywords).Count)
-
-        $best = $null
-        $eligibleCount = 0
-        $cacheHit = $false
-        $cacheSource = 'none'
-        $cacheCandidate = Get-NotifyBrokerTabCacheCandidate -TargetFingerprint $TargetFingerprint -CurrentDirBase $CurrentDirBase -SourceTabTitleValue $SourceTabTitleValue
-        if ($null -ne $cacheCandidate) {
-            $cached = $cacheCandidate.Entry
-            $cacheHit = $true
-            $cacheSource = $cacheCandidate.Source
-            Write-NotifyBrokerLog -Message ('broker-cache-hit source={0} windowFingerprint={1} tabFingerprint={2} tabIndex={3} targetFingerprint={4}' -f $cacheSource, (Get-NotifyBrokerContextFingerprint -Value $cached.WindowTitle), (Get-NotifyBrokerContextFingerprint -Value $cached.TabName), $cached.TabIndex, $TargetFingerprint)
-        }
-
-        if ($null -eq $best) {
-            $windows = @(Get-NotifyBrokerWindows -TerminalOnly)
-            Write-NotifyBrokerLog -Message ('broker-terminal-window-count {0} cacheHit={1}' -f $windows.Count, $cacheHit)
-            foreach ($window in $windows) {
-                $baseScore = 0
-                foreach ($keyword in $keywords) {
-                    if ($window.Title.IndexOf($keyword, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
-                        $baseScore += 20
-                    }
-                }
-
-                $tabs = @(Get-NotifyBrokerTabs -Handle $window.Handle)
-                Write-NotifyBrokerLog -Message ('broker-window titleFingerprint={0} processFingerprint={1} tabs={2} baseScore={3}' -f (Get-NotifyBrokerContextFingerprint -Value $window.Title), (Get-NotifyBrokerContextFingerprint -Value $window.ProcessName), $tabs.Count, $baseScore)
-                if ($tabs.Count -eq 0) {
-                    continue
-                }
-
-                foreach ($tab in $tabs) {
-                    $score = $baseScore
-                    $matchedKeywords = New-Object System.Collections.Generic.List[string]
-                    foreach ($keyword in $keywords) {
-                        if (-not [string]::IsNullOrWhiteSpace($tab.Name) -and $tab.Name.IndexOf($keyword, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
-                            $score += 120
-                            [void]$matchedKeywords.Add($keyword)
-                        }
-                    }
-                    $sourceTabTitleMatch = -not [string]::IsNullOrWhiteSpace($SourceTabTitleValue) -and -not [string]::IsNullOrWhiteSpace($tab.Name) -and $tab.Name.IndexOf($SourceTabTitleValue, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
-                    if ($sourceTabTitleMatch) {
-                        $score += 300
-                    }
-                    $cwdKeywordMatch = $requiresCwdMatch -and ($matchedKeywords -contains $CurrentDirBase)
-                    if ($hasPreciseSourceTitle -and -not $sourceTabTitleMatch) {
-                        $score = 0
-                    }
-                    elseif ($requiresCwdMatch -and -not $cwdKeywordMatch) {
-                        $score = 0
-                    }
-                    Write-NotifyBrokerLog -Message ('broker-tab index={0} nameFingerprint={1} selected={2} score={3} matchedKeywordCount={4} sourceTabTitleMatch={5}' -f $tab.Index, (Get-NotifyBrokerContextFingerprint -Value $tab.Name), $tab.IsSelected, $score, @($matchedKeywords).Count, $sourceTabTitleMatch)
-                    if ($score -le 0) {
-                        continue
-                    }
-
-                    $eligibleCount += 1
-                    $candidate = [pscustomobject]@{ Window = $window; Score = $score; Tab = $tab.Element; TabName = $tab.Name; TabIndex = $tab.Index }
-                    if ($null -eq $best -or $candidate.Score -gt $best.Score) {
-                        $best = $candidate
-                    }
-                }
-            }
-        }
-
-        if ($eligibleCount -gt 1) {
-            Write-NotifyBrokerLog -Message ('broker-focus-ambiguous targetFingerprint={0} sourceTabFingerprint={1} candidateCount={2} bestScore={3} cacheHit={4} elapsedMs={5}' -f (Get-NotifyBrokerContextFingerprint -Value $TargetHost), (Get-NotifyBrokerContextFingerprint -Value $SourceTabTitleValue), $eligibleCount, $best.Score, $cacheHit, [int]([DateTime]::UtcNow - $startedAt).TotalMilliseconds)
-            return
-        }
-
-        if ($null -eq $best) {
-            Write-NotifyBrokerLog -Message ('broker-focus-miss no-target-open-skipped targetFingerprint={0} cwdFingerprint={1} keywordCount={2} cacheHit={3} elapsedMs={4}' -f (Get-NotifyBrokerContextFingerprint -Value $TargetHost), (Get-NotifyBrokerContextFingerprint -Value $CurrentDirBase), @($keywords).Count, $cacheHit, [int]([DateTime]::UtcNow - $startedAt).TotalMilliseconds)
-            return
-        }
-
-        Write-NotifyBrokerLog -Message ('broker-focus-best windowFingerprint={0} tabFingerprint={1} tabIndex={2} score={3} cacheHit={4} cacheSource={5}' -f (Get-NotifyBrokerContextFingerprint -Value $best.Window.Title), (Get-NotifyBrokerContextFingerprint -Value $best.TabName), $best.TabIndex, $best.Score, $cacheHit, $cacheSource)
-        if ([PiNotifyBrokerUser32]::IsIconic($best.Window.Handle)) {
-            [void][PiNotifyBrokerUser32]::ShowWindowAsync($best.Window.Handle, 9)
-            Start-Sleep -Milliseconds 80
-        }
-
-        if ($cacheHit) {
-            [void][PiNotifyBrokerUser32]::SetForegroundWindow($best.Window.Handle)
-            if ($null -ne $best.Tab -and (Select-NotifyBrokerTab -TabElement $best.Tab)) {
-                $scrolledToBottom = Set-NotifyBridgeTerminalScrollToBottom -WindowHandle $best.Window.Handle
-                Write-NotifyBrokerLog -Message ('broker-tab-selected tabFingerprint={0} elapsedMs={1} cacheHit=True cacheSource={2} scrolledToBottom={3}' -f (Get-NotifyBrokerContextFingerprint -Value $best.TabName), [int]([DateTime]::UtcNow - $startedAt).TotalMilliseconds, $cacheSource, $scrolledToBottom)
-                Update-NotifyBrokerTabCache -Best $best -TargetFingerprint $TargetFingerprint -SourceTabTitleValue $SourceTabTitleValue
-                return
-            }
-            Write-NotifyBrokerLog -Message ('broker-cache-select-failed tabFingerprint={0}' -f (Get-NotifyBrokerContextFingerprint -Value $best.TabName))
-        }
-
-        try {
-            $shell = New-Object -ComObject WScript.Shell
-            [void]$shell.AppActivate($best.Window.ProcessId)
-        }
-        catch {
-            Write-NotifyBrokerLog -Message ('broker-appactivate-error "{0}"' -f $_.Exception.Message)
-        }
-        Start-Sleep -Milliseconds 40
-        [void][PiNotifyBrokerUser32]::SetForegroundWindow($best.Window.Handle)
-        Start-Sleep -Milliseconds 40
-
-        if ($null -ne $best.Tab) {
-            if (Select-NotifyBrokerTab -TabElement $best.Tab) {
-                $scrolledToBottom = Set-NotifyBridgeTerminalScrollToBottom -WindowHandle $best.Window.Handle
-                Write-NotifyBrokerLog -Message ('broker-tab-selected tabFingerprint={0} elapsedMs={1} cacheHit={2} cacheSource={3} scrolledToBottom={4}' -f (Get-NotifyBrokerContextFingerprint -Value $best.TabName), [int]([DateTime]::UtcNow - $startedAt).TotalMilliseconds, $cacheHit, $cacheSource, $scrolledToBottom)
-                Update-NotifyBrokerTabCache -Best $best -TargetFingerprint $TargetFingerprint -SourceTabTitleValue $SourceTabTitleValue
-            }
-            else {
-                Write-NotifyBrokerLog -Message ('broker-tab-select-failed tabFingerprint={0} elapsedMs={1}' -f (Get-NotifyBrokerContextFingerprint -Value $best.TabName), [int]([DateTime]::UtcNow - $startedAt).TotalMilliseconds)
-            }
-        }
-    }
-    catch {
-        Write-NotifyBrokerLog -Message ('broker-activate-error "{0}"' -f $_.Exception.Message)
-    }
+    return (Start-NotifyBrokerExactWorker -PopupId $PopupId -Mode 'activate' -OriginKind $OriginKind -NotificationId $NotificationId -SnapshotId $SnapshotId -RecoveryTicketId $RecoveryTicketId -TargetHost $TargetHost -CurrentDirBase $CurrentDirBase -SourceTabTitleValue $SourceTabTitleValue -TargetFingerprint $TargetFingerprint)
 }
 
 function Get-NotifyBrokerWorkingArea {
@@ -2077,6 +1871,8 @@ function Show-NotifyBrokerPopup {
     $failureCloseTimer = New-Object System.Windows.Forms.Timer
     $activationWatchdogTimer = New-Object System.Windows.Forms.Timer
     $popupCreatedAtUtc = [DateTime]::UtcNow
+    $popupLifetimeMs = [Math]::Max(3000, ($TimeoutSeconds * 1000))
+    $popupExpiresAtUtc = $popupCreatedAtUtc.AddMilliseconds($popupLifetimeMs)
 
     # Pass closure variables via form.Tag to event handlers to survive function scope exit
     $popupTag = @{
@@ -2106,6 +1902,7 @@ function Show-NotifyBrokerPopup {
         StackIndex        = $StackIndex
         PopupPlacement    = $PopupPlacementValue
         CreatedAtUtc      = $popupCreatedAtUtc
+        ExpiresAtUtc      = $popupExpiresAtUtc
         DidActivate       = [ref]$didActivate
         ShouldActivate    = [ref]$shouldActivate
         Activating        = [ref]$false
@@ -2163,7 +1960,7 @@ function Show-NotifyBrokerPopup {
     }
     $closeLabel.Add_Click($closeAction)
 
-    $timer.Interval = [Math]::Max(3000, ($TimeoutSeconds * 1000))
+    $timer.Interval = $popupLifetimeMs
     $timer.Add_Tick({
         $tag = $this.PopupTag
         Write-NotifyBrokerLog -Message ('broker-timeout-close popupId={0}' -f $tag.PopupId)

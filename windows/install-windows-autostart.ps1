@@ -119,6 +119,8 @@ $null = New-Item -ItemType Directory -Force -Path $baseDir, $binDir, $logDir, $s
 
 $filesToCopy = @(
     'NotifyBridge.Common.ps1',
+    'terminal-route.ps1',
+    'NotifyBridge.Activation.ps1',
     'paseo-desktop-route.ps1',
     'set-paseo-desktop-routing.ps1',
     'set-paseo-built-in-notifications.ps1',

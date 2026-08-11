@@ -8,7 +8,9 @@ param(
     [string]$Token,
     [string]$SshExecutable,
     [ValidateSet('cursor', 'primary', 'right')]
-    [string]$PopupPlacement
+    [string]$PopupPlacement,
+    [string]$PiWebInstanceKey,
+    [string]$PiWebRouteConfigPath
 )
 
 Set-StrictMode -Version Latest
@@ -36,6 +38,8 @@ $logDir = Get-NotifyBridgeLogDir
 New-Item -ItemType Directory -Force -Path $baseDir, $binDir, $logDir | Out-Null
 $runtimeFiles = @(
     'NotifyBridge.Common.ps1',
+    'terminal-route.ps1',
+    'NotifyBridge.Activation.ps1',
     'paseo-desktop-route.ps1',
     'set-paseo-desktop-routing.ps1',
     'set-paseo-built-in-notifications.ps1',
@@ -107,19 +111,17 @@ $remoteManagedExtensionPath = "$remoteManagedDir/remote-windows-notify.ts"
 $remoteManagedEnsurePath = "$remoteManagedDir/pi-notify-ensure.mjs"
 $remoteManagedConfigPath = "$remoteManagedDir/remote-windows-notify.json"
 
-$remoteConfig = @{
-    enabled         = $true
-    endpoint        = $config.RemoteUrl
-    token           = $config.Token
-    timeoutMs       = 4000
-    title           = 'Pi'
-    bodyTemplate    = 'host: {host} | cwd: {cwdBase}'
-    messageMode     = 'dynamic'
-    remoteHostAlias = $RemoteHostAlias
-    paseoLeaseGateEnabled = [bool]$config.PaseoLeaseGateEnabled
-}
+$resolvedPiWebInstanceKey = Resolve-NotifyBridgePiWebInstanceKey `
+    -InstanceKey $PiWebInstanceKey `
+    -RouteConfigPath $PiWebRouteConfigPath
+$remoteConfig = New-NotifyBridgeRemoteConfig `
+    -Endpoint $config.RemoteUrl `
+    -Token $config.Token `
+    -RemoteHostAlias $RemoteHostAlias `
+    -PiWebInstanceKey $resolvedPiWebInstanceKey
+$remoteConfig['paseoLeaseGateEnabled'] = [bool]$config.PaseoLeaseGateEnabled
 if (-not [string]::IsNullOrWhiteSpace([string]$config.PaseoLeasePath)) {
-    $remoteConfig.paseoLeasePath = [string]$config.PaseoLeasePath
+    $remoteConfig['paseoLeasePath'] = [string]$config.PaseoLeasePath
 }
 $remoteConfigJson = $remoteConfig | ConvertTo-Json -Depth 6
 
@@ -163,6 +165,7 @@ Write-Host "Local listener config : $($config.ConfigPath)"
 Write-Host "Local listener URL    : $($config.LocalUrl)"
 Write-Host "Remote tunnel URL     : $($config.RemoteUrl)"
 Write-Host "Remote Pi dir        : $remotePiDir"
+Write-Host ('Pi Web exact route   : {0}' -f $(if ([string]::IsNullOrWhiteSpace($resolvedPiWebInstanceKey)) { 'disabled' } else { 'enabled' }))
 Write-Host "Click URI            : $($toastSupport.ProtocolUri)"
 Write-Host "Toast link           : $($toastSupport.ShortcutPath)"
 Write-Host ""

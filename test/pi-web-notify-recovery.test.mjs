@@ -30,17 +30,21 @@ test("recovery tickets propagate to every Windows notification entry point", () 
   assert.match(popupClick, /Set-NotifyPopupActivating/);
   assert.match(popupClick, /Request-NotifyPopupExactWorkerStop -Reason 'superseded-by-activation'/);
   assert.match(activate, /protectedRecoveryTicketId/);
-  assert.match(activate, /Invoke-NotifyExactRouteRecoveryAndActivate/);
+  assert.match(activate, /Invoke-NotifyActivationStrategy/);
+  const activation = readFileSync(new URL("NotifyBridge.Activation.ps1", windowsRoot), "utf8");
+  assert.match(activation, /Invoke-NotifyExactRouteRecoveryAndActivate/);
 
-  const exactRouteBlock = activate.slice(
-    activate.indexOf("if ($originKind -eq 'pi-web')"),
-    activate.indexOf("$requiredText ="),
-  );
+  const exactRouteBlock = activate.slice(activate.indexOf("if ($originKind -eq 'pi-web')"));
   assert.doesNotMatch(exactRouteBlock, /activate-route-downgrade/);
   assert.match(
     exactRouteBlock,
     /activate-route-fail-closed[\s\S]*exit 1/,
     "a transient exact-route recovery result must not fall through to Terminal focus",
+  );
+  assert.doesNotMatch(
+    exactRouteBlock,
+    /Invoke-NotifyTerminalRouteActivate|Focus-NotifyWindow/,
+    "pi-web fail-closed must never fall through to Terminal",
   );
 });
 
@@ -48,6 +52,7 @@ test("popup feedback has bounded click recovery and an independent terminal clos
   const broker = readFileSync(new URL("pi-notify-broker.ps1", windowsRoot), "utf8");
   const popup = readFileSync(new URL("pi-notify-popup.ps1", windowsRoot), "utf8");
 
+  const activation = readFileSync(new URL("NotifyBridge.Activation.ps1", windowsRoot), "utf8");
   for (const [source, prefix] of [
     [broker, "NotifyBroker"],
     [popup, "NotifyPopup"],
@@ -56,25 +61,27 @@ test("popup feedback has bounded click recovery and an independent terminal clos
     assert.match(source, new RegExp(`\\$script:${prefix}ActivationRecoveryWaitMs = 10000`));
     assert.match(source, new RegExp(`\\$script:${prefix}RecoveringActivationWatchdogMs = 12000`));
     assert.match(source, new RegExp(`\\$script:${prefix}ReadyActivationWatchdogMs = 20000`));
-    assert.match(source, /Wait-NotifyExactRouteRecovery[^\r\n]*-WaitMs 125000/);
-    assert.match(
-      source,
-      /Invoke-NotifyExactRouteRecoveryAndActivate[^\r\n]*-RecoveryWaitMs \$ActivationRecoveryWaitMs/,
-      "a click without a snapshot must use the short recovery budget",
-    );
-    assert.match(
-      source,
-      /Invoke-NotifyExactRouteRecoveryAndActivate[^\r\n]*-ActivateWaitMs 45000 -ActivateTimeoutMs 48000/,
-      "exact activation must preserve a 45-second background proof budget",
-    );
-    assert.doesNotMatch(
-      source,
-      /Invoke-NotifyExactRouteRecoveryAndActivate[^\r\n]*-RecoveryWaitMs 125000/,
-      "the 125-second passive resolver budget must never leak into click handling",
-    );
+    assert.match(source, /Get-NotifyActivationWorkerScript|Invoke-NotifyActivationStrategy/);
+    assert.match(source, /ActivationRecoveryWaitMs/);
     assert.match(source, /FailureCloseTimer[^\r\n]*\.Start\(\)/);
     assert.match(source, /ActivationWatchdogTimer[^\r\n]*\.Start\(\)/);
   }
+  assert.match(activation, /Wait-NotifyExactRouteRecovery[^\r\n]*-WaitMs 125000/);
+  assert.match(
+    activation,
+    /Invoke-NotifyExactRouteRecoveryAndActivate[^\r\n]*-RecoveryWaitMs \$ActivationRecoveryWaitMs/,
+    "a click without a snapshot must use the short recovery budget",
+  );
+  assert.match(
+    activation,
+    /Invoke-NotifyExactRouteRecoveryAndActivate[^\r\n]*-ActivateWaitMs 45000 -ActivateTimeoutMs 48000/,
+    "exact activation must preserve a 45-second background proof budget",
+  );
+  assert.doesNotMatch(
+    activation,
+    /Invoke-NotifyExactRouteRecoveryAndActivate[^\r\n]*-RecoveryWaitMs 125000/,
+    "the 125-second passive resolver budget must never leak into click handling",
+  );
 
   const brokerActivating = broker.slice(
     broker.indexOf("function Set-NotifyBrokerPopupActivating"),
@@ -147,13 +154,16 @@ test("desktop focus progress closes Pi Web feedback without claiming final proof
     "the longer activation deadline must not expand transport-envelope freshness",
   );
 
+  const activation = readFileSync(new URL("NotifyBridge.Activation.ps1", windowsRoot), "utf8");
   for (const source of [broker, popup]) {
     assert.match(source, /ValidateSet\('focused', 'handled', 'failed', 'dismissed'\)/);
-    assert.match(source, /Decision -eq 'focused'/);
-    assert.match(source, /Outcome 'focused'/);
+    assert.match(source, /ConvertTo-NotifyActivationUiOutcome/);
+    assert.match(source, /close-focused|Outcome 'focused'/);
     assert.match(source, /background-proof-pending/);
   }
-  assert.match(activate, /Decision -eq 'focused'/);
+  assert.match(activation, /decisionName -eq 'focused'|\$decision -eq 'focused'/);
+  assert.match(activation, /ProofState 'pending'|close-focused/);
+  assert.match(activate, /close-focused|activate-route-focused/);
   assert.match(activate, /activate-route-focused background-proof=pending/);
 });
 

@@ -1,5 +1,5 @@
 # Pure route-decision tests for Windows notify exact-route integration.
-# Runnable with pwsh or Windows PowerShell; no UIAutomation / WinForms required.
+# Runnable with pwsh or Windows PowerShell; no live focus-changing action is performed.
 [CmdletBinding()]
 param(
     [switch]$SkipDotSource
@@ -9,8 +9,13 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$script:CanTestActivationModules = ($env:OS -eq 'Windows_NT')
 if (-not $SkipDotSource) {
     . (Join-Path $scriptDir 'NotifyBridge.Common.ps1')
+    if ($script:CanTestActivationModules) {
+        . (Join-Path $scriptDir 'terminal-route.ps1')
+        . (Join-Path $scriptDir 'NotifyBridge.Activation.ps1')
+    }
 }
 
 $script:TestFailures = 0
@@ -1010,7 +1015,125 @@ else {
         try { Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue } catch {}
     }
 }
+Write-Host "`n== Activation coordinator and Terminal pure contracts =="
+$activationCommands = @(
+    'Select-NotifyTerminalCandidates',
+    'Test-NotifyTerminalActivationProof',
+    'Normalize-NotifyActivationOriginKind',
+    'Test-NotifyActivationStrategyResult',
+    'Resolve-NotifyActivationWorkerOutput',
+    'Get-NotifyActivationRemainingMs'
+)
+$activationModulesReady = $true
+foreach ($commandName in $activationCommands) {
+    if (-not (Get-Command -Name $commandName -ErrorAction SilentlyContinue)) {
+        $activationModulesReady = $false
+    }
+}
 
+if (-not $activationModulesReady) {
+    Write-Host 'SKIP  activation-module-pure-contracts (requires Windows UIAutomation assemblies)'
+}
+else {
+    $canonicalTitle = ([char]0x03c0) + ' - work ' + ([char]0x00b7) + ' #aaaaaaaaaaaa'
+    $otherTitle = ([char]0x03c0) + ' - work ' + ([char]0x00b7) + ' #bbbbbbbbbbbb'
+    $uniqueWindows = @([pscustomobject]@{
+        Handle = [IntPtr]11
+        Title = 'Windows Terminal - work'
+        ProcessId = 101
+        ProcessName = 'WindowsTerminal'
+        Tabs = @(
+            [pscustomobject]@{ Name = ('decorated ' + $canonicalTitle); Index = 0; IsSelected = $true; Element = $null },
+            [pscustomobject]@{ Name = $otherTitle; Index = 1; IsSelected = $false; Element = $null }
+        )
+    })
+    $unique = Select-NotifyTerminalCandidates -TabTitle $canonicalTitle -CwdBase 'work' -Windows $uniqueWindows
+    Assert-Equal 'unique' $unique.Result 'terminal-direct-full-title-containment-unique'
+    Assert-Equal ('decorated ' + $canonicalTitle) $unique.Selected.TabName 'terminal-direct-full-title-preserved'
+
+    $duplicateWindows = @([pscustomobject]@{
+        Handle = [IntPtr]11
+        Title = 'Windows Terminal - work'
+        ProcessId = 101
+        ProcessName = 'WindowsTerminal'
+        Tabs = @(
+            [pscustomobject]@{ Name = $canonicalTitle; Index = 0; IsSelected = $true; Element = $null },
+            [pscustomobject]@{ Name = ('prefix ' + $canonicalTitle); Index = 1; IsSelected = $false; Element = $null }
+        )
+    })
+    $ambiguous = Select-NotifyTerminalCandidates -TabTitle $canonicalTitle -CwdBase 'work' -Windows $duplicateWindows -CachedCandidate ([pscustomobject]@{ WindowHandle = [IntPtr]11; TabName = $canonicalTitle })
+    Assert-Equal 'ambiguous' $ambiguous.Result 'terminal-direct-cache-cannot-hide-containing-duplicate'
+
+    $wrongHash = Select-NotifyTerminalCandidates -TabTitle $canonicalTitle -CwdBase 'work' -Windows @([pscustomobject]@{
+        Handle = [IntPtr]11; Title = 'Windows Terminal - work'; ProcessId = 101; ProcessName = 'WindowsTerminal'
+        Tabs = @([pscustomobject]@{ Name = $otherTitle; Index = 0; IsSelected = $true; Element = $null })
+    })
+    Assert-Equal 'target-missing' $wrongHash.Result 'terminal-direct-title-blocks-cwd-fallback'
+
+    $cwdLegacy = Select-NotifyTerminalCandidates -CwdBase 'legacy-work' -Windows @([pscustomobject]@{
+        Handle = [IntPtr]12; Title = 'Windows Terminal'; ProcessId = 102; ProcessName = 'WindowsTerminal'
+        Tabs = @([pscustomobject]@{ Name = 'legacy-work shell'; Index = 0; IsSelected = $true; Element = $null })
+    })
+    Assert-Equal 'unique' $cwdLegacy.Result 'terminal-direct-cwd-only-legacy'
+
+    $proofOk = Test-NotifyTerminalActivationProof -TabTitle $canonicalTitle -CwdBase 'work' -TargetHandle ([IntPtr]11) -ForegroundHandle ([IntPtr]11) -SelectedTabs @([pscustomobject]@{ Name = ('decorated ' + $canonicalTitle); WindowTitle = 'current work title' })
+    Assert-True $proofOk.Ok 'terminal-direct-foreground-selected-proof'
+    $proofWrongForeground = Test-NotifyTerminalActivationProof -TabTitle $canonicalTitle -TargetHandle ([IntPtr]11) -ForegroundHandle ([IntPtr]12) -SelectedTabs @([pscustomobject]@{ Name = $canonicalTitle; WindowTitle = '' })
+    Assert-Equal 'foreground-proof-failed' $proofWrongForeground.Result 'terminal-direct-foreground-mismatch'
+    $proofWrongTitle = Test-NotifyTerminalActivationProof -TabTitle $canonicalTitle -TargetHandle ([IntPtr]11) -ForegroundHandle ([IntPtr]11) -SelectedTabs @([pscustomobject]@{ Name = $otherTitle; WindowTitle = '' })
+    Assert-Equal 'selected-tab-proof-failed' $proofWrongTitle.Result 'terminal-direct-selected-title-mismatch'
+    $proofLegacyFreshTitle = Test-NotifyTerminalActivationProof -CwdBase 'legacy-work' -TargetHandle ([IntPtr]11) -ForegroundHandle ([IntPtr]11) -SelectedTabs @([pscustomobject]@{ Name = 'shell'; WindowTitle = 'legacy-work current title' })
+    Assert-True $proofLegacyFreshTitle.Ok 'terminal-direct-cwd-proof-uses-current-window-title'
+
+    $scrolledRouteResult = New-NotifyTerminalRouteResult -Result 'activated' -ScrollAttempted:$true -ScrolledToBottom:$true
+    Assert-True $scrolledRouteResult.ScrollAttempted 'terminal-direct-scroll-attempt-propagated'
+    Assert-True $scrolledRouteResult.ScrolledToBottom 'terminal-direct-scroll-result-propagated'
+    $unattemptedScrollResult = New-NotifyTerminalRouteResult -Result 'target-missing' -ScrolledToBottom:$true
+    Assert-True (-not $unattemptedScrollResult.ScrolledToBottom) 'terminal-direct-scroll-success-requires-attempt'
+
+    Assert-Equal 'terminal' (Normalize-NotifyActivationOriginKind -OriginKind '').OriginKind 'activation-direct-blank-origin-terminal'
+    Assert-True (-not (Normalize-NotifyActivationOriginKind -OriginKind 'pi-web-desktop').Ok) 'activation-direct-unknown-origin-fail-closed'
+
+    $missingRequest = Invoke-NotifyActivationStrategy -Request $null
+    Assert-Equal 'missing-request' $missingRequest.Reason 'activation-direct-missing-request-fail-closed'
+    $unknownRequest = New-NotifyActivationRequest -Operation 'activate' -OriginKind 'pi-web-desktop' -CwdBase 'work' -TabTitle $canonicalTitle
+    $unknownOutcome = Invoke-NotifyActivationStrategy -Request $unknownRequest
+    Assert-Equal 'unsupported-origin' $unknownOutcome.Result 'activation-direct-explicit-unknown-no-terminal-fallback'
+    Assert-True (Test-NotifyActivationStrategyResult -Result $unknownOutcome -ExpectedOperation 'activate') 'activation-direct-unknown-outcome-contract-valid'
+    $unknownUi = ConvertTo-NotifyActivationUiOutcome -Outcome $unknownOutcome
+    Assert-Equal 'show-unavailable' $unknownUi.Action 'activation-direct-unknown-ui-fail-closed'
+    Assert-Equal 'unsupported-origin' $unknownUi.Result 'activation-direct-unknown-ui-classification-preserved'
+    $unknownWorker = Resolve-NotifyActivationWorkerOutput -Rows @($unknownOutcome) -Operation 'activate' -OriginKind 'pi-web-desktop'
+    Assert-Equal 'unsupported-origin' $unknownWorker.Result 'activation-direct-unknown-worker-classification-preserved'
+    $terminalResolve = New-NotifyActivationRequest -Operation 'resolve' -OriginKind 'terminal' -CwdBase 'work'
+    Assert-Equal 'resolve-requires-pi-web' (Invoke-NotifyActivationStrategy -Request $terminalResolve).Reason 'activation-direct-resolve-terminal-invalid'
+    $paseoWithoutHandle = New-NotifyActivationRequest -Operation 'activate' -OriginKind 'paseo' -CwdBase 'work' -TabTitle $canonicalTitle
+    Assert-Equal 'activation-missing' (Invoke-NotifyActivationStrategy -Request $paseoWithoutHandle).Result 'activation-direct-paseo-metadata-no-terminal-repair'
+    $piWebWithoutNotification = New-NotifyActivationRequest -Operation 'activate' -OriginKind 'pi-web' -SnapshotId 'snapshot' -CwdBase 'work'
+    Assert-Equal 'missing-notification-id' (Invoke-NotifyActivationStrategy -Request $piWebWithoutNotification).Reason 'activation-direct-pi-web-no-terminal-repair'
+
+    $handledOutcome = New-NotifyActivationOutcome -Operation 'activate' -OriginKind 'terminal' -Decision 'handled' -Result 'activated' -ProofState 'final' -ScrollAttempted:$true -ScrolledToBottom:$true
+    Assert-True (Test-NotifyActivationStrategyResult -Result $handledOutcome -ExpectedOperation 'activate' -ExpectedOriginKind 'terminal') 'activation-direct-complete-handled-valid'
+    Assert-True $handledOutcome.ScrolledToBottom 'activation-direct-scroll-result-preserved'
+    $focusedWrongOrigin = New-NotifyActivationOutcome -Operation 'activate' -OriginKind 'terminal' -Decision 'focused' -Result 'pending' -ProofState 'pending' -SnapshotId 'snapshot'
+    Assert-True (-not (Test-NotifyActivationStrategyResult -Result $focusedWrongOrigin)) 'activation-direct-focused-terminal-invalid'
+    $readyWrongOperation = New-NotifyActivationOutcome -Operation 'activate' -OriginKind 'pi-web' -Decision 'ready' -Result 'ready' -SnapshotId 'snapshot'
+    Assert-True (-not (Test-NotifyActivationStrategyResult -Result $readyWrongOperation)) 'activation-direct-ready-activate-invalid'
+
+    $emptyWorker = Resolve-NotifyActivationWorkerOutput -Rows @() -Operation 'activate' -OriginKind 'terminal'
+    Assert-Equal 'worker-empty' $emptyWorker.Reason 'activation-direct-worker-empty-complete'
+    Assert-True (Test-NotifyActivationStrategyResult -Result $emptyWorker) 'activation-direct-worker-empty-shape-valid'
+    $multipleWorker = Resolve-NotifyActivationWorkerOutput -Rows @($handledOutcome, $handledOutcome) -Operation 'activate' -OriginKind 'terminal'
+    Assert-Equal 'worker-output-count' $multipleWorker.Reason 'activation-direct-worker-multiple-fail-closed'
+    $malformedWorker = Resolve-NotifyActivationWorkerOutput -Rows @([pscustomobject]@{ Decision = 'handled' }) -Operation 'activate' -OriginKind 'terminal'
+    Assert-Equal 'worker-malformed' $malformedWorker.Reason 'activation-direct-worker-malformed-fail-closed'
+
+    $deadline = [DateTime]::new(2030, 1, 1, 0, 0, 10, [DateTimeKind]::Utc)
+    $before = [DateTime]::new(2030, 1, 1, 0, 0, 7, [DateTimeKind]::Utc)
+    $after = [DateTime]::new(2030, 1, 1, 0, 0, 11, [DateTimeKind]::Utc)
+    Assert-Equal 3000 (Get-NotifyActivationRemainingMs -ExpiresAtUtc $deadline -NowUtc $before) 'activation-direct-immutable-expiry-before'
+    Assert-Equal 0 (Get-NotifyActivationRemainingMs -ExpiresAtUtc $deadline -NowUtc $after) 'activation-direct-immutable-expiry-after'
+}
 
 # Summary
 Write-Host ""

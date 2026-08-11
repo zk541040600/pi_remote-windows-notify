@@ -135,24 +135,24 @@ test("Every Paseo display and click entry uses the opaque handle without Termina
   assert.match(listener, /TtlSeconds \$activationTtlSeconds/);
   assert.match(broker, /originKind -eq 'paseo'[\s\S]{0,160}snapshotId/);
   assert.match(broker, /return Start-NotifyBrokerPaseoWorker/);
-  assert.match(broker, /Complete-NotifyBrokerPopupLifecycle[^\n]+-Retryable \$retryable/);
+  assert.match(broker, /Complete-NotifyBrokerPopupLifecycle[^\n]+-Retryable \$(true|false|retryable)/);
   assert.match(broker, /if \(\[string\]\$Tag\.OriginKind -ne 'paseo'\) \{ \$Tag\.Timer\.Stop\(\) \}/);
   assert.match(broker, /broker-popup-replace-same-target/);
   assert.match(listener, /Get-NotifyPopupStackPlan -TargetKey \$targetKey -TargetFingerprint \$targetFingerprint/);
   assert.match(popup, /OriginKind -eq 'paseo'[\s\S]{0,160}SnapshotId/);
   assert.match(popup, /Start-NotifyPopupPaseoWorker[\s\S]*NotifyPopupDidActivate = \$false/);
-  assert.match(popup, /Complete-NotifyPopupLifecycle[^\n]+-Retryable \$retryable/);
+  assert.match(popup, /Complete-NotifyPopupLifecycle[^\n]+-Retryable \$(true|false|retryable)/);
   assert.match(popup, /NotifyPopupTargetOriginKind -ne 'paseo'\) \{ \$script:NotifyPopupTimer\.Stop\(\) \}/);
-  assert.match(activate, /if \(\$originKind -eq 'paseo'\)[\s\S]*exit 1\n\}/);
+  assert.match(activate, /Invoke-NotifyActivationStrategy/);
+  assert.match(activate, /if \(\$originKind -eq 'paseo'\)[\s\S]*exit 1/);
   assert.match(activate, /PI_NOTIFY_NOTIFICATION_ID'\] = \$notificationId/);
   assert.match(activate, /PI_NOTIFY_SNAPSHOT_ID'\] = \$snapshotId/);
-  assert.match(activate, /paseoOutcome\.Result -ne 'busy'/);
+  assert.match(activate, /outcome\.Result -ne 'busy'|\$outcome\.Result -ne 'busy'/);
   assert.match(activate, /'-ConfigPath', \(\[string\]\$config\.ConfigPath\)/);
-  const piWebBranch = activate.indexOf("if ($originKind -eq 'pi-web')");
-  const paseoBranch = activate.lastIndexOf("if ($originKind -eq 'paseo')", piWebBranch);
+  const paseoRetry = activate.slice(activate.indexOf("if ($originKind -eq 'paseo')"));
   assert.doesNotMatch(
-    activate.slice(paseoBranch, piWebBranch),
-    /Focus-NotifyWindow|WindowsTerminal|Start-Process/,
+    paseoRetry,
+    /Invoke-NotifyTerminalRouteActivate|Focus-NotifyWindow|WindowsTerminal/,
   );
 });
 
@@ -203,8 +203,14 @@ test("Paseo runtime files are copied everywhere but never auto-enabled", () => {
   assert.match(builtIn, /Remove-ItemProperty -LiteralPath \$RegistryPath -Name 'Enabled'/);
 
   const remoteInstaller = readWindows("install-remote-windows-notify.ps1");
-  assert.match(remoteInstaller, /paseoLeaseGateEnabled = \[bool\]\$config\.PaseoLeaseGateEnabled/);
-  assert.match(remoteInstaller, /paseoLeasePath = \[string\]\$config\.PaseoLeasePath/);
+  assert.match(
+    remoteInstaller,
+    /\$remoteConfig(?:\.paseoLeaseGateEnabled|\[['"]paseoLeaseGateEnabled['"]\])\s*=\s*\[bool\]\$config\.PaseoLeaseGateEnabled/,
+  );
+  assert.match(
+    remoteInstaller,
+    /\$remoteConfig(?:\.paseoLeasePath|\[['"]paseoLeasePath['"]\])\s*=\s*\[string\]\$config\.PaseoLeasePath/,
+  );
 
   const check = readWindows("pi-notify-check.ps1");
   assert.match(check, /set-paseo-built-in-notifications\.ps1/);
@@ -212,8 +218,14 @@ test("Paseo runtime files are copied everywhere but never auto-enabled", () => {
   assert.match(check, /ConvertTo-NotifyBridgeBoolean -Value \$cfg\.paseoLeaseGateEnabled -Default \$false/);
   assert.match(check, /OK paseo lease gate enabled=/);
   assert.match(check, /\$remoteGateSuccess = \$remoteText -match/);
-  assert.match(check, /\$remoteSuccessByOutput = \([^\r\n]*\$remoteGateSuccess\)/);
-  assert.match(check, /\$remoteExitCodeText -eq '0' -and \$remoteGateSuccess/);
+  assert.match(
+    check,
+    /\$remoteSuccessByOutput = \([^\r\n]*\$remoteGateSuccess[^\r\n]*\$remoteRouteSuccess\)/,
+  );
+  assert.match(
+    check,
+    /\$remoteExitCodeText -eq '0' -and \$remoteGateSuccess -and \$remoteRouteSuccess/,
+  );
   assert.match(check, /must never auto-run Paseo built-in notification Disable\/Restore/);
   assert.doesNotMatch(check, /set-paseo-built-in-notifications\.ps1\s+-(Disable|Restore)/);
 });

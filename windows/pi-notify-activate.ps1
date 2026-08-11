@@ -9,45 +9,10 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 . "$PSScriptRoot/NotifyBridge.Common.ps1"
+. "$PSScriptRoot/terminal-route.ps1"
+. "$PSScriptRoot/NotifyBridge.Activation.ps1"
 
 Add-Type -AssemblyName System.Security
-
-Add-Type -AssemblyName UIAutomationClient
-Add-Type -AssemblyName UIAutomationTypes
-
-Add-Type @"
-using System;
-using System.Runtime.InteropServices;
-using System.Text;
-
-public static class PiNotifyUser32 {
-    public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
-
-    [DllImport("user32.dll")]
-    public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
-
-    [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
-    public static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
-
-    [DllImport("user32.dll", SetLastError = true)]
-    public static extern int GetWindowTextLength(IntPtr hWnd);
-
-    [DllImport("user32.dll")]
-    public static extern bool IsWindowVisible(IntPtr hWnd);
-
-    [DllImport("user32.dll")]
-    public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
-
-    [DllImport("user32.dll")]
-    public static extern bool SetForegroundWindow(IntPtr hWnd);
-
-    [DllImport("user32.dll")]
-    public static extern bool IsIconic(IntPtr hWnd);
-
-    [DllImport("user32.dll")]
-    public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
-}
-"@
 
 $configArgs = @{}
 if ($PSBoundParameters.ContainsKey('ConfigPath')) { $configArgs.ConfigPath = $ConfigPath }
@@ -63,19 +28,6 @@ function Write-NotifyActivateLog {
 
     $line = ('[{0}] {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'), $Message)
     Add-Content -LiteralPath $script:NotifyActivateLogPath -Value $line -Encoding UTF8
-}
-
-function Get-NotifyActivateFingerprint {
-    param([string]$Value)
-    if ([string]::IsNullOrWhiteSpace($Value)) { return '' }
-    $sha = [System.Security.Cryptography.SHA256]::Create()
-    try {
-        $hash = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes([string]$Value))
-        return ([System.BitConverter]::ToString($hash).Replace('-', '').ToLowerInvariant()).Substring(0, 16)
-    }
-    finally {
-        if ($null -ne $sha) { $sha.Dispose() }
-    }
 }
 
 function Get-NotifyQueryValue {
@@ -178,223 +130,6 @@ function Resolve-NotifyActivationState {
     }
 }
 
-function Get-CandidateWindows {
-    $windows = New-Object System.Collections.Generic.List[object]
-    $callback = [PiNotifyUser32+EnumWindowsProc]{
-        param([IntPtr]$Handle, [IntPtr]$LParam)
-
-        if (-not [PiNotifyUser32]::IsWindowVisible($Handle)) {
-            return $true
-        }
-
-        $length = [PiNotifyUser32]::GetWindowTextLength($Handle)
-        if ($length -le 0) {
-            return $true
-        }
-
-        $builder = New-Object System.Text.StringBuilder ($length + 1)
-        [void][PiNotifyUser32]::GetWindowText($Handle, $builder, $builder.Capacity)
-        $title = $builder.ToString().Trim()
-        if ([string]::IsNullOrWhiteSpace($title)) {
-            return $true
-        }
-
-        $processId = [uint32]0
-        [void][PiNotifyUser32]::GetWindowThreadProcessId($Handle, [ref]$processId)
-        try {
-            $process = Get-Process -Id $processId -ErrorAction Stop
-        }
-        catch {
-            return $true
-        }
-
-        if ($process.ProcessName -notmatch 'WindowsTerminal|Terminal') {
-            return $true
-        }
-
-        $windows.Add([pscustomobject]@{
-            Handle      = $Handle
-            Title       = $title
-            ProcessId   = $process.Id
-            ProcessName = $process.ProcessName
-        })
-        return $true
-    }
-
-    [void][PiNotifyUser32]::EnumWindows($callback, [IntPtr]::Zero)
-    return $windows
-}
-
-function Get-NotifyWindowTabs {
-    param(
-        [Parameter(Mandatory = $true)]
-        [IntPtr]$Handle
-    )
-
-    $rows = New-Object System.Collections.Generic.List[object]
-    try {
-        $root = [System.Windows.Automation.AutomationElement]::FromHandle($Handle)
-        if ($null -eq $root) {
-            return $rows
-        }
-
-        $condition = New-Object System.Windows.Automation.PropertyCondition(
-            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
-            [System.Windows.Automation.ControlType]::TabItem
-        )
-        $tabs = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $condition)
-        foreach ($tab in $tabs) {
-            $rows.Add([pscustomobject]@{
-                Name    = [string]$tab.Current.Name
-                Element = $tab
-            }) | Out-Null
-        }
-    }
-    catch {
-    }
-
-    return $rows
-}
-
-function Select-NotifyTab {
-    param(
-        [Parameter(Mandatory = $true)]
-        $TabElement
-    )
-
-    try {
-        $patternObj = $null
-        if ($TabElement.TryGetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern, [ref]$patternObj)) {
-            ([System.Windows.Automation.SelectionItemPattern]$patternObj).Select()
-            return $true
-        }
-    }
-    catch {
-    }
-
-    try {
-        $patternObj = $null
-        if ($TabElement.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$patternObj)) {
-            ([System.Windows.Automation.InvokePattern]$patternObj).Invoke()
-            return $true
-        }
-    }
-    catch {
-    }
-
-    return $false
-}
-
-function Focus-NotifyWindow {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string[]]$Keywords,
-        [string]$RequiredText
-    )
-
-    $normalized = @($Keywords | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { $_.Trim() } | Select-Object -Unique)
-    $required = if ([string]::IsNullOrWhiteSpace($RequiredText)) { '' } else { $RequiredText.Trim() }
-    $windows = Get-CandidateWindows
-
-    $best = $null
-    $eligibleCount = 0
-    foreach ($window in $windows) {
-        $baseScore = 0
-        foreach ($keyword in $normalized) {
-            if ($window.Title.IndexOf($keyword, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
-                $baseScore += 20
-            }
-        }
-
-        $tabs = @(Get-NotifyWindowTabs -Handle $window.Handle)
-        if ($tabs.Count -eq 0) {
-            if ([string]::IsNullOrWhiteSpace($required) -and $baseScore -gt 0) {
-                $candidate = [pscustomobject]@{
-                    Window   = $window
-                    Score    = $baseScore
-                    TabName  = ''
-                    TabFound = $false
-                    Tab      = $null
-                }
-                if ($null -eq $best -or $candidate.Score -gt $best.Score) {
-                    $best = $candidate
-                }
-            }
-            continue
-        }
-
-        foreach ($tab in $tabs) {
-            if (-not [string]::IsNullOrWhiteSpace($required) -and ([string]::IsNullOrWhiteSpace($tab.Name) -or $tab.Name.IndexOf($required, [System.StringComparison]::OrdinalIgnoreCase) -lt 0)) {
-                Write-NotifyActivateLog -Message ('focus-tab-skip-required tabFingerprint="{0}" requiredFingerprint="{1}"' -f (Get-NotifyActivateFingerprint $tab.Name), (Get-NotifyActivateFingerprint $required))
-                continue
-            }
-
-            $score = $baseScore
-            foreach ($keyword in $normalized) {
-                if (-not [string]::IsNullOrWhiteSpace($tab.Name) -and $tab.Name.IndexOf($keyword, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
-                    $score += 120
-                }
-            }
-            if ($score -le 0) {
-                continue
-            }
-
-            $eligibleCount += 1
-            $candidate = [pscustomobject]@{
-                Window   = $window
-                Score    = $score
-                TabName  = $tab.Name
-                TabFound = $true
-                Tab      = $tab.Element
-            }
-            if ($null -eq $best -or $candidate.Score -gt $best.Score) {
-                $best = $candidate
-            }
-        }
-    }
-
-    if ($eligibleCount -gt 1) {
-        Write-NotifyActivateLog -Message ('focus-ambiguous candidateCount={0} bestScore={1} requiredFingerprint="{2}"' -f $eligibleCount, $best.Score, (Get-NotifyActivateFingerprint $required))
-        return $false
-    }
-
-    if ($null -eq $best) {
-        Write-NotifyActivateLog -Message 'focus-no-candidate'
-        return $false
-    }
-
-    Write-NotifyActivateLog -Message ('focus-best windowFingerprint="{0}" tabFingerprint="{1}" score={2}' -f (Get-NotifyActivateFingerprint $best.Window.Title), (Get-NotifyActivateFingerprint $best.TabName), $best.Score)
-
-    if ([PiNotifyUser32]::IsIconic($best.Window.Handle)) {
-        [void][PiNotifyUser32]::ShowWindowAsync($best.Window.Handle, 9)
-        Write-NotifyActivateLog -Message 'focus-restore-iconic'
-        Start-Sleep -Milliseconds 180
-    }
-
-    try {
-        $shell = New-Object -ComObject WScript.Shell
-        [void]$shell.AppActivate($best.Window.ProcessId)
-    }
-    catch {
-    }
-    Start-Sleep -Milliseconds 150
-    [void][PiNotifyUser32]::SetForegroundWindow($best.Window.Handle)
-    Start-Sleep -Milliseconds 120
-
-    if ($best.TabFound -and $null -ne $best.Tab) {
-        if (Select-NotifyTab -TabElement $best.Tab) {
-            $scrolledToBottom = Set-NotifyBridgeTerminalScrollToBottom -WindowHandle $best.Window.Handle
-            Write-NotifyActivateLog -Message ('focus-tab-selected tabFingerprint="{0}" scrolledToBottom={1}' -f (Get-NotifyActivateFingerprint $best.TabName), $scrolledToBottom)
-            Start-Sleep -Milliseconds 150
-            [void][PiNotifyUser32]::SetForegroundWindow($best.Window.Handle)
-            return $true
-        }
-        Write-NotifyActivateLog -Message ('focus-tab-select-failed tabFingerprint="{0}"' -f (Get-NotifyActivateFingerprint $best.TabName))
-    }
-
-    return $true
-}
-
 Write-NotifyActivateLog -Message ('activate-start hasUri={0}' -f (-not [string]::IsNullOrWhiteSpace($Uri)))
 
 $targetHost = $config.RemoteHostAlias
@@ -445,20 +180,32 @@ if ($originKind -ne 'paseo') {
     if (-not [string]::IsNullOrWhiteSpace($env:PI_NOTIFY_RECOVERY_TICKET_ID)) { $recoveryTicketId = $env:PI_NOTIFY_RECOVERY_TICKET_ID.Trim() }
 }
 
-if ($originKind -eq 'paseo') {
-    Write-NotifyActivateLog -Message ('activate-route originKind=paseo notificationFp={0} activationFp={1}' -f (Get-NotifyRouteFingerprint -Value $notificationId), (Get-NotifyRouteFingerprint -Value $snapshotId))
-    if ($activationStateResult -in @('expired', 'invalid')) {
-        Write-NotifyActivateLog -Message ('activate-route fail-closed result={0} reason=toast-activation-state' -f $activationStateResult)
-        exit 1
-    }
-    if ([string]::IsNullOrWhiteSpace($snapshotId)) {
-        Write-NotifyActivateLog -Message ('activate-route fail-closed result=activation-missing reason=missing-activation-handle notificationFp={0}' -f (Get-NotifyRouteFingerprint -Value $notificationId))
-        exit 1
-    }
-    $paseoOutcome = Invoke-NotifyPaseoRouteActivate -ActivationId $snapshotId -Config $config -TimeoutMs 20000
-    Write-NotifyActivateLog -Message ('activate-route decision={0} result={1} reason={2} notificationFp={3} activationFp={4}' -f $paseoOutcome.Decision, $paseoOutcome.Result, $(if ([string]::IsNullOrWhiteSpace([string]$paseoOutcome.Reason)) { 'none' } else { [string]$paseoOutcome.Reason }), (Get-NotifyRouteFingerprint -Value $notificationId), (Get-NotifyRouteFingerprint -Value $snapshotId))
-    if ($paseoOutcome.Decision -eq 'handled') {
-        # Consume toast pointer cache after successful activation.
+if ($originKind -eq 'paseo' -and $activationStateResult -in @('expired', 'invalid')) {
+    Write-NotifyActivateLog -Message ('activate-route fail-closed result={0} reason=toast-activation-state' -f $activationStateResult)
+    exit 1
+}
+
+Write-NotifyActivateLog -Message ('activate-route originKind={0} notificationFp={1} snapshotFp={2}' -f $(if ([string]::IsNullOrWhiteSpace($originKind)) { 'terminal' } else { $originKind }), (Get-NotifyRouteFingerprint -Value $notificationId), (Get-NotifyRouteFingerprint -Value $snapshotId))
+
+$request = New-NotifyActivationRequest `
+    -Version 1 `
+    -Operation 'activate' `
+    -OriginKind $originKind `
+    -NotificationId $notificationId `
+    -SnapshotId $snapshotId `
+    -RecoveryTicketId $recoveryTicketId `
+    -TargetHost $targetHost `
+    -CwdBase $cwdBase `
+    -TabTitle $tabTitle `
+    -TargetFingerprint '' `
+    -TimeoutMs $(if ($originKind -eq 'paseo') { 20000 } elseif ($originKind -eq 'pi-web') { 48000 } else { 3000 })
+
+$outcome = Invoke-NotifyActivationStrategy -Request $request -Config $config -ActivationRecoveryWaitMs 125000
+$ui = ConvertTo-NotifyActivationUiOutcome -Outcome $outcome
+Write-NotifyActivateLog -Message ('activate-route decision={0} result={1} reason={2} proof={3} retryable={4} notificationFp={5} snapshotFp={6} scrollAttempted={7} scrolledToBottom={8}' -f $outcome.Decision, $outcome.Result, $(if ([string]::IsNullOrWhiteSpace([string]$outcome.Reason)) { 'none' } else { [string]$outcome.Reason }), $outcome.ProofState, $outcome.Retryable, (Get-NotifyRouteFingerprint -Value $notificationId), (Get-NotifyRouteFingerprint -Value ([string]$outcome.SnapshotId)), $outcome.ScrollAttempted, $outcome.ScrolledToBottom)
+
+if ($ui.Action -eq 'close-handled' -or $ui.Action -eq 'close-focused') {
+    if ($originKind -eq 'paseo' -and -not [string]::IsNullOrWhiteSpace($activationIdValue)) {
         try {
             $toastPaths = @(
                 (Join-Path (Get-NotifyBridgeLogDir) ('activation-{0}.json' -f $activationIdValue)),
@@ -466,18 +213,21 @@ if ($originKind -eq 'paseo') {
             ) | Select-Object -Unique
             foreach ($candidate in $toastPaths) { Remove-Item -LiteralPath $candidate -Force -ErrorAction SilentlyContinue }
         } catch {}
+    }
+    if ($ui.Action -eq 'close-focused') {
+        Write-NotifyActivateLog -Message 'activate-route-focused background-proof=pending'
+    }
+    else {
         Write-NotifyActivateLog -Message 'activate-route-success'
-        exit 0
     }
+    exit 0
+}
 
-    # Temporary failure: restore custom retry popup with same opaque activation id; never terminal fallback.
-    # Permanent failures (expired/invalid/ambiguous/foreign-owner/non-loopback) stay fail-closed without retry UI.
-    $retryable = $true
-    if ($paseoOutcome.PSObject.Properties['Retryable']) {
-        try { $retryable = [bool]$paseoOutcome.Retryable } catch { $retryable = $true }
-    }
-    $permanent = ([string]$paseoOutcome.Result -in @('expired', 'invalid', 'activation-missing', 'foreign-owner', 'non-loopback', 'ambiguous'))
-    if ($retryable -and -not $permanent -and [string]$paseoOutcome.Result -ne 'busy') {
+# Temporary Paseo failure: restore custom retry popup with same opaque activation id; never terminal fallback.
+if ($originKind -eq 'paseo') {
+    $retryable = [bool]$outcome.Retryable
+    $permanent = ([string]$outcome.Result -in @('expired', 'invalid', 'activation-missing', 'foreign-owner', 'non-loopback', 'ambiguous'))
+    if ($retryable -and -not $permanent -and [string]$outcome.Result -ne 'busy') {
         try {
             $retryState = Resolve-NotifyPaseoActivationState -ActivationId $snapshotId
             if (-not $retryState.Available) { exit 1 }
@@ -510,57 +260,22 @@ if ($originKind -eq 'paseo') {
                 $psi.EnvironmentVariables['PI_NOTIFY_NOTIFICATION_ID'] = $notificationId
                 $psi.EnvironmentVariables['PI_NOTIFY_SNAPSHOT_ID'] = $snapshotId
                 [void][System.Diagnostics.Process]::Start($psi)
-                Write-NotifyActivateLog -Message ('activate-route-retry-popup result={0}' -f $paseoOutcome.Result)
+                Write-NotifyActivateLog -Message ('activate-route-retry-popup result={0}' -f $outcome.Result)
             }
         }
         catch {
             Write-NotifyActivateLog -Message 'activate-route-retry-popup-error'
         }
     }
+    Write-NotifyActivateLog -Message ('activate-route-fail-closed result={0}' -f $outcome.Result)
     exit 1
 }
 
 if ($originKind -eq 'pi-web') {
-    Write-NotifyActivateLog -Message ('activate-route originKind=pi-web notificationFp={0} snapshotFp={1}' -f (Get-NotifyRouteFingerprint -Value $notificationId), (Get-NotifyRouteFingerprint -Value $snapshotId))
-    if ([string]::IsNullOrWhiteSpace($notificationId) -or
-        ([string]::IsNullOrWhiteSpace($snapshotId) -and [string]::IsNullOrWhiteSpace($recoveryTicketId))) {
-        Write-NotifyActivateLog -Message ('activate-route fail-closed result=owner-unresolved reason=missing-route-handle notificationFp={0}' -f (Get-NotifyRouteFingerprint -Value $notificationId))
-        exit 1
-    }
-    $activateOutcome = Invoke-NotifyExactRouteRecoveryAndActivate -NotificationId $notificationId -SnapshotId $snapshotId -RecoveryTicketId $recoveryTicketId -Config $config -RecoveryWaitMs 125000 -ActivateWaitMs 45000 -ActivateTimeoutMs 48000
-    $decision = $activateOutcome.Decision
-    $resolvedSnapshotId = if ($activateOutcome.PSObject.Properties['SnapshotId']) { [string]$activateOutcome.SnapshotId } else { $snapshotId }
-    Write-NotifyActivateLog -Message ('activate-route decision={0} result={1} reason={2} notificationFp={3} snapshotFp={4} ticketFp={5}' -f $decision.Decision, $decision.Result, $(if ([string]::IsNullOrWhiteSpace($decision.Reason)) { 'none' } else { $decision.Reason }), (Get-NotifyRouteFingerprint -Value $notificationId), (Get-NotifyRouteFingerprint -Value $resolvedSnapshotId), (Get-NotifyRouteFingerprint -Value $recoveryTicketId))
-    if ($decision.Decision -eq 'handled') {
-        Write-NotifyActivateLog -Message 'activate-route-success'
-        exit 0
-    }
-    if ($decision.Decision -eq 'focused') {
-        Write-NotifyActivateLog -Message 'activate-route-focused background-proof=pending'
-        exit 0
-    }
-    if ($decision.Decision -eq 'fail-closed') {
-        Write-NotifyActivateLog -Message ('activate-route-fail-closed result={0}' -f $decision.Result)
-        exit 1
-    }
-    # Exact Pi Web metadata is an authority boundary. A transient recovery
-    # result (including client timeout/retry) must never fall through to the
-    # Terminal title/cwd heuristic and focus a different surface.
-    Write-NotifyActivateLog -Message ('activate-route-fail-closed result={0} reason={1}' -f $decision.Result, $(if ([string]::IsNullOrWhiteSpace($decision.Reason)) { 'none' } else { $decision.Reason }))
+    # Exact Pi Web metadata is an authority boundary. Fail closed never falls through to Terminal.
+    Write-NotifyActivateLog -Message ('activate-route-fail-closed result={0} reason={1}' -f $outcome.Result, $(if ([string]::IsNullOrWhiteSpace([string]$outcome.Reason)) { 'none' } else { [string]$outcome.Reason }))
     exit 1
 }
 
-$requiredText = if (-not [string]::IsNullOrWhiteSpace($tabTitle)) { $tabTitle } else { $cwdBase }
-$keywords = @($tabTitle, $cwdBase, $targetHost) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
-Write-NotifyActivateLog -Message ('activate-target targetFingerprint="{0}" hasCwd={1} hasTab={2} requiredFingerprint="{3}" keywordCount={4}' -f (Get-NotifyActivateFingerprint $targetHost), (-not [string]::IsNullOrWhiteSpace($cwdBase)), (-not [string]::IsNullOrWhiteSpace($tabTitle)), (Get-NotifyActivateFingerprint $requiredText), @($keywords).Count)
-if ([string]::IsNullOrWhiteSpace($requiredText)) {
-    Write-NotifyActivateLog -Message ('activate-focus-miss missing-target-metadata no-target-open-skipped targetFingerprint="{0}"' -f (Get-NotifyActivateFingerprint $targetHost))
-    exit 1
-}
-if (Focus-NotifyWindow -Keywords $keywords -RequiredText $requiredText) {
-    Write-NotifyActivateLog -Message 'activate-focus-success'
-    exit 0
-}
-
-Write-NotifyActivateLog -Message ('activate-focus-miss no-target-open-skipped targetFingerprint="{0}" hasCwd={1} hasTab={2}' -f (Get-NotifyActivateFingerprint $targetHost), (-not [string]::IsNullOrWhiteSpace($cwdBase)), (-not [string]::IsNullOrWhiteSpace($tabTitle)))
+Write-NotifyActivateLog -Message ('activate-focus-miss result={0} reason={1}' -f $outcome.Result, $(if ([string]::IsNullOrWhiteSpace([string]$outcome.Reason)) { 'none' } else { [string]$outcome.Reason }))
 exit 1

@@ -17,6 +17,8 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 . "$PSScriptRoot/NotifyBridge.Common.ps1"
+. "$PSScriptRoot/terminal-route.ps1"
+. "$PSScriptRoot/NotifyBridge.Activation.ps1"
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
@@ -207,10 +209,30 @@ function Complete-NotifyPopupLifecycle {
     )
 
     if ($null -eq $script:NotifyPopupForm -or $script:NotifyPopupForm.IsDisposed) { return $false }
-    $paseoRetryAllowed = $Reason -notin @('expired', 'invalid', 'activation-missing', 'foreign-owner', 'non-loopback', 'ambiguous')
-    if ($null -ne $Retryable) { $paseoRetryAllowed = [bool]$Retryable }
-    $isPaseoRetryable = ($Outcome -eq 'failed') -and ([string]$script:NotifyPopupTargetOriginKind -eq 'paseo') -and $paseoRetryAllowed
-    $keepPaseoExpiryTimer = ($Outcome -eq 'failed') -and ([string]$script:NotifyPopupTargetOriginKind -eq 'paseo') -and ($isPaseoRetryable -or $Reason -in @('expired', 'invalid', 'activation-missing'))
+    $remainingMs = Get-NotifyActivationRemainingMs -ExpiresAtUtc $script:NotifyPopupExpiresAtUtc
+    if ($Outcome -ne 'dismissed' -and $remainingMs -le 0) {
+        $script:NotifyPopupTerminalState = $true
+        $script:NotifyPopupTerminalOutcome = 'dismissed'
+        $script:NotifyPopupTerminalReason = 'expired'
+        $script:NotifyPopupActivating = $false
+        $script:NotifyPopupTimer.Stop()
+        $script:NotifyPopupFocusWatchTimer.Stop()
+        $script:NotifyPopupFailureCloseTimer.Stop()
+        $script:NotifyPopupActivationWatchdogTimer.Stop()
+        Write-NotifyPopupLog -Message ('popup-expired ignoredOutcome={0} reason={1}' -f $Outcome, $Reason)
+        if (-not $script:NotifyPopupCloseRequested) {
+            $script:NotifyPopupCloseRequested = $true
+            $script:NotifyPopupForm.Close()
+        }
+        return $true
+    }
+
+    $originKind = if ($null -eq $script:NotifyPopupTargetOriginKind) { '' } else { ([string]$script:NotifyPopupTargetOriginKind).Trim() }
+    $retryAllowed = $Reason -notin @('expired', 'invalid', 'activation-missing', 'foreign-owner', 'non-loopback', 'ambiguous')
+    if ($null -ne $Retryable) { $retryAllowed = [bool]$Retryable }
+    $supportsRetry = ($originKind -eq 'paseo') -or ($originKind -eq 'terminal') -or [string]::IsNullOrWhiteSpace($originKind)
+    $isRetryableFailure = ($Outcome -eq 'failed') -and $supportsRetry -and $retryAllowed
+    $keepPaseoExpiryTimer = ($Outcome -eq 'failed') -and ($originKind -eq 'paseo') -and ($isRetryableFailure -or $Reason -in @('expired', 'invalid', 'activation-missing'))
     $alreadyTerminal = $script:NotifyPopupTerminalState
     if (-not $alreadyTerminal) {
         $script:NotifyPopupTerminalState = $true
@@ -225,7 +247,7 @@ function Complete-NotifyPopupLifecycle {
 
     if ($Outcome -eq 'failed') {
         if ($alreadyTerminal) { return $false }
-        if ($isPaseoRetryable) {
+        if ($isRetryableFailure) {
             $script:NotifyPopupTerminalState = $false
             $script:NotifyPopupTerminalOutcome = ''
             $script:NotifyPopupTerminalReason = ''
@@ -236,8 +258,22 @@ function Complete-NotifyPopupLifecycle {
             $script:NotifyPopupTitleLabel.Text = $retryText
             $script:NotifyPopupBodyLabel.Text = $script:NotifyPopupOriginalBody
             $script:NotifyPopupFailureCloseTimer.Stop()
-            # Keep the original expiry timer running so retries cannot extend activation lifetime.
-            Write-NotifyPopupLog -Message ('popup-paseo-retry-ready reason={0}' -f $Reason)
+            $remainingMs = Get-NotifyActivationRemainingMs -ExpiresAtUtc $script:NotifyPopupExpiresAtUtc
+            if ($remainingMs -le 0) {
+                $script:NotifyPopupTerminalState = $true
+                $script:NotifyPopupTerminalOutcome = 'dismissed'
+                $script:NotifyPopupTerminalReason = 'expired'
+                if (-not $script:NotifyPopupCloseRequested) {
+                    $script:NotifyPopupCloseRequested = $true
+                    $script:NotifyPopupForm.Close()
+                }
+                return $true
+            }
+            $script:NotifyPopupTimer.Stop()
+            $script:NotifyPopupTimer.Interval = $remainingMs
+            $script:NotifyPopupTimer.Start()
+            $script:NotifyPopupFocusWatchTimer.Start()
+            Write-NotifyPopupLog -Message ('popup-retry-ready originKind={0} reason={1} remainingMs={2}' -f $(if ([string]::IsNullOrWhiteSpace($originKind)) { 'terminal' } else { $originKind }), $Reason, $remainingMs)
             return $true
         }
         if (([string]$script:NotifyPopupTargetOriginKind -eq 'paseo') -and ($Reason -in @('expired', 'invalid', 'activation-missing'))) {
@@ -249,6 +285,7 @@ function Complete-NotifyPopupLifecycle {
         }
         Set-NotifyPopupRecoveryUiState -State 'unavailable'
         $script:NotifyPopupFailureCloseTimer.Stop()
+        $script:NotifyPopupFailureCloseTimer.Interval = [Math]::Max(1, [Math]::Min([int]$script:NotifyPopupFailureCloseDelayMs, $remainingMs))
         $script:NotifyPopupFailureCloseTimer.Start()
         return $true
     }
@@ -310,6 +347,18 @@ function Set-NotifyPopupActivating {
     }
 }
 
+function Close-NotifyPopupExactWorkerResources {
+    param([Parameter(Mandatory = $true)]$Worker)
+
+    if ($Worker.PSObject.Properties['ResourcesClosed'] -and [bool]$Worker.ResourcesClosed) { return }
+    if ($Worker.PSObject.Properties['ResourcesClosed']) {
+        $Worker.ResourcesClosed = $true
+    }
+    try { $Worker.PowerShell.Dispose() } catch {}
+    try { $Worker.Runspace.Close() } catch {}
+    try { $Worker.Runspace.Dispose() } catch {}
+}
+
 function Request-NotifyPopupExactWorkerStop {
     param([Parameter(Mandatory = $true)][string]$Reason)
 
@@ -326,15 +375,18 @@ function Request-NotifyPopupExactWorkerStop {
     }
     catch {
         $worker.CancelReason = ''
-        Write-NotifyPopupLog -Message ('popup-exact-worker-cancel-error mode={0} reason={1}' -f $worker.Mode, $Reason)
+        $failure = New-NotifyActivationWorkerFailureOutcome -Operation $worker.Operation -OriginKind $worker.OriginKind -Reason 'worker-cancel-error'
+        Write-NotifyPopupLog -Message ('popup-exact-worker-cancel-error mode={0} reason={1} result={2}' -f $worker.Mode, $Reason, $failure.Result)
+        [void](Complete-NotifyPopupLifecycle -Outcome 'failed' -Reason $failure.Reason -Retryable $failure.Retryable)
         return $false
     }
 }
 
 function Invoke-NotifyPopupActivationWatchdog {
     if ($script:NotifyPopupTerminalState) { return $false }
-    Write-NotifyPopupLog -Message 'popup-activation-watchdog'
-    [void](Complete-NotifyPopupLifecycle -Outcome 'failed' -Reason 'activation-watchdog')
+    $failure = New-NotifyActivationWorkerFailureOutcome -Operation 'activate' -OriginKind $script:NotifyPopupTargetOriginKind -Reason 'activation-watchdog'
+    Write-NotifyPopupLog -Message ('popup-activation-watchdog result={0}' -f $failure.Result)
+    [void](Complete-NotifyPopupLifecycle -Outcome 'failed' -Reason $failure.Reason -Retryable $failure.Retryable)
     [void](Request-NotifyPopupExactWorkerStop -Reason 'activation-watchdog')
     return $true
 }
@@ -348,84 +400,29 @@ function Start-NotifyPopupPaseoWorker {
         return $false
     }
 
-    $runspace = $null
-    $powerShell = $null
-    $workerScript = @'
-param($CommonPath, $ConfigPath, $ActivationId)
-$ErrorActionPreference = 'Stop'
-. $CommonPath
-$configArgs = @{}
-if (-not [string]::IsNullOrWhiteSpace($ConfigPath)) { $configArgs.ConfigPath = $ConfigPath }
-$workerConfig = Ensure-NotifyBridgeConfig @configArgs
-$outcome = Invoke-NotifyPaseoRouteActivate -ActivationId $ActivationId -Config $workerConfig -TimeoutMs 20000
-[pscustomobject]@{
-    Decision = [string]$outcome.Decision
-    Result = [string]$outcome.Result
-    Reason = [string]$outcome.Reason
-    Retryable = [bool]$outcome.Retryable
-}
-'@
-    try {
-        $runspace = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
-        $runspace.Open()
-        $powerShell = [System.Management.Automation.PowerShell]::Create()
-        $powerShell.Runspace = $runspace
-        [void]$powerShell.AddScript($workerScript)
-        [void]$powerShell.AddParameter('CommonPath', (Join-Path $PSScriptRoot 'NotifyBridge.Common.ps1'))
-        [void]$powerShell.AddParameter('ConfigPath', $ConfigPath)
-        [void]$powerShell.AddParameter('ActivationId', $ActivationId)
-        $async = $powerShell.BeginInvoke()
-        $script:NotifyPopupExactWorker = [pscustomobject]@{
-            Mode = 'paseo-activate'
-            PowerShell = $powerShell
-            Runspace = $runspace
-            Async = $async
-            StartedAtUtc = [DateTime]::UtcNow
-            StopAsync = $null
-            CancelReason = ''
-        }
-        $script:NotifyPopupExactWorkerTimer.Start()
-        return $true
-    }
-    catch {
-        if ($null -ne $powerShell) { try { $powerShell.Dispose() } catch {} }
-        if ($null -ne $runspace) {
-            try { $runspace.Close() } catch {}
-            try { $runspace.Dispose() } catch {}
-        }
-        [void](Complete-NotifyPopupLifecycle -Outcome 'failed' -Reason 'worker-start-error')
-        return $false
-    }
+    return (Start-NotifyPopupExactWorker -Mode 'activate' -OriginKind 'paseo' -SnapshotId $ActivationId)
 }
 
 function Start-NotifyPopupExactWorker {
-    param([Parameter(Mandatory = $true)][ValidateSet('resolve', 'activate')][string]$Mode)
+    param(
+        [Parameter(Mandatory = $true)][ValidateSet('resolve', 'activate')][string]$Mode,
+        [string]$OriginKind = '',
+        [string]$SnapshotId = ''
+    )
 
     if ($script:NotifyPopupTerminalState -or $null -ne $script:NotifyPopupExactWorker) { return $false }
     $runspace = $null
     $powerShell = $null
-    $workerScript = @'
-param($CommonPath, $ConfigPath, $Mode, $NotificationId, $SnapshotId, $RecoveryTicketId, $ActivationRecoveryWaitMs)
-$ErrorActionPreference = 'Stop'
-. $CommonPath
-$configArgs = @{}
-if (-not [string]::IsNullOrWhiteSpace($ConfigPath)) { $configArgs.ConfigPath = $ConfigPath }
-$workerConfig = Ensure-NotifyBridgeConfig @configArgs
-if ($Mode -eq 'resolve') {
-    $outcome = Wait-NotifyExactRouteRecovery -NotificationId $NotificationId -RecoveryTicketId $RecoveryTicketId -Config $workerConfig -WaitMs 125000
-    $decision = $outcome.Decision
-}
-else {
-    $outcome = Invoke-NotifyExactRouteRecoveryAndActivate -NotificationId $NotificationId -SnapshotId $SnapshotId -RecoveryTicketId $RecoveryTicketId -Config $workerConfig -RecoveryWaitMs $ActivationRecoveryWaitMs -ActivateWaitMs 45000 -ActivateTimeoutMs 48000
-    $decision = $outcome.Decision
-}
-[pscustomobject]@{
-    Decision = [string]$decision.Decision
-    Result = [string]$decision.Result
-    Reason = [string]$decision.Reason
-    SnapshotId = if ($outcome.PSObject.Properties['SnapshotId']) { [string]$outcome.SnapshotId } elseif ($decision.PSObject.Properties['SnapshotId']) { [string]$decision.SnapshotId } else { '' }
-}
-'@
+    $workerScript = Get-NotifyActivationWorkerScript
+    $operation = if ($Mode -eq 'resolve') { 'resolve' } else { 'activate' }
+    $resolvedOrigin = if (-not [string]::IsNullOrWhiteSpace($OriginKind)) {
+        $OriginKind.Trim()
+    } elseif ($Mode -eq 'resolve') {
+        'pi-web'
+    } else {
+        [string]$script:NotifyPopupTargetOriginKind
+    }
+    $resolvedSnapshot = if (-not [string]::IsNullOrWhiteSpace($SnapshotId)) { $SnapshotId } else { [string]$script:NotifyPopupTargetSnapshotId }
     try {
         $runspace = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
         $runspace.Open()
@@ -433,21 +430,32 @@ else {
         $powerShell.Runspace = $runspace
         [void]$powerShell.AddScript($workerScript)
         [void]$powerShell.AddParameter('CommonPath', (Join-Path $PSScriptRoot 'NotifyBridge.Common.ps1'))
+        [void]$powerShell.AddParameter('TerminalRoutePath', (Join-Path $PSScriptRoot 'terminal-route.ps1'))
+        [void]$powerShell.AddParameter('ActivationPath', (Join-Path $PSScriptRoot 'NotifyBridge.Activation.ps1'))
         [void]$powerShell.AddParameter('ConfigPath', $ConfigPath)
-        [void]$powerShell.AddParameter('Mode', $Mode)
+        [void]$powerShell.AddParameter('Operation', $operation)
+        [void]$powerShell.AddParameter('OriginKind', $resolvedOrigin)
         [void]$powerShell.AddParameter('NotificationId', $script:NotifyPopupTargetNotificationId)
-        [void]$powerShell.AddParameter('SnapshotId', $script:NotifyPopupTargetSnapshotId)
+        [void]$powerShell.AddParameter('SnapshotId', $resolvedSnapshot)
         [void]$powerShell.AddParameter('RecoveryTicketId', $script:NotifyPopupTargetRecoveryTicketId)
+        [void]$powerShell.AddParameter('TargetHost', $script:NotifyPopupTargetHost)
+        [void]$powerShell.AddParameter('CwdBase', $script:NotifyPopupTargetCwdBase)
+        [void]$powerShell.AddParameter('TabTitle', $script:NotifyPopupTargetSourceTabTitle)
+        [void]$powerShell.AddParameter('TargetFingerprint', $script:NotifyPopupTargetFingerprint)
+        [void]$powerShell.AddParameter('TimeoutMs', 3000)
         [void]$powerShell.AddParameter('ActivationRecoveryWaitMs', $script:NotifyPopupActivationRecoveryWaitMs)
         $async = $powerShell.BeginInvoke()
         $script:NotifyPopupExactWorker = [pscustomobject]@{
             Mode = $Mode
+            Operation = $operation
+            OriginKind = $resolvedOrigin
             PowerShell = $powerShell
             Runspace = $runspace
             Async = $async
             StartedAtUtc = [DateTime]::UtcNow
             StopAsync = $null
             CancelReason = ''
+            ResourcesClosed = $false
         }
     }
     catch {
@@ -456,11 +464,12 @@ else {
             try { $runspace.Close() } catch {}
             try { $runspace.Dispose() } catch {}
         }
-        Write-NotifyPopupLog -Message ('popup-exact-worker-start-error mode={0} "{1}"' -f $Mode, $_.Exception.Message)
-        [void](Complete-NotifyPopupLifecycle -Outcome 'failed' -Reason 'worker-start-error')
+        $failure = New-NotifyActivationWorkerFailureOutcome -Operation $operation -OriginKind $resolvedOrigin -Reason 'worker-start-error'
+        Write-NotifyPopupLog -Message ('popup-exact-worker-start-error mode={0} result={1} reason={2}' -f $Mode, $failure.Result, $failure.Reason)
+        [void](Complete-NotifyPopupLifecycle -Outcome 'failed' -Reason $failure.Reason -Retryable $failure.Retryable)
         return $false
     }
-    Write-NotifyPopupLog -Message ('popup-exact-worker-start mode={0}' -f $Mode)
+    Write-NotifyPopupLog -Message ('popup-exact-worker-start mode={0} originKind={1}' -f $Mode, $(if ([string]::IsNullOrWhiteSpace($resolvedOrigin)) { 'terminal' } else { $resolvedOrigin }))
     $script:NotifyPopupExactWorkerTimer.Start()
     return $true
 }
@@ -988,190 +997,6 @@ function Test-NotifyPopupForegroundTarget {
     return $false
 }
 
-function Invoke-NotifyPopupActivation {
-    param(
-        [string]$TargetHost,
-        [string]$CurrentDirBase,
-        [string]$SourceTabTitleValue,
-        [string]$OriginKind = '',
-        [string]$NotificationId = '',
-        [string]$SnapshotId = ''
-    )
-
-    try {
-        $startedAt = [DateTime]::UtcNow
-        $requiresCwdMatch = -not [string]::IsNullOrWhiteSpace($CurrentDirBase)
-        $hasPreciseSourceTitle = -not [string]::IsNullOrWhiteSpace($SourceTabTitleValue)
-        $allowTargetCache = Test-NotifyPopupSessionTaggedTitle -Value $SourceTabTitleValue
-        Write-NotifyPopupLog -Message ('popup-activate targetFingerprint={0} cwdFingerprint={1} sourceTabFingerprint={2} originKind={3} notificationFp={4} snapshotFp={5}' -f (Get-NotifyPopupContextFingerprint -Value $TargetHost), (Get-NotifyPopupContextFingerprint -Value $CurrentDirBase), (Get-NotifyPopupContextFingerprint -Value $SourceTabTitleValue), $(if ([string]::IsNullOrWhiteSpace($OriginKind)) { 'none' } else { $OriginKind }), (Get-NotifyRouteFingerprint -Value $NotificationId), (Get-NotifyRouteFingerprint -Value $SnapshotId))
-
-        if ($OriginKind -eq 'paseo') {
-            Write-NotifyPopupLog -Message 'popup-paseo-activate-invariant paseo-must-use-background-worker'
-            return
-        }
-
-        if ($OriginKind -eq 'pi-web') {
-            Write-NotifyPopupLog -Message 'popup-route-activate-invariant exact-route-must-use-background-worker'
-            return
-        }
-
-        if (-not $requiresCwdMatch -and -not $hasPreciseSourceTitle) {
-            Write-NotifyPopupLog -Message ('popup-focus-miss missing-target-metadata no-target-open-skipped targetFingerprint={0} elapsedMs={1}' -f (Get-NotifyPopupContextFingerprint -Value $TargetHost), [int]([DateTime]::UtcNow - $startedAt).TotalMilliseconds)
-            return
-        }
-        Write-NotifyPopupLog -Message ('popup-focus-policy requiresCwdMatch={0} requiresSourceTabTitle={1} allowSelectedFallback={2} allowOpenNew={3}' -f $requiresCwdMatch, $hasPreciseSourceTitle, $false, $false)
-
-        $keywords = @($SourceTabTitleValue, $CurrentDirBase, $TargetHost) |
-            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
-            ForEach-Object { $_.Trim() } |
-            Select-Object -Unique
-        Write-NotifyPopupLog -Message ('popup-keywords count={0}' -f @($keywords).Count)
-
-        $cache = if ($allowTargetCache) { Get-NotifyPopupCache } else { $null }
-        $cacheMatches = $false
-        $cacheWindowFingerprint = ''
-        $cacheTabFingerprint = ''
-        if ($null -ne $cache) {
-            $cachedTabIndex = if ($cache.PSObject.Properties['tabIndex']) { [string]$cache.tabIndex } else { '' }
-            $cacheWindowFingerprint = if ($cache.PSObject.Properties['windowFingerprint']) { [string]$cache.windowFingerprint } else { '' }
-            $cacheTabFingerprint = if ($cache.PSObject.Properties['tabFingerprint']) { [string]$cache.tabFingerprint } else { '' }
-            $cacheHostFingerprint = if ($cache.PSObject.Properties['hostFingerprint']) { [string]$cache.hostFingerprint } else { '' }
-            $cacheCwdFingerprint = if ($cache.PSObject.Properties['cwdFingerprint']) { [string]$cache.cwdFingerprint } else { '' }
-            Write-NotifyPopupLog -Message ('popup-cache hostFingerprint={0} cwdFingerprint={1} windowFingerprint={2} tabFingerprint={3} tabIndex={4}' -f $cacheHostFingerprint, $cacheCwdFingerprint, $cacheWindowFingerprint, $cacheTabFingerprint, $cachedTabIndex)
-            $cacheMatches = -not [string]::IsNullOrWhiteSpace($CurrentDirBase) -and
-                $cacheHostFingerprint -eq (Get-NotifyPopupContextFingerprint -Value $TargetHost) -and
-                $cacheCwdFingerprint -eq (Get-NotifyPopupContextFingerprint -Value $CurrentDirBase)
-            Write-NotifyPopupLog -Message ('popup-cache-match {0}' -f $cacheMatches)
-        }
-        if ($null -ne $script:NotifyPopupInitialTarget) {
-            Write-NotifyPopupLog -Message ('popup-initial windowFingerprint={0} tabFingerprint={1} tabIndex={2}' -f (Get-NotifyPopupContextFingerprint -Value $script:NotifyPopupInitialTarget.WindowTitle), (Get-NotifyPopupContextFingerprint -Value $script:NotifyPopupInitialTarget.TabTitle), $script:NotifyPopupInitialTarget.TabIndex)
-        }
-
-        $windows = @(Get-NotifyPopupWindows -TerminalOnly)
-        Write-NotifyPopupLog -Message ('popup-terminal-window-count {0}' -f $windows.Count)
-        $best = $null
-        $eligibleCount = 0
-        foreach ($window in $windows) {
-            $baseScore = 0
-            foreach ($keyword in $keywords) {
-                if ($window.Title.IndexOf($keyword, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
-                    $baseScore += 20
-                }
-            }
-            if ($cacheMatches -and -not [string]::IsNullOrWhiteSpace($cacheWindowFingerprint) -and (Get-NotifyPopupContextFingerprint -Value $window.Title) -eq $cacheWindowFingerprint) {
-                $baseScore += 80
-            }
-            if ([string]::IsNullOrWhiteSpace($CurrentDirBase) -and $null -ne $script:NotifyPopupInitialTarget -and $window.Title -eq $script:NotifyPopupInitialTarget.WindowTitle) {
-                $baseScore += 50
-            }
-
-            $tabs = @(Get-NotifyPopupTabs -Handle $window.Handle)
-            Write-NotifyPopupLog -Message ('popup-window titleFingerprint={0} process="{1}" tabs={2} baseScore={3}' -f (Get-NotifyPopupContextFingerprint -Value $window.Title), $window.ProcessName, $tabs.Count, $baseScore)
-            if ($tabs.Count -eq 0) {
-                if (-not $requiresCwdMatch -and -not $hasPreciseSourceTitle -and $baseScore -gt 0) {
-                    $candidate = [pscustomobject]@{ Window = $window; Score = $baseScore; Tab = $null; TabName = ''; TabIndex = -1 }
-                    if ($null -eq $best -or $candidate.Score -gt $best.Score) {
-                        $best = $candidate
-                    }
-                }
-                continue
-            }
-
-            foreach ($tab in $tabs) {
-                $score = $baseScore
-                $matchedKeywords = New-Object System.Collections.Generic.List[string]
-                foreach ($keyword in $keywords) {
-                    if (-not [string]::IsNullOrWhiteSpace($tab.Name) -and $tab.Name.IndexOf($keyword, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
-                        $score += 120
-                        [void]$matchedKeywords.Add($keyword)
-                    }
-                }
-                $sourceTabTitleMatch = -not [string]::IsNullOrWhiteSpace($SourceTabTitleValue) -and -not [string]::IsNullOrWhiteSpace($tab.Name) -and $tab.Name.IndexOf($SourceTabTitleValue, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
-                if ($sourceTabTitleMatch) {
-                    $score += 300
-                }
-                $cacheTabMatch = $allowTargetCache -and $cacheMatches -and $sourceTabTitleMatch -and -not [string]::IsNullOrWhiteSpace($cacheTabFingerprint) -and (Get-NotifyPopupContextFingerprint -Value $tab.Name) -eq $cacheTabFingerprint
-                if ($cacheTabMatch) {
-                    $score += 200
-                }
-                $cwdKeywordMatch = $requiresCwdMatch -and ($matchedKeywords -contains $CurrentDirBase)
-                if ($hasPreciseSourceTitle -and -not $sourceTabTitleMatch) {
-                    $score = 0
-                }
-                elseif ($requiresCwdMatch -and -not $cwdKeywordMatch) {
-                    $score = 0
-                }
-                $initialTabMatch = [string]::IsNullOrWhiteSpace($CurrentDirBase) -and $null -ne $script:NotifyPopupInitialTarget -and $tab.Name -eq $script:NotifyPopupInitialTarget.TabTitle
-                if ($initialTabMatch) {
-                    $score += 500
-                }
-                $selectedFallback = $false
-                if ($score -le 0 -and $tab.IsSelected -and [string]::IsNullOrWhiteSpace($CurrentDirBase) -and -not $hasPreciseSourceTitle) {
-                    $score = 1
-                    $selectedFallback = $true
-                }
-                Write-NotifyPopupLog -Message ('popup-tab index={0} nameFingerprint={1} selected={2} score={3} matchedKeywordCount={4} sourceTabTitleMatch={5} cacheTabMatch={6} initialTabMatch={7} selectedFallback={8}' -f $tab.Index, (Get-NotifyPopupContextFingerprint -Value $tab.Name), $tab.IsSelected, $score, @($matchedKeywords).Count, $sourceTabTitleMatch, $cacheTabMatch, $initialTabMatch, $selectedFallback)
-                if ($score -le 0) {
-                    continue
-                }
-
-                $eligibleCount += 1
-                $candidate = [pscustomobject]@{ Window = $window; Score = $score; Tab = $tab.Element; TabName = $tab.Name; TabIndex = $tab.Index }
-                if ($null -eq $best -or $candidate.Score -gt $best.Score) {
-                    $best = $candidate
-                }
-            }
-        }
-
-        if ($eligibleCount -gt 1) {
-            Write-NotifyPopupLog -Message ('popup-focus-ambiguous targetFingerprint={0} sourceTabFingerprint={1} candidateCount={2} bestScore={3} elapsedMs={4}' -f (Get-NotifyPopupContextFingerprint -Value $TargetHost), (Get-NotifyPopupContextFingerprint -Value $SourceTabTitleValue), $eligibleCount, $best.Score, [int]([DateTime]::UtcNow - $startedAt).TotalMilliseconds)
-            return
-        }
-
-        if ($null -eq $best) {
-            Write-NotifyPopupLog -Message ('popup-focus-miss no-target-open-skipped targetFingerprint={0} cwdFingerprint={1} keywordCount={2} elapsedMs={3}' -f (Get-NotifyPopupContextFingerprint -Value $TargetHost), (Get-NotifyPopupContextFingerprint -Value $CurrentDirBase), @($keywords).Count, [int]([DateTime]::UtcNow - $startedAt).TotalMilliseconds)
-            return
-        }
-
-        Write-NotifyPopupLog -Message ('popup-focus-best windowFingerprint={0} tabFingerprint={1} tabIndex={2} score={3}' -f (Get-NotifyPopupContextFingerprint -Value $best.Window.Title), (Get-NotifyPopupContextFingerprint -Value $best.TabName), $best.TabIndex, $best.Score)
-        if ([PiNotifyPopupUser32]::IsIconic($best.Window.Handle)) {
-            [void][PiNotifyPopupUser32]::ShowWindowAsync($best.Window.Handle, 9)
-            Start-Sleep -Milliseconds 120
-        }
-
-        try {
-            $shell = New-Object -ComObject WScript.Shell
-            [void]$shell.AppActivate($best.Window.ProcessId)
-        }
-        catch {
-            Write-NotifyPopupLog -Message ('popup-appactivate-error "{0}"' -f $_.Exception.Message)
-        }
-        Start-Sleep -Milliseconds 80
-        [void][PiNotifyPopupUser32]::SetForegroundWindow($best.Window.Handle)
-        Start-Sleep -Milliseconds 80
-
-        if ($null -ne $best.Tab) {
-            if (Select-NotifyPopupTab -TabElement $best.Tab) {
-                $scrolledToBottom = Set-NotifyBridgeTerminalScrollToBottom -WindowHandle $best.Window.Handle
-                Write-NotifyPopupLog -Message ('popup-tab-selected tabFingerprint={0} elapsedMs={1} scrolledToBottom={2}' -f (Get-NotifyPopupContextFingerprint -Value $best.TabName), [int]([DateTime]::UtcNow - $startedAt).TotalMilliseconds, $scrolledToBottom)
-                if ($allowTargetCache -and -not [string]::IsNullOrWhiteSpace($CurrentDirBase)) {
-                    Save-NotifyPopupCache -TargetHostValue $TargetHost -CwdBaseValue $CurrentDirBase -WindowTitle $best.Window.Title -TabTitle $best.TabName -TabIndex $best.TabIndex
-                }
-            }
-            else {
-                Write-NotifyPopupLog -Message ('popup-tab-select-failed tabFingerprint={0} elapsedMs={1}' -f (Get-NotifyPopupContextFingerprint -Value $best.TabName), [int]([DateTime]::UtcNow - $startedAt).TotalMilliseconds)
-            }
-        }
-        else {
-            if ($allowTargetCache -and -not [string]::IsNullOrWhiteSpace($CurrentDirBase)) {
-                Save-NotifyPopupCache -TargetHostValue $TargetHost -CwdBaseValue $CurrentDirBase -WindowTitle $best.Window.Title -TabTitle '' -TabIndex -1
-            }
-        }
-    }
-    catch {
-        Write-NotifyPopupLog -Message ('popup-activate-error "{0}"' -f $_.Exception.Message)
-    }
-}
 
 $script:NotifyPopupInitialTarget = Get-NotifyPopupSelectedTerminalTarget
 if ($null -ne $script:NotifyPopupInitialTarget) {
@@ -1337,7 +1162,6 @@ $targetNotificationId = $NotificationId
 $targetSnapshotId = $SnapshotId
 $targetRecoveryTicketId = $RecoveryTicketId
 $script:NotifyPopupDidActivate = $false
-$shouldActivate = $false
 
 $script:NotifyPopupForm = $form
 $script:NotifyPopupPanel = $panel
@@ -1359,11 +1183,17 @@ $script:NotifyPopupOriginalSessionForeColor = $sessionLabel.ForeColor
 $script:NotifyPopupOriginalTitleForeColor = $titleLabel.ForeColor
 $script:NotifyPopupOriginalBodyForeColor = $bodyLabel.ForeColor
 $script:NotifyPopupOriginalCloseForeColor = $closeLabel.ForeColor
+$script:NotifyPopupTargetHost = $targetHost
+$script:NotifyPopupTargetCwdBase = $targetCwdBase
+$script:NotifyPopupTargetSourceTabTitle = $targetSourceTabTitle
+$script:NotifyPopupTargetOriginKind = $targetOriginKind
+$script:NotifyPopupTargetFingerprint = if ([string]::IsNullOrWhiteSpace($TargetFingerprint)) { Get-NotifyPopupContextFingerprint -Value $targetHost } else { $TargetFingerprint }
 $script:NotifyPopupTargetNotificationId = $targetNotificationId
 $script:NotifyPopupTargetSnapshotId = $targetSnapshotId
 $script:NotifyPopupTargetRecoveryTicketId = $targetRecoveryTicketId
 $script:NotifyPopupRecoveryState = if ($targetOriginKind -eq 'pi-web' -and [string]::IsNullOrWhiteSpace($targetSnapshotId) -and -not [string]::IsNullOrWhiteSpace($targetRecoveryTicketId)) { 'recovering' } elseif ($targetOriginKind -eq 'pi-web' -and [string]::IsNullOrWhiteSpace($targetSnapshotId)) { 'unavailable' } elseif ($targetOriginKind -eq 'paseo' -and [string]::IsNullOrWhiteSpace($targetSnapshotId)) { 'unavailable' } else { 'ready' }
 $script:NotifyPopupExactWorker = $null
+$script:NotifyPopupClosingWorker = $null
 $script:NotifyPopupActivateAfterResolve = $false
 $script:NotifyPopupTerminalState = $false
 $script:NotifyPopupTerminalOutcome = ''
@@ -1379,72 +1209,68 @@ $script:NotifyPopupExactWorkerTimer.Add_Tick({
     if (-not $completionReady) { return }
     $cancelReason = [string]$worker.CancelReason
     $result = $null
+    $rows = @()
     try {
         if ($null -ne $worker.StopAsync) { $worker.PowerShell.EndStop($worker.StopAsync) }
         if ($worker.Async.IsCompleted) {
             $rows = @($worker.PowerShell.EndInvoke($worker.Async))
-            if ($rows.Count -gt 0) { $result = $rows[-1] }
         }
     }
     catch {
         if ([string]::IsNullOrWhiteSpace($cancelReason)) {
-            $result = [pscustomobject]@{ Decision = 'fail-closed'; Result = 'adapter-unavailable'; Reason = 'worker-error'; SnapshotId = '' }
+            $result = New-NotifyActivationWorkerFailureOutcome -Operation $worker.Operation -OriginKind $worker.OriginKind -Reason 'worker-endinvoke-error' -ElapsedMs ([int]([DateTime]::UtcNow - $worker.StartedAtUtc).TotalMilliseconds)
         }
     }
     finally {
-        try { $worker.PowerShell.Dispose() } catch {}
-        try { $worker.Runspace.Close(); $worker.Runspace.Dispose() } catch {}
+        Close-NotifyPopupExactWorkerResources -Worker $worker
         $script:NotifyPopupExactWorker = $null
         $this.Stop()
     }
+    $elapsedMs = [int]([DateTime]::UtcNow - $worker.StartedAtUtc).TotalMilliseconds
     if (-not [string]::IsNullOrWhiteSpace($cancelReason)) {
-        Write-NotifyPopupLog -Message ('popup-exact-worker-cancelled mode={0} reason={1} elapsedMs={2}' -f $worker.Mode, $cancelReason, [int]([DateTime]::UtcNow - $worker.StartedAtUtc).TotalMilliseconds)
+        $cancelled = New-NotifyActivationWorkerFailureOutcome -Operation $worker.Operation -OriginKind $worker.OriginKind -Reason 'worker-cancelled' -ElapsedMs $elapsedMs
+        Write-NotifyPopupLog -Message ('popup-exact-worker-cancelled mode={0} reason={1} result={2} elapsedMs={3}' -f $worker.Mode, $cancelReason, $cancelled.Result, $cancelled.ElapsedMs)
         if ($cancelReason -eq 'superseded-by-activation' -and $script:NotifyPopupActivateAfterResolve -and -not $script:NotifyPopupTerminalState) {
             $script:NotifyPopupActivateAfterResolve = $false
-            [void](Start-NotifyPopupExactWorker -Mode 'activate')
+            [void](Start-NotifyPopupExactWorker -Mode 'activate' -OriginKind 'pi-web')
         }
         return
     }
     if ($null -eq $result) {
-        $result = [pscustomobject]@{ Decision = 'fail-closed'; Result = 'adapter-unavailable'; Reason = 'worker-empty'; SnapshotId = '' }
+        $result = Resolve-NotifyActivationWorkerOutput -Rows $rows -Operation $worker.Operation -OriginKind $worker.OriginKind -ElapsedMs $elapsedMs
     }
-    Write-NotifyPopupLog -Message ('popup-exact-worker-complete mode={0} decision={1} result={2} reason={3} snapshotFp={4} elapsedMs={5}' -f $worker.Mode, $result.Decision, $result.Result, $(if ([string]::IsNullOrWhiteSpace([string]$result.Reason)) { 'none' } else { [string]$result.Reason }), (Get-NotifyRouteFingerprint -Value ([string]$result.SnapshotId)), [int]([DateTime]::UtcNow - $worker.StartedAtUtc).TotalMilliseconds)
+    $snapshotFp = Get-NotifyRouteFingerprint -Value ([string]$result.SnapshotId)
+    Write-NotifyPopupLog -Message ('popup-exact-worker-complete mode={0} decision={1} result={2} reason={3} snapshotFp={4} elapsedMs={5} scrollAttempted={6} scrolledToBottom={7}' -f $worker.Mode, $result.Decision, $result.Result, $(if ([string]::IsNullOrWhiteSpace([string]$result.Reason)) { 'none' } else { [string]$result.Reason }), $snapshotFp, [int]([DateTime]::UtcNow - $worker.StartedAtUtc).TotalMilliseconds, $result.ScrollAttempted, $result.ScrolledToBottom)
     if ($script:NotifyPopupTerminalState) { return }
-    if ($worker.Mode -eq 'paseo-activate') {
-        if ($result.Decision -eq 'handled') {
-            [void](Complete-NotifyPopupLifecycle -Outcome 'handled' -Reason $(if ([string]::IsNullOrWhiteSpace([string]$result.Result)) { 'activated' } else { [string]$result.Result }))
+    $ui = ConvertTo-NotifyActivationUiOutcome -Outcome $result -HasDeferredActivateIntent:$script:NotifyPopupActivateAfterResolve
+    if ($ui.Action -eq 'store-ready') {
+        if (-not [string]::IsNullOrWhiteSpace([string]$ui.SnapshotId)) {
+            $script:NotifyPopupTargetSnapshotId = [string]$ui.SnapshotId
+        }
+        if ($ui.StartActivate) {
+            $script:NotifyPopupActivateAfterResolve = $false
+            [void](Start-NotifyPopupExactWorker -Mode 'activate' -OriginKind 'pi-web')
         }
         else {
-            $reason = if (-not [string]::IsNullOrWhiteSpace([string]$result.Result)) { [string]$result.Result } elseif (-not [string]::IsNullOrWhiteSpace([string]$result.Reason)) { [string]$result.Reason } else { 'activation-failed' }
-            $retryable = if ($result.PSObject.Properties['Retryable']) { [bool]$result.Retryable } else { $null }
-            [void](Complete-NotifyPopupLifecycle -Outcome 'failed' -Reason $reason -Retryable $retryable)
+            Set-NotifyPopupRecoveryUiState -State 'ready'
         }
         return
     }
-    if ($worker.Mode -eq 'resolve') {
-        if ($result.Decision -eq 'exact-ready' -and -not [string]::IsNullOrWhiteSpace([string]$result.SnapshotId)) {
-            $script:NotifyPopupTargetSnapshotId = [string]$result.SnapshotId
-            if ($script:NotifyPopupActivateAfterResolve) {
-                $script:NotifyPopupActivateAfterResolve = $false
-                [void](Start-NotifyPopupExactWorker -Mode 'activate')
-            }
-            else {
-                Set-NotifyPopupRecoveryUiState -State 'ready'
-            }
-        }
-        else {
-            [void](Complete-NotifyPopupLifecycle -Outcome 'failed' -Reason $(if ([string]::IsNullOrWhiteSpace([string]$result.Reason)) { 'resolve-failed' } else { [string]$result.Reason }))
-        }
+    if ($ui.Action -eq 'close-handled') {
+        [void](Complete-NotifyPopupLifecycle -Outcome 'handled' -Reason $(if ([string]::IsNullOrWhiteSpace([string]$ui.Result)) { 'activation-handled' } else { [string]$ui.Result }))
+        return
     }
-    elseif ($result.Decision -eq 'focused') {
-        [void](Complete-NotifyPopupLifecycle -Outcome 'focused' -Reason $(if ([string]::IsNullOrWhiteSpace([string]$result.Reason)) { 'background-proof-pending' } else { [string]$result.Reason }))
+    if ($ui.Action -eq 'close-focused') {
+        [void](Complete-NotifyPopupLifecycle -Outcome 'focused' -Reason $(if ([string]::IsNullOrWhiteSpace([string]$ui.Reason)) { 'background-proof-pending' } else { [string]$ui.Reason }))
+        return
     }
-    elseif ($result.Decision -eq 'handled') {
-        [void](Complete-NotifyPopupLifecycle -Outcome 'handled' -Reason $(if ([string]::IsNullOrWhiteSpace([string]$result.Result)) { 'activation-handled' } else { [string]$result.Result }))
+    if ($ui.Action -eq 'restore-retryable') {
+        $reason = if (-not [string]::IsNullOrWhiteSpace([string]$ui.Result)) { [string]$ui.Result } elseif (-not [string]::IsNullOrWhiteSpace([string]$ui.Reason)) { [string]$ui.Reason } else { 'activation-failed' }
+        [void](Complete-NotifyPopupLifecycle -Outcome 'failed' -Reason $reason -Retryable $true)
+        return
     }
-    else {
-        [void](Complete-NotifyPopupLifecycle -Outcome 'failed' -Reason $(if ([string]::IsNullOrWhiteSpace([string]$result.Reason)) { 'activation-failed' } else { [string]$result.Reason }))
-    }
+    $failReason = if (-not [string]::IsNullOrWhiteSpace([string]$ui.Result)) { [string]$ui.Result } elseif (-not [string]::IsNullOrWhiteSpace([string]$ui.Reason)) { [string]$ui.Reason } else { 'activation-failed' }
+    [void](Complete-NotifyPopupLifecycle -Outcome 'failed' -Reason $failReason -Retryable $false)
 })
 
 $activateAction = {
@@ -1481,15 +1307,18 @@ $activateAction = {
             }
         }
         else {
-            [void](Start-NotifyPopupExactWorker -Mode 'activate')
+            [void](Start-NotifyPopupExactWorker -Mode 'activate' -OriginKind 'pi-web')
         }
         return
     }
-    $script:NotifyPopupDidActivate = $true
-    $script:shouldActivate = $true
+
     Write-NotifyPopupLog -Message 'popup-click'
     Write-NotifyPopupLog -Message ('popup-action activate targetFingerprint={0} originKind={1} notificationFp={2} snapshotFp={3}' -f (Get-NotifyPopupContextFingerprint -Value $targetHost), $(if ([string]::IsNullOrWhiteSpace($targetOriginKind)) { 'none' } else { $targetOriginKind }), (Get-NotifyRouteFingerprint -Value $targetNotificationId), (Get-NotifyRouteFingerprint -Value $targetSnapshotId))
-    [void](Complete-NotifyPopupLifecycle -Outcome 'handled' -Reason 'legacy-activation-queued')
+    if (-not (Set-NotifyPopupActivating)) { return }
+    $script:NotifyPopupDidActivate = $true
+    if (-not (Start-NotifyPopupExactWorker -Mode 'activate' -OriginKind $(if ([string]::IsNullOrWhiteSpace($targetOriginKind)) { 'terminal' } else { $targetOriginKind }))) {
+        [void](Complete-NotifyPopupLifecycle -Outcome 'failed' -Reason 'worker-start-error')
+    }
 }
 
 $closeAction = {
@@ -1505,7 +1334,9 @@ $closeLabel.Add_Click($closeAction)
 
 $timer = New-Object System.Windows.Forms.Timer
 $script:NotifyPopupTimer = $timer
-$timer.Interval = [Math]::Max(3000, ($TimeoutSeconds * 1000))
+$popupLifetimeMs = [Math]::Max(3000, ($TimeoutSeconds * 1000))
+$script:NotifyPopupExpiresAtUtc = [DateTime]::UtcNow.AddMilliseconds($popupLifetimeMs)
+$timer.Interval = $popupLifetimeMs
 $timer.Add_Tick({
     Write-NotifyPopupLog -Message 'popup-timeout-close'
     Write-NotifyPopupLog -Message 'popup-action dismiss source="timeout"'
@@ -1529,7 +1360,6 @@ $script:NotifyPopupPaseoCloseTimer.Add_Tick({
     Write-NotifyPopupLog -Message ('popup-action dismiss source="paseo-close" notificationFp={0}' -f (Get-NotifyRouteFingerprint -Value $targetNotificationId))
     [void](Request-NotifyPopupExactWorkerStop -Reason 'paseo-close')
     $script:NotifyPopupDidActivate = $false
-    $script:shouldActivate = $false
     [void](Complete-NotifyPopupLifecycle -Outcome 'dismissed' -Reason 'paseo-close')
 })
 
@@ -1624,7 +1454,7 @@ $form.Add_FormClosed({
         $script:NotifyPopupTerminalOutcome = 'dismissed'
         $script:NotifyPopupTerminalReason = 'form-closed'
     }
-    Write-NotifyPopupLog -Message ('popup-closed shouldActivate={0}' -f $shouldActivate)
+    Write-NotifyPopupLog -Message ('popup-closed didActivate={0}' -f $script:NotifyPopupDidActivate)
     Remove-NotifyPopupLiveState
     try {
         if ($null -ne $script:NotifyPopupPaseoCloseEvent) {
@@ -1636,6 +1466,7 @@ $form.Add_FormClosed({
             # process teardown reclaim the runspace instead of synchronously
             # waiting in Stop/Dispose/Close while the popup is trying to exit.
             [void](Request-NotifyPopupExactWorkerStop -Reason 'popup-closed')
+            $script:NotifyPopupClosingWorker = $script:NotifyPopupExactWorker
             $script:NotifyPopupExactWorker = $null
         }
         $timer.Stop()
@@ -1666,6 +1497,20 @@ try {
     [System.Windows.Forms.Application]::Run($form)
 }
 finally {
+    foreach ($worker in @($script:NotifyPopupExactWorker, $script:NotifyPopupClosingWorker)) {
+        if ($null -eq $worker) { continue }
+        try {
+            if ([string]::IsNullOrWhiteSpace([string]$worker.CancelReason) -and -not $worker.Async.IsCompleted) {
+                $worker.CancelReason = 'process-teardown'
+                $worker.PowerShell.Stop()
+            }
+        }
+        catch {
+        }
+        Close-NotifyPopupExactWorkerResources -Worker $worker
+    }
+    $script:NotifyPopupExactWorker = $null
+    $script:NotifyPopupClosingWorker = $null
     if ($null -ne $script:NotifyPopupPaseoCloseTimer) {
         try { $script:NotifyPopupPaseoCloseTimer.Stop() } catch {}
         try { $script:NotifyPopupPaseoCloseTimer.Dispose() } catch {}
@@ -1675,8 +1520,4 @@ finally {
         try { $script:NotifyPopupPaseoCloseEvent.Dispose() } catch {}
         $script:NotifyPopupPaseoCloseEvent = $null
     }
-}
-
-if ($shouldActivate) {
-    Invoke-NotifyPopupActivation -TargetHost $targetHost -CurrentDirBase $targetCwdBase -SourceTabTitleValue $targetSourceTabTitle -OriginKind $targetOriginKind -NotificationId $targetNotificationId -SnapshotId $targetSnapshotId
 }

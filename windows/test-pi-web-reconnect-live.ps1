@@ -600,8 +600,8 @@ function Invoke-LiveNotification {
 
     $safeSuffix = $NotificationFingerprint.Substring(0, 8)
     $payload = [ordered]@{
-        title            = '[自动回归 ' + $safeSuffix + '] Pi Web 重连'
-        body             = '点击后应回到重连前的对应会话'
+        title            = '[Auto regression ' + $safeSuffix + '] Pi Web reconnect'
+        body             = 'Click to return to the matching session from before reconnect'
         routeVersion     = 1
         notificationId   = $NotificationId
         notificationKind = 'turn-complete'

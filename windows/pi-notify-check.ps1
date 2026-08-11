@@ -112,6 +112,8 @@ else {
 $commonText = [string]$sourceText['NotifyBridge.Common.ps1']
 $processText = [string]$sourceText['NotifyBridge.Process.ps1']
 $remoteHelperText = [string]$sourceText['NotifyBridge.Remote.ps1']
+$terminalRouteText = if ($sourceText.ContainsKey('terminal-route.ps1')) { [string]$sourceText['terminal-route.ps1'] } else { '' }
+$activationText = if ($sourceText.ContainsKey('NotifyBridge.Activation.ps1')) { [string]$sourceText['NotifyBridge.Activation.ps1'] } else { '' }
 $brokerText = [string]$sourceText['pi-notify-broker.ps1']
 $popupText = [string]$sourceText['pi-notify-popup.ps1']
 $refreshText = [string]$sourceText['pi-notify-refresh.ps1']
@@ -130,6 +132,30 @@ $tunnelText = [string]$sourceText['pi-notify-reverse-tunnel.ps1']
 $linuxInstallText = [string]$sourceText['install-linux-autostart.ps1']
 $autostartAllText = [string]$sourceText['install-autostart-all.ps1']
 $checkText = [string]$sourceText['pi-notify-check.ps1']
+if ([string]::IsNullOrWhiteSpace($terminalRouteText) -or $terminalRouteText -notmatch 'function Select-NotifyTerminalCandidates' -or $terminalRouteText -notmatch 'function Test-NotifyTerminalActivationProof' -or $terminalRouteText -notmatch 'function Invoke-NotifyTerminalRouteActivate') {
+    throw 'terminal-route.ps1 must expose pure candidate selection, post-check proof, and activation entry points.'
+}
+if ([string]::IsNullOrWhiteSpace($activationText) -or $activationText -notmatch 'function Invoke-NotifyActivationStrategy' -or $activationText -notmatch 'function ConvertTo-NotifyActivationUiOutcome' -or $activationText -notmatch 'function Get-NotifyActivationWorkerScript') {
+    throw 'NotifyBridge.Activation.ps1 must expose the coordinator, UI mapper, and shared worker script.'
+}
+if ($brokerText -notmatch 'terminal-route\.ps1' -or $brokerText -notmatch 'NotifyBridge\.Activation\.ps1' -or $brokerText -notmatch 'Invoke-NotifyActivationStrategy|Get-NotifyActivationWorkerScript' -or $brokerText -notmatch 'ConvertTo-NotifyActivationUiOutcome') {
+    throw 'Broker must load shared terminal/activation modules and map worker outcomes through the coordinator.'
+}
+if ($popupText -notmatch 'terminal-route\.ps1' -or $popupText -notmatch 'NotifyBridge\.Activation\.ps1' -or $popupText -notmatch 'Get-NotifyActivationWorkerScript' -or $popupText -notmatch 'ConvertTo-NotifyActivationUiOutcome' -or $popupText -match 'legacy-activation-queued') {
+    throw 'Fallback popup must use the shared activation coordinator and must not close as handled before activation completes.'
+}
+if ($activateText -notmatch 'terminal-route\.ps1' -or $activateText -notmatch 'NotifyBridge\.Activation\.ps1' -or $activateText -notmatch 'Invoke-NotifyActivationStrategy' -or $activateText -match 'function Focus-NotifyWindow') {
+    throw 'System-toast activation must invoke the shared coordinator and must not keep a private WT focus implementation.'
+}
+if ($brokerText -match 'legacy-activation-complete') {
+    throw 'Broker must not close WT cards as handled before activation proof completes.'
+}
+if ($commonText -notmatch 'function Resolve-NotifyBridgePiWebInstanceKey' -or
+    $commonText -notmatch 'function New-NotifyBridgeRemoteConfig' -or
+    $remoteInstallText -notmatch 'Resolve-NotifyBridgePiWebInstanceKey' -or
+    $remoteInstallText -notmatch 'New-NotifyBridgeRemoteConfig') {
+    throw 'Remote install must project the authoritative PiWebDesktop instance key through the shared remote-config helpers.'
+}
 if ($commonText -notmatch 'brokerEnabled' -or $commonText -notmatch 'brokerPort' -or $commonText -notmatch 'brokerStartupTimeoutMs' -or $commonText -notmatch 'brokerRequestTimeoutMs' -or $commonText -notmatch 'BrokerHealthUrl' -or $commonText -notmatch 'BrokerPopupUrl' -or $commonText -notmatch 'BrokerCloseUrl') {
     throw 'NotifyBridge config must persist stable broker defaults (brokerEnabled, brokerPort, brokerStartupTimeoutMs, brokerRequestTimeoutMs) and expose broker URLs.'
 }
@@ -157,15 +183,15 @@ if ($commonText -notmatch ('function\s+' + [regex]::Escape($scrollHelperName)) -
     $commonText -notmatch '\.SetValue\(') {
     throw 'NotifyBridge common must scroll the selected terminal with writable UIAutomation RangeValuePattern maximum.'
 }
-if ([regex]::Matches($brokerText, [regex]::Escape($scrollHelperName)).Count -lt 2 -or
-    [regex]::Matches($brokerText, 'scrolledToBottom').Count -lt 2 -or
-    $popupText -notmatch [regex]::Escape($scrollHelperName) -or
-    $popupText -notmatch 'scrolledToBottom' -or
-    $activateText -notmatch [regex]::Escape($scrollHelperName) -or
-    $activateText -notmatch 'scrolledToBottom') {
-    throw 'Broker cache/scan and both fallback activation paths must scroll selected terminal tabs and log the boolean result.'
+if ($terminalRouteText -notmatch [regex]::Escape($scrollHelperName) -or
+    $terminalRouteText -notmatch '\$scrollAttempted\s*=\s*\$true' -or
+    $terminalRouteText -notmatch '\$scrolledToBottom\s*=\s*\[bool\]\(Set-NotifyBridgeTerminalScrollToBottom' -or
+    $brokerText -notmatch 'scrollAttempted=' -or $brokerText -notmatch 'scrolledToBottom=' -or
+    $popupText -notmatch 'scrollAttempted=' -or $popupText -notmatch 'scrolledToBottom=' -or
+    $activateText -notmatch 'scrollAttempted=' -or $activateText -notmatch 'scrolledToBottom=') {
+    throw 'Shared Terminal strategy must own best-effort scroll and every activation surface must log its boolean result.'
 }
-$activationRuntimeText = $commonText + "`n" + $brokerText + "`n" + $popupText + "`n" + $activateText
+$activationRuntimeText = $commonText + "`n" + $terminalRouteText + "`n" + $brokerText + "`n" + $popupText + "`n" + $activateText
 if ($activationRuntimeText -match 'SendKeys|SendWait|keybd_event|SendInput') {
     throw 'Terminal scroll-to-bottom must use UIAutomation and must not inject keyboard input.'
 }
@@ -203,6 +229,34 @@ try {
         (Resolve-NotifyBridgeRemotePiDir -PathValue 'agent/' -RemoteHome '/home/probe') -ne '/home/probe/agent') {
         throw 'Remote Pi directory normalization probe failed.'
     }
+
+    $routeConfigProbePath = Join-Path $customProbeBase 'route-config.json'
+    $routeConfigProbeInstance = '11111111-2222-3333-4444-555555555555'
+    [System.IO.File]::WriteAllText(
+        $routeConfigProbePath,
+        ('{"instanceKey":"' + $routeConfigProbeInstance + '"}'),
+        [System.Text.UTF8Encoding]::new($false))
+    $resolvedRouteInstance = Resolve-NotifyBridgePiWebInstanceKey `
+        -InstanceKey '' `
+        -RouteConfigPath $routeConfigProbePath
+    $webRemoteConfig = New-NotifyBridgeRemoteConfig `
+        -Endpoint 'http://127.0.0.1:23118/notify' `
+        -Token 'probe-token' `
+        -RemoteHostAlias 'probe' `
+        -PiWebInstanceKey $resolvedRouteInstance
+    $terminalRemoteConfig = New-NotifyBridgeRemoteConfig `
+        -Endpoint 'http://127.0.0.1:23118/notify' `
+        -Token 'probe-token' `
+        -RemoteHostAlias 'probe'
+    if ($resolvedRouteInstance -ne $routeConfigProbeInstance -or
+        -not $webRemoteConfig.Contains('originKind') -or
+        [string]$webRemoteConfig['originKind'] -ne 'pi-web' -or
+        [string]$webRemoteConfig['instanceKey'] -ne $routeConfigProbeInstance -or
+        $terminalRemoteConfig.Contains('originKind') -or
+        $terminalRemoteConfig.Contains('instanceKey')) {
+        throw 'Pi Web remote config projection probe failed.'
+    }
+
     $quote = [string][char]39
     if ((ConvertTo-NotifyBridgeRemoteShellLiteral -Value 'path with space') -ne ($quote + 'path with space' + $quote) -or
         (ConvertTo-NotifyBridgeWindowsProcessArgument -Value 'path with space') -ne '"path with space"' -or
@@ -353,7 +407,7 @@ $qqOkIndex = $listenerText.LastIndexOf("-Body 'ok'")
 if ($qqNoTargetIndex -lt 0 -or $qqNoTargetIndex -ge $qqDedupIndex -or $qqDedupIndex -ge $qqDesktopIndex -or $qqDesktopIndex -ge $qqDispatchIndex -or $qqDispatchIndex -ge $qqOkIndex -or ([regex]::Matches($listenerText, '(?m)^\s*Start-NotifyQqDispatch -Title \$title -Body \$body\s*$')).Count -ne 1 -or $listenerText -notmatch 'qq-send-drop reason=capacity' -or $listenerText -notmatch 'SetAccessRuleProtection\(\$true, \$false\)') {
     throw 'Listener QQ dispatch must run once after target/dedupe/desktop gates with private bounded worker resources.'
 }
-if ($listenerText -match 'Paseo stays off the QQ mirror path' -or $listenerText -match "if \(\$routeOriginKind -ne 'paseo'\)\s*\{[\s\S]{0,80}Start-NotifyQqDispatch") {
+if ($listenerText -match 'Paseo stays off the QQ mirror path' -or $listenerText -match 'if \(\$routeOriginKind -ne ''paseo''\)\s*\{[\s\S]{0,80}Start-NotifyQqDispatch') {
     throw 'Listener QQ dispatch must include originKind=paseo after desktop display succeeds.'
 }
 foreach ($runtimeText in @($refreshText, $windowsInstallText, $restartText, $remoteInstallText)) {
@@ -446,8 +500,11 @@ if ($brokerText -notmatch '/activate-oldest' -or $brokerText -notmatch 'Invoke-N
 if ($brokerText -notmatch 'Queue-NotifyBrokerPrewarm' -or $brokerText -notmatch 'Update-NotifyBrokerTabCacheForTarget' -or $brokerText -notmatch 'broker-prewarm-cache-updated' -or $brokerText -notmatch 'broker-prewarm-skip recent-scan' -or $brokerText -notmatch 'broker-prewarm-dedupe' -or $brokerText -notmatch 'broker-prewarm-skip closed-popup' -or $brokerText -notmatch 'NotifyBrokerPrewarmDelayMs\s*=\s*10000') {
     throw 'Broker must prewarm target tab cache after popup display while delaying/throttling repeated expensive scans and skipping closed popups.'
 }
-if ($brokerText -notmatch 'Test-NotifyBrokerSessionTaggedTitle' -or $brokerText -notmatch '\$CacheEntry\.Tab\.Current\.Name' -or $brokerText -notmatch 'broker-prewarm-ambiguous' -or $brokerText -notmatch 'broker-focus-ambiguous' -or $brokerText -notmatch 'if \(\$hasPreciseSourceTitle -and -not \$sourceTabTitleMatch\)') {
-    throw 'Broker must require precise source-title matches, reject ambiguous candidates, and validate only session-tagged caches against the live tab name.'
+if ($brokerText -notmatch 'Test-NotifyBrokerSessionTaggedTitle' -or $brokerText -notmatch '\$CacheEntry\.Tab\.Current\.Name' -or $brokerText -notmatch 'broker-prewarm-ambiguous' -or $brokerText -notmatch 'if \(\$hasPreciseSourceTitle -and -not \$sourceTabTitleMatch\)') {
+    throw 'Broker prewarm must require precise session-tagged titles, reject ambiguous candidates, and validate cached tabs against the live tab name.'
+}
+if ($terminalRouteText -notmatch 'function Test-NotifyTerminalAuthorityMatch' -or $terminalRouteText -notmatch '\$candidates\.Count -gt 1' -or $terminalRouteText -notmatch 'Cache cannot skip full uniqueness enumeration' -or $terminalRouteText -notmatch 'live-authority-revalidation-failed' -or $terminalRouteText -notmatch 'Get-NotifyTerminalWindowTitle' -or $terminalRouteText -notmatch '\$selected\.Count -gt 1') {
+    throw 'Shared Terminal route must require the full title, reject ambiguity, re-enumerate live authority, and prove exactly one selected tab.'
 }
 # Origin-aware foreground auto-dismiss: only terminal/legacy may match WT title/cwd.
 if ($brokerText -notmatch 'function Test-NotifyForegroundDismissAllowed' -or $popupText -notmatch 'function Test-NotifyForegroundDismissAllowed') {
@@ -500,8 +557,8 @@ if ($popupText -match 'sanitizedPayload' -or $popupText -match 'WriteAllText\(\$
 if ($popupText -notmatch 'Get-NotifyPopupContextFingerprint' -or $popupText -match 'popup-cache host="' -or $popupText -match 'popup-cache .*cwdBase=' -or $popupText -match 'popup-window title="' -or $popupText -match 'popup-tab .*name="' -or $popupText -match 'popup-focus-best windowTitle=' -or $popupText -match 'popup-initial-captured windowTitle=' -or $popupText -match 'popup-keywords "\{0\}"' -or $popupText -match 'popup-action activate host=') {
     throw 'Popup cache/logs must persist only fingerprints/counts for cwd/tab/window/keyword context.'
 }
-if ($popupText -notmatch 'Test-NotifyPopupSessionTaggedTitle' -or $popupText -notmatch 'popup-focus-ambiguous' -or $popupText -notmatch 'if \(\$hasPreciseSourceTitle -and -not \$sourceTabTitleMatch\)') {
-    throw 'Fallback popup must require precise source-title matches, reject ambiguous candidates, and ignore untagged target caches.'
+if ($popupText -notmatch 'AddParameter\(''CwdBase'', \$script:NotifyPopupTargetCwdBase\)' -or $popupText -notmatch 'AddParameter\(''TabTitle'', \$script:NotifyPopupTargetSourceTabTitle\)' -or $popupText -notmatch 'ConvertTo-NotifyActivationUiOutcome -Outcome \$result') {
+    throw 'Fallback popup must pass exact Terminal metadata to the shared worker and consume only the coordinator UI outcome.'
 }
 if ($popupText -match 'host\s*=\s*\$TargetHostValue' -or $popupText -match 'cwdBase\s*=\s*\$CwdBaseValue' -or $popupText -match 'windowTitle\s*=\s*\$WindowTitle' -or $popupText -match 'tabTitle\s*=\s*\$TabTitle') {
     throw 'Popup cache must not persist raw host/cwd/window/tab context.'
@@ -518,8 +575,8 @@ $badActivateNotificationLogPattern = 'activate-target host=' + '|' + 'activate-f
 if ($listenerText -match $badListenerNotificationLogPattern -or $popupText -match $badPopupNotificationLogPattern -or $activateText -match $badActivateNotificationLogPattern) {
     throw 'Listener/popup/activate logs must not persist notification title/body text or raw target context.'
 }
-if ($activateText -notmatch 'Get-NotifyActivateFingerprint \$targetHost' -or $activateText -match 'activate-target host="' -or $activateText -match 'activate-focus-miss .*host="') {
-    throw 'Activate script must log target host only as a fingerprint.'
+if ($activateText -notmatch 'Get-NotifyRouteFingerprint -Value \$notificationId' -or $activateText -notmatch 'notificationFp=' -or $activateText -notmatch 'snapshotFp=' -or $activateText -match 'Write-NotifyActivateLog[^\r\n]*(targetHost|cwdBase|tabTitle|FocusTarget)' -or $activateText -match 'activate-target host="' -or $activateText -match 'activate-focus-miss .*host="') {
+    throw 'Activate logs must use shared notification/snapshot fingerprints and never persist raw target context.'
 }
 
 # --- Paseo desktop routing contract (offline static) ---
@@ -596,10 +653,10 @@ if ($listenerText -notmatch 'OriginKind \$routeOriginKind' -and $listenerText -n
 if ($listenerText -notmatch 'Test-NotifyDuplicateDrop' -or $listenerText -notmatch '\$originPart') {
     throw 'Listener dedup must include origin so Paseo/Pi do not cross-suppress.'
 }
-if ($brokerText -notmatch 'Start-NotifyBrokerPaseoWorker' -or $brokerText -notmatch 'broker-paseo-retry-ready' -or $brokerText -notmatch "OriginKind -eq 'paseo'" -or $brokerText -notmatch 'Complete-NotifyBrokerPopupLifecycle[^\r\n]+-Retryable \$retryable' -or $popupText -notmatch 'Start-NotifyPopupPaseoWorker' -or $popupText -notmatch 'popup-paseo-retry-ready' -or $popupText -notmatch 'Complete-NotifyPopupLifecycle[^\r\n]+-Retryable \$retryable' -or $activateText -notmatch 'Invoke-NotifyPaseoRouteActivate') {
+if ($brokerText -notmatch 'Start-NotifyBrokerPaseoWorker' -or $brokerText -notmatch 'broker-retry-ready' -or $brokerText -notmatch 'Complete-NotifyBrokerPopupLifecycle[^\r\n]+-Retryable \$true' -or $brokerText -notmatch 'Complete-NotifyBrokerPopupLifecycle[^\r\n]+-Retryable \$false' -or $popupText -notmatch 'Start-NotifyPopupPaseoWorker' -or $popupText -notmatch 'popup-retry-ready' -or $popupText -notmatch 'Complete-NotifyPopupLifecycle[^\r\n]+-Retryable \$true' -or $popupText -notmatch 'Complete-NotifyPopupLifecycle[^\r\n]+-Retryable \$false' -or $activationText -notmatch 'function Invoke-NotifyPaseoActivationStrategy' -or $activationText -notmatch 'Invoke-NotifyPaseoRouteActivate' -or $activationText -notmatch '-Retryable:\$retryable') {
     throw 'Broker/popup/activate must share the Paseo handler, preserve authoritative retryability, and never fall back to Terminal.'
 }
-if ($brokerText -notmatch "originKind -eq 'paseo'[\s\S]{0,120}snapshotId" -or $popupText -notmatch "OriginKind -eq 'paseo'[\s\S]{0,120}SnapshotId" -or $popupText -notmatch 'NotifyPopupDidActivate = \$false' -or $activateText -notmatch "paseoOutcome.Result -ne 'busy'" -or $activateText -notmatch 'PI_NOTIFY_NOTIFICATION_ID''] = \$notificationId' -or $activateText -notmatch '''-ConfigPath'', \(\[string\]\$config.ConfigPath\)') {
+if ($brokerText -notmatch 'Start-NotifyBrokerPaseoWorker -PopupId \$PopupId -ActivationId \$SnapshotId' -or $popupText -notmatch 'Start-NotifyPopupPaseoWorker -ActivationId \$targetSnapshotId' -or $popupText -notmatch 'NotifyPopupDidActivate = \$false' -or $activateText -notmatch '\[bool\]\$outcome\.Retryable' -or $activateText -notmatch '\$outcome\.Result -ne ''busy''' -or $activateText -notmatch 'PI_NOTIFY_NOTIFICATION_ID''] = \$notificationId' -or $activateText -notmatch '''-ConfigPath'', \(\[string\]\$config.ConfigPath\)') {
     throw 'Paseo broker/fallback must accept opaque handles, retain instance config, avoid busy duplicate retry UI, and restore clickability after retryable failures.'
 }
 if ($listenerText -notmatch 'TtlSeconds \$activationTtlSeconds' -or $listenerText -notmatch 'toast\.Tag = \$notificationId' -or $listenerText -notmatch 'toast\.Group = \$TargetFingerprint' -or $listenerText -notmatch 'OriginKind ''paseo'' -NotificationId \$routeNotificationId -SnapshotId') {
@@ -614,8 +671,8 @@ if ($listenerText -notmatch 'Test-NotifyPaseoCloseTombstone' -or $listenerText -
 if ($commonText -match 'function Get-NotifyPaseoHealthSnapshot[\s\S]{0,1200}SetEnvironmentVariable' -or $commonText -match 'function Get-NotifyPaseoRouteReadyState[\s\S]{0,1800}Stop-Process' -or $commonText -match 'function Invoke-NotifyPaseoCloseByNotificationId[\s\S]{0,1200}taskkill') {
     throw 'Paseo health/close helpers must remain side-effect free (no env mutation / process kill).'
 }
-if ($brokerText -match "OriginKind -eq 'paseo'[\s\S]{0,200}Windows Terminal" -or $activateText -match "originKind -eq 'paseo'[\s\S]{0,120}pi-web") {
-    throw 'Paseo activation branches must not fall through into terminal/Pi Web routing.'
+if ($brokerText -match 'Invoke-NotifyTerminalRouteActivate' -or $popupText -match 'Invoke-NotifyTerminalRouteActivate' -or $activateText -match 'Invoke-NotifyTerminalRouteActivate' -or $activationText -notmatch 'if \(\$origin -eq ''paseo''\)[\s\S]{0,1200}elseif \(\$origin -eq ''pi-web''\)' -or $activateText -notmatch 'if \(\$originKind -eq ''paseo''\) \{[\s\S]{0,5000}exit 1\s*\}\s*if \(\$originKind -eq ''pi-web''\)') {
+    throw 'Paseo activation must remain coordinator-owned and fail closed before Pi Web/Terminal routing.'
 }
 foreach ($requiredRuntimeName in @('paseo-desktop-route.ps1', 'set-paseo-desktop-routing.ps1', 'set-paseo-built-in-notifications.ps1')) {
     if ($refreshText -notmatch [regex]::Escape($requiredRuntimeName) -or $windowsInstallText -notmatch [regex]::Escape($requiredRuntimeName) -or $restartText -notmatch [regex]::Escape($requiredRuntimeName) -or $remoteInstallText -notmatch [regex]::Escape($requiredRuntimeName)) {
@@ -635,8 +692,8 @@ if ($checkText -match $checkInvokePattern -or $checkText -match $checkStartPatte
     throw 'pi-notify-check must not invoke Paseo built-in notification helper.'
 }
 
-if ($activateText -notmatch 'focus-ambiguous' -or $activateText -notmatch '\$eligibleCount -gt 1') {
-    throw 'System-toast activation must reject ambiguous required-title/cwd candidates instead of selecting the first tab.'
+if ($activateText -notmatch 'New-NotifyActivationRequest' -or $activateText -notmatch '-CwdBase \$cwdBase' -or $activateText -notmatch '-TabTitle \$tabTitle' -or $activateText -notmatch 'Invoke-NotifyActivationStrategy' -or $terminalRouteText -notmatch "Result\s*=\s*'ambiguous'") {
+    throw 'System-toast activation must pass exact title/cwd metadata to the shared strategy, which rejects ambiguous candidates.'
 }
 if ($listenerText -notmatch '\$maxBodyBytes\s*=\s*65536' -or $listenerText -notmatch '\$contentLength -gt \$maxBodyBytes' -or $listenerText -notmatch 'HTTP request body too large') {
     throw 'Listener Read-HttpRequest must cap request bodies to avoid memory/connection abuse.'
@@ -650,8 +707,8 @@ if ($listenerText -notmatch 'Get-NotifyCommandLineArgument' -or $listenerText -n
 if ($listenerText -notmatch 'NotifyActivationCleanupTimers' -or $listenerText -notmatch 'TimerCallback' -or $listenerText -notmatch '\[TimeSpan\]::FromSeconds\(\$ttl\)' -or $listenerText -match 'Register-ObjectEvent' -or $listenerText -match 'system-toast-activation-events-unavailable') {
     throw 'System-toast activation must use protocol activation plus bounded cache timers; do not attempt unsupported PS5 WinRT event subscriptions.'
 }
-if ($activateText -notmatch 'Resolve-NotifyActivationState' -or $activateText -notmatch 'ProtectedData\]::Unprotect' -or $activateText -notmatch 'Get-NotifyQueryValue -ParsedUri \$parsedUri -Name ''id''' -or $activateText -notmatch '\$keywords = @\(\$tabTitle, \$cwdBase, \$targetHost\) \| Where-Object') {
-    throw 'Activate script must resolve nonce-only system-toast activation ids and filter empty focus keywords before UI Automation binding.'
+if ($activateText -notmatch 'Resolve-NotifyActivationState' -or $activateText -notmatch 'ProtectedData\]::Unprotect' -or $activateText -notmatch 'Get-NotifyQueryValue -ParsedUri \$parsedUri -Name ''id''' -or $activateText -notmatch 'New-NotifyActivationRequest' -or $activateText -notmatch 'ConvertTo-NotifyActivationUiOutcome' -or $activateText -match 'AutomationElement|Get-NotifyTerminalWindowSnapshots') {
+    throw 'Activate script must resolve nonce-only toast state and delegate all Terminal UI Automation to the shared coordinator.'
 }
 if ($commonText -notmatch 'function Register-NotifyBridgeSystemToastSupport' -or $commonText -notmatch 'Register-NotifyBridgeProtocolHandler' -or $commonText -notmatch 'Register-NotifyBridgeToastShortcut' -or $commonText -notmatch 'SHGetPropertyStoreFromParsingName' -or $commonText -notmatch 'New-Object -ComObject WScript.Shell' -or $commonText -notmatch 'Pi Remote\.lnk' -or $commonText -match 'Get-Command python') {
     throw 'Common must expose one shared setup path for system-toast protocol handler and Pi Remote toast shortcut/AUMID.'
@@ -719,17 +776,23 @@ if ($refreshText -match 'origin master' -or $refreshText -notmatch 'rev-parse --
 if ($refreshText -notmatch '\$runtimeFiles' -or $refreshText -notmatch 'GetFullPath\(\$source\)' -or $refreshText -notmatch 'GetFullPath\(\$destination\)') {
     throw 'Refresh runtime sync must use a runtime file list with same-path skip so it works from the runtime bin.'
 }
-foreach ($requiredRuntimeName in @('NotifyBridge.Process.ps1', 'NotifyBridge.Remote.ps1', 'pi-notify-ensure.mjs', 'remote-windows-notify.ts', 'popup-wallpaper.png', 'install-remote-windows-notify.ps1', 'install-linux-autostart.ps1', 'install-windows-autostart.ps1', 'install-autostart-all.ps1', 'pi-notify-check.ps1', 'pi-notify-hotkey.ps1', 'pi-notify-broker.ps1', 'pi-notify-qq-sender.ps1')) {
+foreach ($requiredRuntimeName in @('NotifyBridge.Process.ps1', 'NotifyBridge.Remote.ps1', 'terminal-route.ps1', 'NotifyBridge.Activation.ps1', 'pi-notify-ensure.mjs', 'remote-windows-notify.ts', 'popup-wallpaper.png', 'install-remote-windows-notify.ps1', 'install-linux-autostart.ps1', 'install-windows-autostart.ps1', 'install-autostart-all.ps1', 'pi-notify-check.ps1', 'pi-notify-hotkey.ps1', 'pi-notify-broker.ps1', 'pi-notify-qq-sender.ps1')) {
     if ($refreshText -notmatch [regex]::Escape($requiredRuntimeName) -or $autostartAllText -match 'unused-never-match') {
         throw ('Refresh runtime sync must copy required file: {0}' -f $requiredRuntimeName)
     }
     if ($windowsInstallText -notmatch [regex]::Escape($requiredRuntimeName)) {
         throw ('Windows autostart installer must copy required runtime file: {0}' -f $requiredRuntimeName)
     }
+    if ($restartText -notmatch [regex]::Escape($requiredRuntimeName)) {
+        throw ('Restart runtime sync must copy required file: {0}' -f $requiredRuntimeName)
+    }
+    if ($remoteInstallText -notmatch [regex]::Escape($requiredRuntimeName)) {
+        throw ('Remote installer must copy required runtime file: {0}' -f $requiredRuntimeName)
+    }
 }
 $runtimeBin = Join-Path $runtimeBaseDir 'bin'
 if (Test-Path -LiteralPath $runtimeBin) {
-    foreach ($requiredRuntimeName in @('NotifyBridge.Process.ps1', 'NotifyBridge.Remote.ps1', 'pi-notify-ensure.mjs', 'remote-windows-notify.ts', 'popup-wallpaper.png', 'install-remote-windows-notify.ps1', 'install-linux-autostart.ps1', 'install-windows-autostart.ps1', 'install-autostart-all.ps1', 'pi-notify-check.ps1', 'pi-notify-hotkey.ps1', 'pi-notify-broker.ps1', 'pi-notify-qq-sender.ps1')) {
+    foreach ($requiredRuntimeName in @('NotifyBridge.Process.ps1', 'NotifyBridge.Remote.ps1', 'terminal-route.ps1', 'NotifyBridge.Activation.ps1', 'pi-notify-ensure.mjs', 'remote-windows-notify.ts', 'popup-wallpaper.png', 'install-remote-windows-notify.ps1', 'install-linux-autostart.ps1', 'install-windows-autostart.ps1', 'install-autostart-all.ps1', 'pi-notify-check.ps1', 'pi-notify-hotkey.ps1', 'pi-notify-broker.ps1', 'pi-notify-qq-sender.ps1')) {
         if (-not (Test-Path -LiteralPath (Join-Path $runtimeBin $requiredRuntimeName))) {
             throw ('Runtime bin is missing required file: {0}' -f $requiredRuntimeName)
         }
@@ -876,8 +939,14 @@ if ($null -ne $cfg -and -not [string]::IsNullOrWhiteSpace([string]$cfg.remoteHos
         $false
     }
     $expectedPaseoLeaseGateJs = if ($expectedPaseoLeaseGate) { 'true' } else { 'false' }
-    $remoteGateScript = 'const fs=require("fs");const p=process.env.HOME+"/.local/share/pi-notify/remote-windows-notify.json";const d=JSON.parse(fs.readFileSync(p,"utf8"));const actual=d.paseoLeaseGateEnabled===true;if(actual!==' + $expectedPaseoLeaseGateJs + ')process.exit(41);console.log("OK paseo lease gate enabled="+actual);'
-    $remoteCommand = 'node_exe="$(command -v node)" && "$node_exe" "$HOME/.local/share/pi-notify/pi-notify-ensure.mjs" --check --managed-dir "$HOME/.local/share/pi-notify" && "$node_exe" -e ' + (ConvertTo-NotifyBridgeRemoteShellLiteral -Value $remoteGateScript)
+    $expectedPiWebInstanceKey = Resolve-NotifyBridgePiWebInstanceKey `
+        -InstanceKey '' `
+        -RouteConfigPath ''
+    $expectedPiWebEnabled = -not [string]::IsNullOrWhiteSpace($expectedPiWebInstanceKey)
+    $expectedPiWebEnabledJs = if ($expectedPiWebEnabled) { 'true' } else { 'false' }
+    $expectedPiWebInstanceFp = Get-NotifyRouteFingerprint -Value $expectedPiWebInstanceKey
+    $remoteConfigScript = 'const fs=require("fs"),crypto=require("crypto");const p=process.env.HOME+"/.local/share/pi-notify/remote-windows-notify.json";const d=JSON.parse(fs.readFileSync(p,"utf8"));const gate=d.paseoLeaseGateEnabled===true;if(gate!==' + $expectedPaseoLeaseGateJs + ')process.exit(41);const route=d.originKind==="pi-web";if(route!==' + $expectedPiWebEnabledJs + ')process.exit(42);const key=typeof d.instanceKey==="string"?d.instanceKey:"";const fp=key?crypto.createHash("sha256").update(key).digest("hex").slice(0,16):"";if(fp!=="' + $expectedPiWebInstanceFp + '")process.exit(43);console.log("OK paseo lease gate enabled="+gate);console.log("OK pi web route enabled="+route+" instanceFp="+(fp||"none"));'
+    $remoteCommand = 'node_exe="$(command -v node)" && "$node_exe" "$HOME/.local/share/pi-notify/pi-notify-ensure.mjs" --check --managed-dir "$HOME/.local/share/pi-notify" && "$node_exe" -e ' + (ConvertTo-NotifyBridgeRemoteShellLiteral -Value $remoteConfigScript)
     $remoteArgs = Join-NotifyBridgeProcessArguments @(
         '-T',
         '-o', 'BatchMode=yes',
@@ -911,8 +980,9 @@ if ($null -ne $cfg -and -not [string]::IsNullOrWhiteSpace([string]$cfg.remoteHos
     $remoteExitCodeText = ''
     try { $remoteExitCodeText = [string]$remoteProcess.ExitCode } catch { $remoteExitCodeText = '' }
     $remoteGateSuccess = $remoteText -match (('(?m)^OK paseo lease gate enabled={0}\s*$' -f $expectedPaseoLeaseGateJs))
-    $remoteSuccessByOutput = ($remoteText -match '^OK Pi notify bridge verified mode=(package|standalone) packageCopies=\d+ active=' -and $remoteText -notmatch '(?m)^BAD ' -and $remoteGateSuccess)
-    if (($remoteExitCodeText -eq '0' -and $remoteGateSuccess) -or $remoteSuccessByOutput) {
+    $remoteRouteSuccess = $remoteText -match (('(?m)^OK pi web route enabled={0} instanceFp={1}\s*$' -f $expectedPiWebEnabledJs, $(if ([string]::IsNullOrWhiteSpace($expectedPiWebInstanceFp)) { 'none' } else { $expectedPiWebInstanceFp })))
+    $remoteSuccessByOutput = ($remoteText -match '^OK Pi notify bridge verified mode=(package|standalone) packageCopies=\d+ active=' -and $remoteText -notmatch '(?m)^BAD ' -and $remoteGateSuccess -and $remoteRouteSuccess)
+    if (($remoteExitCodeText -eq '0' -and $remoteGateSuccess -and $remoteRouteSuccess) -or $remoteSuccessByOutput) {
         $remoteOutput | ForEach-Object { Write-Host $_ }
     }
     else {

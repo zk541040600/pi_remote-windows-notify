@@ -76,6 +76,16 @@ forbidPattern(
   /-RemotePath \$remoteExtensionPath/,
   "remote installer must delegate active-entry ownership to pi-notify-ensure.mjs",
 );
+requirePattern(
+  remoteInstall,
+  /Resolve-NotifyBridgePiWebInstanceKey[\s\S]*New-NotifyBridgeRemoteConfig/,
+  "remote installer must project the authoritative PiWebDesktop instance key into Linux config",
+);
+forbidPattern(
+  remoteInstall,
+  /\$remoteConfig\s*=\s*@\{/,
+  "remote installer must not bypass the shared Pi Web remote-config builder",
+);
 
 const windowsCheck = read("windows/pi-notify-check.ps1");
 requirePattern(windowsCheck, /pi-notify-ensure\.mjs["']?\s+--check/, "Windows check must invoke read-only ownership verification");
@@ -86,6 +96,11 @@ requirePattern(windowsCheck, /promptUnsubscribe\\\(\\\)/, "Windows check must re
 requirePattern(windowsCheck, /function Test-NotifyRecentLogEntry/, "Windows check must age out historical runtime repair logs");
 requirePattern(windowsCheck, /\$recentLogCutoff = \(Get-Date\)\.AddMinutes\(-10\)/, "Windows check must use a bounded runtime log window");
 requirePattern(windowsCheck, /pi-notify-qq-sender\.ps1/, "Windows check must cover the QQ worker runtime file");
+requirePattern(
+  windowsCheck,
+  /expectedPiWebInstanceKey[\s\S]*OK pi web route enabled=/,
+  "Windows check must compare authoritative PiWebDesktop identity with remote runtime config",
+);
 
 const common = read("windows/NotifyBridge.Common.ps1");
 for (const field of ["qqNotifyEnabled", "qqNodeExecutable", "qqSenderScript", "qqSendTimeoutSeconds", "qqMaxConcurrent"]) {

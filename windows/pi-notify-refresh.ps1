@@ -285,6 +285,8 @@ Write-Host "[3/7] sync runtime files..."
 New-Item -ItemType Directory -Force -Path $binDir | Out-Null
 $runtimeFiles = @(
     'NotifyBridge.Common.ps1',
+    'terminal-route.ps1',
+    'NotifyBridge.Activation.ps1',
     'paseo-desktop-route.ps1',
     'set-paseo-desktop-routing.ps1',
     'set-paseo-built-in-notifications.ps1',
