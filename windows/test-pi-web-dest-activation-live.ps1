@@ -13,9 +13,10 @@ $ErrorActionPreference = 'Stop'
 # Live, user-state-preserving Dest App regression test.
 #
 # The default invocation is a dry run. -ConfirmLive creates broker-only test
-# popups and activates them automatically, but it never starts, stops, or
-# restarts PiWebDesktop and never deletes WebView/session data. The initially
-# selected session is restored in finally through the same exact-route path.
+# popups and waits for a physical click on each accepted activation round; it
+# never starts, stops, or restarts PiWebDesktop and never deletes WebView/session
+# data. The initially selected session is restored in finally through the same
+# exact-route path.
 
 $script:FailureCode = ''
 $script:FailureKinds = [System.Collections.Generic.List[string]]::new()
@@ -781,16 +782,6 @@ function Get-CapturedRowRoutingFingerprints {
     return @($captured)
 }
 
-function Test-CapturedRowEvidence {
-    param(
-        [Parameter(Mandatory = $true)][string]$RoutingFingerprint,
-        [Parameter(Mandatory = $true)][long]$DocumentGeneration
-    )
-
-    return @(Get-CapturedRowRoutingFingerprints `
-        -DocumentGeneration $DocumentGeneration) -contains $RoutingFingerprint
-}
-
 function Invoke-LiveExactActivation {
     param(
         [Parameter(Mandatory = $true)]$Target,
@@ -808,7 +799,9 @@ function Invoke-LiveExactActivation {
             Failures = $failures.ToArray(); PopupId = ''; NotificationFp = ''
             RoutingFp = [string]$Target.RoutingFingerprint
             BeforeDocumentGeneration = -1; AfterDocumentGeneration = -1
-            RowClickReceiptCount = 0; HistoryReceiptCount = 0
+            PhysicalPopupClickCount = 0; ActivationCommandCount = 0
+            BindingSnapshotCount = 0; RetainedHistorySnapshotCount = 0
+            HistoryReceiptCount = 0
             SessionGetProofCount = 0; ExplicitOpenEventCount = 0
             NavigationStartingCount = 0; FreshFallbackCount = 0
             BindingCountBefore = 0; BindingCountAfter = 0
@@ -827,13 +820,9 @@ function Invoke-LiveExactActivation {
     $surfaceBefore = Get-BindingSurfaceInvariant
     if ($null -eq $bindingBefore) { [void]$failures.Add('TARGET_BINDING_MISSING_BEFORE') }
 
-    if (-not $RestorationOnly -and
-        -not (Test-CapturedRowEvidence `
-            -RoutingFingerprint ([string]$Target.RoutingFingerprint) `
-            -DocumentGeneration $beforeGeneration)) {
-        [void]$failures.Add('TARGET_ROW_WEAKREF_NOT_EVIDENCED')
-    }
-
+    # Captured evidence proves only that the target previously acquired an
+    # authenticated row/history binding in this document. It does not require
+    # that the row is still live when the activation command is issued.
     $popup = New-ExactRoutePopup `
         -Target $Target `
         -StackIndex $StackIndex `
@@ -847,7 +836,9 @@ function Invoke-LiveExactActivation {
             RoutingFp = [string]$Target.RoutingFingerprint
             BeforeDocumentGeneration = $beforeGeneration
             AfterDocumentGeneration = $beforeGeneration
-            RowClickReceiptCount = 0; HistoryReceiptCount = 0
+            PhysicalPopupClickCount = 0; ActivationCommandCount = 0
+            BindingSnapshotCount = 0; RetainedHistorySnapshotCount = 0
+            HistoryReceiptCount = 0
             SessionGetProofCount = 0; ExplicitOpenEventCount = 0
             NavigationStartingCount = 0; FreshFallbackCount = 0
             BindingCountBefore = 0; BindingCountAfter = 0
@@ -857,12 +848,29 @@ function Invoke-LiveExactActivation {
     }
 
     $sampleCountBefore = $script:IdentitySamples
-    $clickAtUtc = [DateTime]::UtcNow
-    if (-not (Invoke-BrokerRequest -Method POST -Path '/close' -Payload @{
-        popupId = [string]$popup.PopupId
-        activate = $true
-    })) {
-        [void]$failures.Add('BROKER_CLICK_FAILED')
+    $clickDeadline = [DateTime]::UtcNow.AddSeconds($ActivationTimeoutSeconds)
+    $clickAtUtc = [DateTime]::MinValue
+    do {
+        $brokerLines = @(Get-BrokerLines | Where-Object {
+            $_ -match ('\bpopupId=' + [regex]::Escape([string]$popup.PopupId) + '\b')
+        })
+        $popupClicks = @($brokerLines | Where-Object {
+            $_ -match ('broker-popup-click\s+popupId=' +
+                [regex]::Escape([string]$popup.PopupId) + '\b')
+        })
+        if ($popupClicks.Count -gt 1) {
+            [void]$failures.Add('PHYSICAL_POPUP_CLICK_COUNT_INVALID')
+            break
+        }
+        if ($popupClicks.Count -eq 1) {
+            $clickAtUtc = ConvertTo-BrokerLineUtc -Line $popupClicks[0]
+            break
+        }
+        Start-Sleep -Milliseconds $SampleIntervalMilliseconds
+    } while ([DateTime]::UtcNow -lt $clickDeadline)
+    if ($clickAtUtc -eq [DateTime]::MinValue) {
+        [void]$failures.Add('PHYSICAL_POPUP_CLICK_MISSING')
+        $clickAtUtc = [DateTime]::UtcNow
     }
 
     $deadline = [DateTime]::UtcNow.AddSeconds($ActivationTimeoutSeconds)
@@ -886,9 +894,8 @@ function Invoke-LiveExactActivation {
             (Test-EventField -EventRecord $_ -Name 'notificationFp' `
                 -Expected ([string]$popup.NotificationFingerprint))
         }).Count -gt 0
-        # A focused popup closes before the exact GET proof by design. Keep the
-        # live verifier attached to the independent Desktop terminal chain so
-        # early UX completion can never be mistaken for final route success.
+        # The popup must remain open through progress and close only after the
+        # same activation request reaches its Desktop terminal result.
         if ($closedObserved -and $adapterCompleteObserved) { break }
         Start-Sleep -Milliseconds $SampleIntervalMilliseconds
     } while ([DateTime]::UtcNow -lt $deadline)
@@ -939,6 +946,20 @@ function Invoke-LiveExactActivation {
     } else {
         ''
     }
+    $bindingSnapshots = @($events | Where-Object {
+        [string]$_.eventName -eq 'route-row-binding-diagnostic' -and
+        (Test-EventField $_ 'accepted' $true) -and
+        (Test-EventField $_ 'phase' 'activation-snapshot') -and
+        (Test-EventField $_ 'requestFp' $rowRequestFp) -and
+        (Test-EventField $_ 'activationFp' $activationFp) -and
+        (Test-EventField $_ 'requestMatchesActiveRow' $true) -and
+        (ConvertTo-EventUtc -EventRecord $_) -ge $readyUtc -and
+        (Test-EventField $_ 'targetFp' $routingFp)
+    })
+    $retainedHistorySnapshots = @($bindingSnapshots | Where-Object {
+        -not (Test-EventField $_ 'targetRowState' 'verified') -and
+        (Test-EventField $_ 'targetHistoryState' 'retained')
+    })
     $history = @($events | Where-Object {
         [string]$_.eventName -eq 'route-row-activation-result' -and
         (Test-EventField $_ 'accepted' $true) -and
@@ -1021,28 +1042,24 @@ function Invoke-LiveExactActivation {
         $confirmedUtc -le $acknowledgedUtc -and
         $acknowledgedUtc -le $completedUtc
 
-    $fallbacks = @($events | Where-Object {
-        [string]$_.eventName -eq 'route-row-activation-fallback' -and
+    # Notification activation never fresh-navigates and never falls back to a
+    # fresh document. An accepted round must show zero native navigation
+    # starting events and zero fail-closed rejection records: only the exact
+    # verified row or the exact retained Navigation entry may drive selection.
+    $failClosedEvents = @($events | Where-Object {
+        [string]$_.eventName -eq 'route-activation-fail-closed' -and
         (Test-EventField $_ 'routingFp' $routingFp)
     })
-    $fallbackReasons = @($fallbacks | ForEach-Object {
-        if ($_.fields.PSObject.Properties['reason']) {
-            [string]$_.fields.reason
-        }
+    $failClosedChecks = @($events | Where-Object {
+        [string]$_.eventName -eq 'route-row-activation-fail-closed-check' -and
+        (Test-EventField $_ 'routingFp' $routingFp)
     })
-    $invalidFallback = @($fallbackReasons | Where-Object {
-        $_ -ne 'row-unavailable-source-unchanged'
-    })
-    if ($fallbacks.Count -gt 1 -or $invalidFallback.Count -gt 0) {
-        [void]$failures.Add('FRESH_NAV_FALLBACK_POLICY_VIOLATION')
-    }
 
     $navigationStarts = @($events | Where-Object {
         [string]$_.eventName -eq 'route-navigation-starting'
     })
-    if (($fallbacks.Count -eq 0 -and $navigationStarts.Count -gt 0) -or
-        ($fallbacks.Count -eq 1 -and $navigationStarts.Count -ne 1)) {
-        [void]$failures.Add('FRESH_NAV_FALLBACK_COUNT_INVALID')
+    if ($navigationStarts.Count -ne 0) {
+        [void]$failures.Add('FRESH_DOCUMENT_NAVIGATION_OBSERVED')
     }
     $documentReady = @($events | Where-Object {
         [string]$_.eventName -eq 'route-document-ready' -and
@@ -1072,7 +1089,6 @@ function Invoke-LiveExactActivation {
             [regex]::Escape([string]$popup.PopupId) +
             '\s+mode=activate\s+decision=handled\s+result=session-url-confirmed\b')
     })
-    $workerComplete = @($workerFocused + $workerHandled)
     $terminalFocused = @($brokerLines | Where-Object {
         $_ -match ('broker-popup-terminal\s+popupId=' +
             [regex]::Escape([string]$popup.PopupId) +
@@ -1083,7 +1099,6 @@ function Invoke-LiveExactActivation {
             [regex]::Escape([string]$popup.PopupId) +
             '\s+outcome=handled\b')
     })
-    $terminal = @($terminalFocused + $terminalHandled)
     $closed = @($brokerLines | Where-Object {
         $_ -match ('broker-closed\s+popupId=' +
             [regex]::Escape([string]$popup.PopupId) + '\b')
@@ -1110,19 +1125,23 @@ function Invoke-LiveExactActivation {
     if ($completed.Count -ne 1) { [void]$failures.Add('POLL_COMPLETE_COUNT_INVALID') }
     if ($focus.Count -ne 1) { [void]$failures.Add('FOCUS_RECEIPT_MISSING') }
     if ($feedback.Count -ne 1) { [void]$failures.Add('BROKER_READY_WATCHDOG_INVALID') }
-    if ($workerComplete.Count -ne 1) { [void]$failures.Add('BROKER_FOCUSED_OR_HANDLED_COUNT_INVALID') }
-    if ($terminal.Count -ne 1) { [void]$failures.Add('BROKER_TERMINAL_COUNT_INVALID') }
+    if ($workerFocused.Count -ne 0) { [void]$failures.Add('BROKER_FOCUSED_PROGRESS_REPORTED_AS_COMPLETE') }
+    if ($workerHandled.Count -ne 1) { [void]$failures.Add('BROKER_HANDLED_FINAL_COUNT_INVALID') }
+    if ($terminalFocused.Count -ne 0) { [void]$failures.Add('BROKER_FOCUSED_TERMINAL_OBSERVED') }
+    if ($terminalHandled.Count -ne 1) { [void]$failures.Add('BROKER_HANDLED_TERMINAL_COUNT_INVALID') }
     if ($closed.Count -ne 1) { [void]$failures.Add('BROKER_CLOSE_COUNT_INVALID') }
 
     if (-not $RestorationOnly) {
-        if ($rowIssued.Count -ne 1) { [void]$failures.Add('ROW_CLICK_RECEIPT_MISSING') }
+        if ($rowIssued.Count -ne 1) { [void]$failures.Add('ACTIVATION_COMMAND_RECEIPT_MISSING') }
+        if ($bindingSnapshots.Count -ne 1) { [void]$failures.Add('ACTIVATION_BINDING_SNAPSHOT_INVALID') }
         if ($history.Count -lt 1) { [void]$failures.Add('SAME_DOCUMENT_HISTORY_TARGET_MISSING') }
         if ($proof.Count -ne 1) { [void]$failures.Add('EXACT_SESSION_GET_PROOF_MISSING') }
         if ($committed.Count -ne 1) { [void]$failures.Add('ROW_ACTIVATION_COMMIT_MISSING') }
         if (-not $activationEventOrderValid) {
             [void]$failures.Add('ACTIVATION_EVENT_ORDER_INVALID')
         }
-        if ($fallbacks.Count -ne 0) { [void]$failures.Add('UNEXPECTED_FRESH_NAV_FALLBACK') }
+        if ($failClosedEvents.Count -ne 0) { [void]$failures.Add('UNEXPECTED_FAIL_CLOSED_ACTIVATION') }
+        if ($failClosedChecks.Count -ne 0) { [void]$failures.Add('ROW_ACTIVATION_FAIL_CLOSED_CHECKED') }
         if ($navigationStarts.Count -ne 0) { [void]$failures.Add('FRESH_DOCUMENT_NAVIGATION_OBSERVED') }
         if ($documentReady.Count -ne 0) { [void]$failures.Add('NEW_DOCUMENT_READY_OBSERVED') }
         if ($beforeGeneration -ne $afterGeneration) {
@@ -1162,13 +1181,9 @@ function Invoke-LiveExactActivation {
         $popupElapsedMs = [int]((ConvertTo-BrokerLineUtc -Line $closed[-1]) -
             $clickAtUtc).TotalMilliseconds
     }
-    if ($workerFocused.Count -eq 1 -and
-        ($popupElapsedMs -lt 0 -or $popupElapsedMs -gt 2000)) {
-        [void]$failures.Add('FOCUSED_POPUP_CLOSE_EXCEEDED_2S')
-    }
-
     $handled = $confirmed.Count -eq 1 -and
-        $workerComplete.Count -eq 1 -and
+        $workerHandled.Count -eq 1 -and
+        $terminalHandled.Count -eq 1 -and
         $closed.Count -eq 1
     return [pscustomobject]@{
         Step                       = $StepName
@@ -1180,20 +1195,25 @@ function Invoke-LiveExactActivation {
         RoutingFp                  = $routingFp
         BeforeDocumentGeneration   = $beforeGeneration
         AfterDocumentGeneration    = $afterGeneration
-        RowClickReceiptCount       = $rowIssued.Count
+        PhysicalPopupClickCount     = $popupClicks.Count
+        ActivationCommandCount     = $rowIssued.Count
+        BindingSnapshotCount       = $bindingSnapshots.Count
+        RetainedHistorySnapshotCount = $retainedHistorySnapshots.Count
         HistoryReceiptCount        = $history.Count
         SessionGetProofCount       = $proof.Count
         ExplicitOpenEventCount     = $explicitOpenEvents.Count
         NavigationStartingCount    = $navigationStarts.Count
-        FreshFallbackCount         = $fallbacks.Count
+        FreshFallbackCount         = 0
         BindingCountBefore         = $surfaceBefore.Count
         BindingCountAfter          = $surfaceAfter.Count
         IdentitySamples            = $script:IdentitySamples - $sampleCountBefore
         ElapsedMs                  = $elapsedMs
         PopupElapsedMs             = $popupElapsedMs
-        PopupOutcome               = if ($workerFocused.Count -eq 1) {
+        PopupOutcome               = if ($terminalHandled.Count -eq 1) {
+            'handled'
+        } elseif ($terminalFocused.Count -eq 1) {
             'focused'
-        } else { 'handled' }
+        } else { '' }
     }
 }
 
@@ -1334,8 +1354,8 @@ function Get-SafeRouteEvidence {
         'route-row-activation-progress',
         'activate-progress-result',
         'route-row-activation-committed',
-        'route-row-activation-fallback-check',
-        'route-row-activation-fallback',
+        'route-row-activation-fail-closed-check',
+        'route-activation-fail-closed',
         'route-history-changed',
         'route-session-proof',
         'route-navigation-starting',
@@ -1622,8 +1642,9 @@ try {
     }
     $script:OriginalBindingSurfaceInvariant = Get-BindingSurfaceInvariant
 
-    # Fail before creating any popup unless both directions have a row that was
-    # verified by a real sidebar intent plus its exact API proof in this document.
+    # Targets must have been authenticated earlier in this document. Their live
+    # row may later disconnect; the activation snapshot decides whether the
+    # accepted round used a verified row or a retained Navigation entry.
     $capturedRoutingFingerprints = @(Get-CapturedRowRoutingFingerprints `
         -DocumentGeneration ([long]$initialState.DocumentGeneration))
     if ($capturedRoutingFingerprints -notcontains
@@ -1674,7 +1695,10 @@ try {
         desktopHwnd               = ('0x{0:X}' -f $script:DesktopHwnd)
         beforeDocumentGeneration  = $first.BeforeDocumentGeneration
         afterDocumentGeneration   = $first.AfterDocumentGeneration
-        rowClickReceiptCount      = $first.RowClickReceiptCount
+        physicalPopupClickCount   = $first.PhysicalPopupClickCount
+        activationCommandCount    = $first.ActivationCommandCount
+        bindingSnapshotCount      = $first.BindingSnapshotCount
+        retainedHistorySnapshotCount = $first.RetainedHistorySnapshotCount
         historyReceiptCount       = $first.HistoryReceiptCount
         sessionGetProofCount      = $first.SessionGetProofCount
         explicitOpenEventCount    = $first.ExplicitOpenEventCount
@@ -1703,7 +1727,10 @@ try {
             desktopHwnd               = ('0x{0:X}' -f $script:DesktopHwnd)
             beforeDocumentGeneration  = $second.BeforeDocumentGeneration
             afterDocumentGeneration   = $second.AfterDocumentGeneration
-            rowClickReceiptCount      = $second.RowClickReceiptCount
+            physicalPopupClickCount   = $second.PhysicalPopupClickCount
+            activationCommandCount    = $second.ActivationCommandCount
+            bindingSnapshotCount      = $second.BindingSnapshotCount
+            retainedHistorySnapshotCount = $second.RetainedHistorySnapshotCount
             historyReceiptCount       = $second.HistoryReceiptCount
             sessionGetProofCount      = $second.SessionGetProofCount
             explicitOpenEventCount    = $second.ExplicitOpenEventCount
@@ -1718,6 +1745,15 @@ try {
     }
     else {
         Add-FailureKind -Code 'SECOND_ACTIVATION_SKIPPED_AFTER_UNHANDLED_FIRST'
+    }
+
+    if ($script:ActivationResults.Count -ne 2) {
+        Add-FailureKind -Code 'TWO_ACCEPTED_ACTIVATION_ROUNDS_REQUIRED'
+    }
+    elseif (@($script:ActivationResults | Where-Object {
+        $_.RetainedHistorySnapshotCount -eq 1
+    }).Count -lt 1) {
+        Add-FailureKind -Code 'RETAINED_HISTORY_ROUND_MISSING'
     }
 
     $stateBeforeTiming = Get-LatestStableRouteState -WaitSeconds 3

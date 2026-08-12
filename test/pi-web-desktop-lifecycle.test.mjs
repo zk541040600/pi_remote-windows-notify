@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { test } from "node:test";
 
 const mainFormPath = new URL(
@@ -16,6 +16,10 @@ const appPathsPath = new URL(
 );
 const rowActivationPath = new URL(
   "../../IggToolsL2/tools/pi-web-desktop/SessionRowActivationTransaction.cs",
+  import.meta.url,
+);
+const programmaticNavigationPath = new URL(
+  "../../IggToolsL2/tools/pi-web-desktop/ProgrammaticSessionNavigationTransaction.cs",
   import.meta.url,
 );
 const routeAdapterPath = new URL(
@@ -67,7 +71,7 @@ test("PiWebDesktop durable route outboxes are Windows login-session local", () =
   );
 });
 
-test("PiWebDesktop notification routing reuses a verified live sidebar row", () => {
+test("PiWebDesktop notification routing uses verified same-document row or history only", () => {
   const source = readFileSync(mainFormPath, "utf8");
   const transaction = readFileSync(rowActivationPath, "utf8");
 
@@ -94,17 +98,28 @@ test("PiWebDesktop notification routing reuses a verified live sidebar row", () 
   assert.match(source, /navigationApi\.entries\(\)/);
   assert.match(source, /nativeTraverseTo\(historyRecord\.key/);
   assert.match(source, /info===activation\.navigationInfo/);
-  assert.match(source, /beginProvisionalHistoryEntryRebind\(target,method\)/);
+  assert.match(source, /beginProvisionalHistoryEntryRebind\(target,effectiveMethod\)/);
   assert.match(source, /finishProvisionalHistoryEntryRebind\(/);
   assert.match(source, /currentProvisionalHistoryEntry\(/);
   assert.match(source, /proof\.requestGestureSeq===lastCommittedUserGestureSeq/);
   assert.match(source, /proof\.requestGestureSeq===gestureSequence/);
-  assert.match(source, /beginHistoryEntryRebind\(activation,target,method\)/);
+  assert.match(source, /beginHistoryEntryRebind\(activation,target,effectiveMethod\)/);
   assert.match(source, /finishHistoryEntryRebind\(activation\)/);
   assert.match(source, /activation\.finished=true;emitDeferredHistoryApiProof/);
   assert.match(source, /traverse-correlation-timeout/);
   assert.match(source, /RowActivationHistoryBudgetMs/);
-  assert.match(source, /reason = "current-source-is-target"/);
+  assert.match(source, /LogRouteEvent\("route-activation-fail-closed"/);
+  assert.match(source, /reason = rowActivationOutcome ==[\s\S]*"row-and-history-unavailable"/);
+  assert.match(transaction, /IsUnavailableWithoutMutation/);
+  assert.doesNotMatch(transaction, /CanFallback/);
+  assert.doesNotMatch(source, /route-row-activation-fallback/);
+  assert.doesNotMatch(source, /route-activation-navigation-issued/);
+  assert.doesNotMatch(source, /new ProgrammaticSessionNavigationTransaction/);
+  assert.equal(
+    existsSync(programmaticNavigationPath),
+    false,
+    "notification fresh-navigation transaction must not remain in the shipped Desktop source",
+  );
   assert.match(
     source,
     /activation\.navigateSeen[\s\S]*activation\.committed[\s\S]*activation\.entryEventSeen/,
@@ -362,6 +377,29 @@ test("live Dest activation evidence strips PowerShell provider metadata", () => 
     /\$readyUtc -le \$issuedUtc[\s\S]*\$issuedUtc -le \$historyUtc[\s\S]*\$historyUtc -le \$proofUtc[\s\S]*\$proofUtc -le \$committedUtc[\s\S]*\$committedUtc -le \$confirmedUtc[\s\S]*\$confirmedUtc -le \$acknowledgedUtc[\s\S]*\$acknowledgedUtc -le \$completedUtc/,
   );
   assert.match(source, /ACTIVATION_EVENT_ORDER_INVALID/);
-  assert.match(source, /FOCUSED_POPUP_CLOSE_EXCEEDED_2S/);
+  assert.match(source, /PHYSICAL_POPUP_CLICK_MISSING/);
+  assert.match(source, /broker-popup-click\\s\+popupId/);
+  const activationStart = source.indexOf("function Invoke-LiveExactActivation");
+  const activationEnd = source.indexOf("\nfunction ", activationStart + 1);
+  const activationContract = source.slice(
+    activationStart,
+    activationEnd > activationStart ? activationEnd : undefined,
+  );
+  assert.ok(activationStart >= 0, "missing live exact activation contract");
+  assert.doesNotMatch(activationContract, /Test-CapturedRowEvidence/);
+  assert.doesNotMatch(
+    activationContract,
+    /Invoke-BrokerRequest\s+-Method POST\s+-Path '\/close'[\s\S]{0,160}activate\s*=\s*\$true/,
+  );
+  assert.match(source, /ACTIVATION_BINDING_SNAPSHOT_INVALID/);
+  assert.match(source, /targetRowState' 'verified'/);
+  assert.match(source, /targetHistoryState' 'retained'/);
+  assert.match(source, /TWO_ACCEPTED_ACTIVATION_ROUNDS_REQUIRED/);
+  assert.match(source, /RETAINED_HISTORY_ROUND_MISSING/);
+  assert.match(source, /BROKER_HANDLED_FINAL_COUNT_INVALID/);
+  assert.match(source, /BROKER_HANDLED_TERMINAL_COUNT_INVALID/);
+  assert.match(source, /BROKER_FOCUSED_TERMINAL_OBSERVED/);
+  assert.match(source, /DOCUMENT_GENERATION_CHANGED/);
+  assert.match(source, /FreshFallbackCount\s*=\s*0/);
   assert.match(source, /'route-row-binding-diagnostic'/);
 });
