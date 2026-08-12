@@ -1960,7 +1960,10 @@ function Invoke-NotifyExactRouteActivate {
     $request = @{}
     foreach ($k in $envelope.Keys) { $request[$k] = $envelope[$k] }
 
-    $clientResult = Invoke-NotifyRouteHostClient -Request $request -WaitMs $WaitMs -TimeoutMs $TimeoutMs -Config $Config -ReturnOnProgress
+    $clientResult = Invoke-NotifyRouteHostClient -Request $request -WaitMs $WaitMs -TimeoutMs $TimeoutMs -Config $Config
+    # Wait for the terminal activation result: a focused/pending intermediate
+    # must never close the popup early (the worker/UI owner treats it as
+    # non-terminal and keeps the card in bounded pending feedback).
     return [pscustomobject]@{
         ClientResult = $clientResult
         Decision     = (Get-NotifyRouteActivateDecision -OriginKind 'pi-web' -NotificationId $NotificationId -SnapshotId $SnapshotId -ClientResult $clientResult)

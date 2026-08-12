@@ -244,6 +244,17 @@ function Get-NotifyActivationRemainingMs {
     return [int][Math]::Min([int]::MaxValue, [Math]::Ceiling($remaining))
 }
 
+# Keep Pi Web activation alive through the terminal Route Host wait without extending popup expiry.
+function Get-NotifyPiWebActivationWatchdogMs {
+    param(
+        [Parameter(Mandatory = $true)][DateTime]$ExpiresAtUtc,
+        [DateTime]$NowUtc = [DateTime]::UtcNow
+    )
+
+    $remainingMs = Get-NotifyActivationRemainingMs -ExpiresAtUtc $ExpiresAtUtc -NowUtc $NowUtc
+    return [Math]::Max(1, [Math]::Min(60000, $remainingMs))
+}
+
 # Pure UI lifecycle mapping. Does not touch WinForms controls.
 function ConvertTo-NotifyActivationUiOutcome {
     param(
@@ -301,8 +312,11 @@ function ConvertTo-NotifyActivationUiOutcome {
     }
 
     if ($decision -eq 'focused') {
+        # Focused/pending is NON-terminal: the popup must stay open in bounded
+        # pending feedback until a final result (or the original deadline)
+        # arrives. Closing here is what caused the early-close blank-page bug.
         return [pscustomobject]@{
-            Action               = 'close-focused'
+            Action               = 'keep-focused'
             Decision             = $decision
             Result               = $(if ([string]::IsNullOrWhiteSpace($result)) { 'pending' } else { $result })
             Reason               = $(if ([string]::IsNullOrWhiteSpace($reason)) { 'background-proof-pending' } else { $reason })

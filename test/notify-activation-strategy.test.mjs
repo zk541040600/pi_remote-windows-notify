@@ -137,7 +137,9 @@ function mapUiOutcome(outcome, hasDeferredActivateIntent = false) {
     return { action: "close-handled", claimFinalActivation: true };
   }
   if (decision === "focused") {
-    return { action: "close-focused", claimFinalActivation: false };
+    // Focused/pending is NON-terminal: the card must stay open in bounded
+    // pending feedback; only a final result (or the original deadline) closes it.
+    return { action: "keep-focused", claimFinalActivation: false };
   }
   if (outcome?.Retryable) {
     return { action: "restore-retryable", claimFinalActivation: false };
@@ -165,14 +167,14 @@ test("origin normalization accepts blank/terminal/paseo/pi-web and rejects unkno
   assert.doesNotMatch(activation, /originKind\s*=\s*'pi-web-desktop'/);
 });
 
-test("UI lifecycle mapping preserves ready/handled/focused/retry/unavailable semantics", () => {
+test("UI lifecycle mapping keeps focused pending non-terminal", () => {
   assert.equal(mapUiOutcome({ Decision: "ready", Result: "ready" }, false).action, "store-ready");
   assert.equal(mapUiOutcome({ Decision: "ready", Result: "ready" }, true).startActivate, true);
   assert.equal(mapUiOutcome({ Decision: "handled", Result: "activated", ProofState: "final" }).action, "close-handled");
   assert.equal(mapUiOutcome({ Decision: "handled", Result: "activated", ProofState: "final" }).claimFinalActivation, true);
   assert.equal(
     mapUiOutcome({ Decision: "focused", Result: "pending", ProofState: "pending" }).action,
-    "close-focused",
+    "keep-focused",
   );
   assert.equal(
     mapUiOutcome({ Decision: "focused", Result: "pending", ProofState: "pending" }).claimFinalActivation,
@@ -189,7 +191,8 @@ test("UI lifecycle mapping preserves ready/handled/focused/retry/unavailable sem
 
   const activation = readWindows("NotifyBridge.Activation.ps1");
   assert.match(activation, /function ConvertTo-NotifyActivationUiOutcome/);
-  assert.match(activation, /store-ready|close-handled|close-focused|restore-retryable|show-unavailable/);
+  assert.match(activation, /store-ready|close-handled|keep-focused|restore-retryable|show-unavailable/);
+  assert.doesNotMatch(activation, /close-focused/, "focused must never map to a close action");
   assert.match(activation, /ClaimFinalActivation/);
 });
 
@@ -555,14 +558,15 @@ test("safe Windows route suite directly invokes the real PowerShell pure contrac
   assert.doesNotMatch(routeTests, /Invoke-NotifyTerminalRouteActivate/);
 });
 
-test("focused progress cannot be claimed as final activation success", () => {
+test("focused progress stays non-terminal and cannot be claimed as final activation success", () => {
   const activation = readWindows("NotifyBridge.Activation.ps1");
   assert.match(activation, /decisionName -eq 'focused'|\$decision -eq 'focused'/);
   assert.match(activation, /ProofState 'pending'|ProofState = 'pending'/);
-  assert.match(activation, /close-focused/);
+  assert.match(activation, /Action\s+=\s+'keep-focused'/);
+  assert.doesNotMatch(activation, /close-focused/);
   assert.match(activation, /ClaimFinalActivation = \$false/);
 
   const mapper = mapUiOutcome({ Decision: "focused", Result: "pending", ProofState: "pending" });
-  assert.equal(mapper.action, "close-focused");
+  assert.equal(mapper.action, "keep-focused");
   assert.equal(mapper.claimFinalActivation, false);
 });

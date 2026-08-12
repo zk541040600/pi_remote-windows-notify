@@ -204,7 +204,7 @@ $outcome = Invoke-NotifyActivationStrategy -Request $request -Config $config -Ac
 $ui = ConvertTo-NotifyActivationUiOutcome -Outcome $outcome
 Write-NotifyActivateLog -Message ('activate-route decision={0} result={1} reason={2} proof={3} retryable={4} notificationFp={5} snapshotFp={6} scrollAttempted={7} scrolledToBottom={8}' -f $outcome.Decision, $outcome.Result, $(if ([string]::IsNullOrWhiteSpace([string]$outcome.Reason)) { 'none' } else { [string]$outcome.Reason }), $outcome.ProofState, $outcome.Retryable, (Get-NotifyRouteFingerprint -Value $notificationId), (Get-NotifyRouteFingerprint -Value ([string]$outcome.SnapshotId)), $outcome.ScrollAttempted, $outcome.ScrolledToBottom)
 
-if ($ui.Action -eq 'close-handled' -or $ui.Action -eq 'close-focused') {
+if ($ui.Action -eq 'close-handled') {
     if ($originKind -eq 'paseo' -and -not [string]::IsNullOrWhiteSpace($activationIdValue)) {
         try {
             $toastPaths = @(
@@ -214,13 +214,15 @@ if ($ui.Action -eq 'close-handled' -or $ui.Action -eq 'close-focused') {
             foreach ($candidate in $toastPaths) { Remove-Item -LiteralPath $candidate -Force -ErrorAction SilentlyContinue }
         } catch {}
     }
-    if ($ui.Action -eq 'close-focused') {
-        Write-NotifyActivateLog -Message 'activate-route-focused background-proof=pending'
-    }
-    else {
-        Write-NotifyActivateLog -Message 'activate-route-success'
-    }
+    Write-NotifyActivateLog -Message 'activate-route-success'
     exit 0
+}
+
+if ($ui.Action -eq 'keep-focused') {
+    # Defensive only: exact activation normally waits for Route Host terminal
+    # output. Never report pending progress as handled or delete retry state.
+    Write-NotifyActivateLog -Message 'activate-route-focused background-proof=pending'
+    exit 1
 }
 
 # Temporary Paseo failure: restore custom retry popup with same opaque activation id; never terminal fallback.

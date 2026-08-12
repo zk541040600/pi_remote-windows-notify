@@ -61,6 +61,7 @@ test("popup feedback has bounded click recovery and an independent terminal clos
     assert.match(source, new RegExp(`\\$script:${prefix}ActivationRecoveryWaitMs = 10000`));
     assert.match(source, new RegExp(`\\$script:${prefix}RecoveringActivationWatchdogMs = 12000`));
     assert.match(source, new RegExp(`\\$script:${prefix}ReadyActivationWatchdogMs = 20000`));
+    assert.match(source, /Get-NotifyPiWebActivationWatchdogMs -ExpiresAtUtc/);
     assert.match(source, /Get-NotifyActivationWorkerScript|Invoke-NotifyActivationStrategy/);
     assert.match(source, /ActivationRecoveryWaitMs/);
     assert.match(source, /FailureCloseTimer[^\r\n]*\.Start\(\)/);
@@ -131,22 +132,27 @@ test("popup feedback has bounded click recovery and an independent terminal clos
   assert.match(oldestActivation, /no-eligible-popups/);
 });
 
-test("desktop focus progress closes Pi Web feedback without claiming final proof", () => {
+test("desktop focus progress never closes Pi Web feedback (non-terminal pending)", () => {
   const common = readFileSync(new URL("NotifyBridge.Common.ps1", windowsRoot), "utf8");
   const broker = readFileSync(new URL("pi-notify-broker.ps1", windowsRoot), "utf8");
   const popup = readFileSync(new URL("pi-notify-popup.ps1", windowsRoot), "utf8");
   const activate = readFileSync(new URL("pi-notify-activate.ps1", windowsRoot), "utf8");
 
-  assert.match(common, /\$argList \+= '--return-on-progress'/);
-  assert.match(common, /ActivationPhase\s+=\s+\$activationPhase/);
-  assert.match(
-    common,
-    /desktop-row-focused-awaiting-proof[\s\S]*Decision\s+=\s+'focused'[\s\S]*Result\s+=\s+'pending'[\s\S]*Reason\s+=\s+'background-proof-pending'/,
+  // The exact activate helper must wait for the terminal result — it must not
+  // opt in to returning on the focused/pending progress phase.
+  const exactActivate = common.slice(
+    common.indexOf("function Invoke-NotifyExactRouteActivate"),
+    common.indexOf("# --- Paseo desktop route helpers"),
+  );
+  assert.doesNotMatch(
+    exactActivate,
+    /-ReturnOnProgress/,
+    "the exact helper must wait for the terminal activation result",
   );
   assert.match(
-    common,
-    /Invoke-NotifyRouteHostClient[^\r\n]*-ReturnOnProgress/,
-    "the exact helper must explicitly opt in while raw CLI behavior stays terminal",
+    exactActivate,
+    /Invoke-NotifyRouteHostClient -Request \$request -WaitMs \$WaitMs -TimeoutMs \$TimeoutMs -Config \$Config\s*\r?\n/,
+    "the exact helper must not pass -ReturnOnProgress",
   );
   assert.match(
     common,
@@ -158,12 +164,24 @@ test("desktop focus progress closes Pi Web feedback without claiming final proof
   for (const source of [broker, popup]) {
     assert.match(source, /ValidateSet\('focused', 'handled', 'failed', 'dismissed'\)/);
     assert.match(source, /ConvertTo-NotifyActivationUiOutcome/);
-    assert.match(source, /close-focused|Outcome 'focused'/);
-    assert.match(source, /background-proof-pending/);
+    assert.match(source, /if \(\$ui\.Action -eq 'keep-focused'\)/);
+    assert.doesNotMatch(source, /close-focused/, "focused/pending must never close the card");
   }
-  assert.match(activation, /decisionName -eq 'focused'|\$decision -eq 'focused'/);
-  assert.match(activation, /ProofState 'pending'|close-focused/);
-  assert.match(activate, /close-focused|activate-route-focused/);
+  assert.match(activation, /\$decision -eq 'focused'/);
+  assert.match(activation, /Action\s+=\s+'keep-focused'/);
+  assert.match(activation, /background-proof-pending/);
+  assert.doesNotMatch(activation, /close-focused/, "the UI mapping must not close on focused");
+  assert.match(activate, /if \(\$ui\.Action -eq 'keep-focused'\)[\s\S]*activate-route-focused background-proof=pending[\s\S]*exit 1/);
+  const handledCliBlock = activate.slice(
+    activate.indexOf("if ($ui.Action -eq 'close-handled')"),
+    activate.indexOf("if ($ui.Action -eq 'keep-focused')"),
+  );
+  assert.match(handledCliBlock, /Remove-Item/);
+  const pendingCliBlock = activate.slice(
+    activate.indexOf("if ($ui.Action -eq 'keep-focused')"),
+    activate.indexOf("# Temporary Paseo failure"),
+  );
+  assert.doesNotMatch(pendingCliBlock, /Remove-Item|exit 0/);
   assert.match(activate, /activate-route-focused background-proof=pending/);
 });
 
@@ -229,6 +247,9 @@ test(
     const popupPath = fileURLToPath(
       new URL("pi-notify-popup.ps1", windowsRoot),
     );
+    const activationPath = fileURLToPath(
+      new URL("NotifyBridge.Activation.ps1", windowsRoot),
+    );
     const harness = String.raw`
 $ErrorActionPreference = 'Stop'
 function Get-TestFunctionDefinition {
@@ -264,6 +285,20 @@ function Write-NotifyPopupLog { param([string]$Message) }
 . ([scriptblock]::Create((Get-TestFunctionDefinition -Path $env:PI_NOTIFY_BROKER_TEST_PATH -Name 'Invoke-NotifyBrokerOldestPopupActivation')))
 . ([scriptblock]::Create((Get-TestFunctionDefinition -Path $env:PI_NOTIFY_POPUP_TEST_PATH -Name 'Complete-NotifyPopupLifecycle')))
 . ([scriptblock]::Create((Get-TestFunctionDefinition -Path $env:PI_NOTIFY_POPUP_TEST_PATH -Name 'Request-NotifyPopupExactWorkerStop')))
+. ([scriptblock]::Create((Get-TestFunctionDefinition -Path $env:PI_NOTIFY_ACTIVATION_TEST_PATH -Name 'Test-NotifyActivationStrategyResult')))
+. ([scriptblock]::Create((Get-TestFunctionDefinition -Path $env:PI_NOTIFY_ACTIVATION_TEST_PATH -Name 'Get-NotifyActivationRemainingMs')))
+. ([scriptblock]::Create((Get-TestFunctionDefinition -Path $env:PI_NOTIFY_ACTIVATION_TEST_PATH -Name 'Get-NotifyPiWebActivationWatchdogMs')))
+. ([scriptblock]::Create((Get-TestFunctionDefinition -Path $env:PI_NOTIFY_ACTIVATION_TEST_PATH -Name 'ConvertTo-NotifyActivationUiOutcome')))
+
+$watchdogClock = [DateTime]::UtcNow
+$longProofWatchdog = Get-NotifyPiWebActivationWatchdogMs -ExpiresAtUtc $watchdogClock.AddMinutes(1) -NowUtc $watchdogClock
+$shortExpiryWatchdog = Get-NotifyPiWebActivationWatchdogMs -ExpiresAtUtc $watchdogClock.AddMilliseconds(1500) -NowUtc $watchdogClock
+$expiredWatchdog = Get-NotifyPiWebActivationWatchdogMs -ExpiresAtUtc $watchdogClock.AddMilliseconds(-1) -NowUtc $watchdogClock
+if ($longProofWatchdog -ne 60000 -or
+    $shortExpiryWatchdog -ne 1500 -or
+    $expiredWatchdog -ne 1) {
+  throw 'Pi Web watchdog must preserve terminal proof budget without extending popup expiry'
+}
 
 $script:BrokerUnavailableCalls = 0
 function Set-NotifyBrokerRecoveryUiState {
@@ -274,6 +309,8 @@ $brokerForm = New-FakeForm
 $brokerTag = @{
   PopupId = 'terminal-broker'
   Form = $brokerForm
+  OriginKind = 'pi-web'
+  ExpiresAtUtc = [DateTime]::UtcNow.AddMinutes(1)
   TerminalState = [ref]$false
   CloseRequested = [ref]$false
   TerminalOutcome = ''
@@ -297,36 +334,15 @@ if (-not $firstFailure -or $repeatFailure -or -not $firstDismiss -or $repeatDism
   throw 'broker terminal lifecycle is not idempotent'
 }
 
-$brokerFocusedForm = New-FakeForm
-$brokerFocusedTag = @{
-  PopupId = 'focused-broker'
-  Form = $brokerFocusedForm
-  TerminalState = [ref]$false
-  CloseRequested = [ref]$false
-  TerminalOutcome = ''
-  TerminalReason = ''
-  Activating = [ref]$true
-  Timer = New-FakeTimer
-  FocusWatchTimer = New-FakeTimer
-  ActivationWatchdogTimer = New-FakeTimer
-  FailureCloseTimer = New-FakeTimer
-}
-$brokerFocusedForm.Tag = $brokerFocusedTag
-$firstFocused = Complete-NotifyBrokerPopupLifecycle -Tag $brokerFocusedTag -Outcome 'focused' -Reason 'background-proof-pending'
-$repeatFocused = Complete-NotifyBrokerPopupLifecycle -Tag $brokerFocusedTag -Outcome 'focused' -Reason 'background-proof-pending'
-if (-not $firstFocused -or $repeatFocused -or
-    $brokerFocusedForm.CloseCalls -ne 1 -or
-    $brokerFocusedTag.FailureCloseTimer.StartCalls -ne 0 -or
-    $brokerFocusedTag.TerminalOutcome -ne 'focused') {
-  throw 'broker focus progress did not close exactly once'
-}
-
 $script:PopupUnavailableCalls = 0
 function Set-NotifyPopupRecoveryUiState {
   param([string]$State)
   if ($State -eq 'unavailable') { $script:PopupUnavailableCalls += 1 }
 }
 $script:NotifyPopupForm = New-FakeForm
+$script:NotifyPopupTargetOriginKind = 'pi-web'
+$script:NotifyPopupExpiresAtUtc = [DateTime]::UtcNow.AddMinutes(1)
+$script:NotifyPopupFailureCloseDelayMs = 2500
 $script:NotifyPopupTerminalState = $false
 $script:NotifyPopupTerminalOutcome = ''
 $script:NotifyPopupTerminalReason = ''
@@ -348,23 +364,43 @@ if (-not $firstFailure -or $repeatFailure -or -not $firstDismiss -or $repeatDism
   throw 'fallback popup terminal lifecycle is not idempotent'
 }
 
-$script:NotifyPopupForm = New-FakeForm
-$script:NotifyPopupTerminalState = $false
-$script:NotifyPopupTerminalOutcome = ''
-$script:NotifyPopupTerminalReason = ''
-$script:NotifyPopupCloseRequested = $false
-$script:NotifyPopupActivating = $true
-$script:NotifyPopupTimer = New-FakeTimer
-$script:NotifyPopupFocusWatchTimer = New-FakeTimer
-$script:NotifyPopupActivationWatchdogTimer = New-FakeTimer
-$script:NotifyPopupFailureCloseTimer = New-FakeTimer
-$firstFocused = Complete-NotifyPopupLifecycle -Outcome 'focused' -Reason 'background-proof-pending'
-$repeatFocused = Complete-NotifyPopupLifecycle -Outcome 'focused' -Reason 'background-proof-pending'
-if (-not $firstFocused -or $repeatFocused -or
-    $script:NotifyPopupForm.CloseCalls -ne 1 -or
-    $script:NotifyPopupFailureCloseTimer.StartCalls -ne 0 -or
-    $script:NotifyPopupTerminalOutcome -ne 'focused') {
-  throw 'fallback focus progress did not close exactly once'
+# Focused/pending must map to a NON-terminal UI action: the card stays open in
+# bounded pending feedback and only a final result (or the original deadline)
+# closes it. Validate the pure UI mapping against the real strategy validator.
+$focusedOutcome = [pscustomobject]@{
+  Version = 1; Operation = 'activate'; OriginKind = 'pi-web'
+  Decision = 'focused'; Result = 'pending'; Reason = 'background-proof-pending'
+  Retryable = $false; ProofState = 'pending'
+  SnapshotId = 'snapshot-focused'; RecoveryTicketId = 'ticket'
+  ScrollAttempted = $false; ScrolledToBottom = $false; ElapsedMs = 42
+}
+$focusedUi = ConvertTo-NotifyActivationUiOutcome -Outcome $focusedOutcome
+if ($focusedUi.Action -ne 'keep-focused' -or
+    $focusedUi.ClaimFinalActivation -ne $false -or
+    $focusedUi.Decision -ne 'focused' -or
+    $focusedUi.Result -ne 'pending' -or
+    $focusedUi.Reason -ne 'background-proof-pending') {
+  throw 'focused outcome must map to non-terminal keep-focused'
+}
+$handledUi = ConvertTo-NotifyActivationUiOutcome -Outcome ([pscustomobject]@{
+  Version = 1; Operation = 'activate'; OriginKind = 'pi-web'
+  Decision = 'handled'; Result = 'session-url-confirmed'; Reason = ''
+  Retryable = $false; ProofState = 'final'
+  SnapshotId = 'snapshot-handled'; RecoveryTicketId = ''
+  ScrollAttempted = $false; ScrolledToBottom = $false; ElapsedMs = 30
+})
+if ($handledUi.Action -ne 'close-handled' -or $handledUi.ClaimFinalActivation -ne $true) {
+  throw 'handled outcome must remain terminal close-handled'
+}
+$failedUi = ConvertTo-NotifyActivationUiOutcome -Outcome ([pscustomobject]@{
+  Version = 1; Operation = 'activate'; OriginKind = 'pi-web'
+  Decision = 'fail-closed'; Result = 'adapter-unavailable'; Reason = 'route-host-missing'
+  Retryable = $false; ProofState = 'none'
+  SnapshotId = ''; RecoveryTicketId = ''
+  ScrollAttempted = $false; ScrolledToBottom = $false; ElapsedMs = 5
+})
+if ($failedUi.Action -ne 'show-unavailable') {
+  throw 'fail-closed outcome must map to show-unavailable'
 }
 
 $cancelPowerShell = [pscustomobject]@{ BeginStopCalls = 0; StopCalls = 0 }
@@ -466,6 +502,7 @@ if (Invoke-NotifyBrokerOldestPopupActivation) {
           ...process.env,
           PI_NOTIFY_BROKER_TEST_PATH: brokerPath,
           PI_NOTIFY_POPUP_TEST_PATH: popupPath,
+          PI_NOTIFY_ACTIVATION_TEST_PATH: activationPath,
         },
       },
     );
