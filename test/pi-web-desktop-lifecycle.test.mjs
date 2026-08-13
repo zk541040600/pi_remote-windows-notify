@@ -71,9 +71,15 @@ test("PiWebDesktop durable route outboxes are Windows login-session local", () =
   );
 });
 
-test("PiWebDesktop notification routing uses verified same-document row or history only", () => {
+test("PiWebDesktop notification routing keeps strict same-document proof and one controlled unbound navigation", () => {
   const source = readFileSync(mainFormPath, "utf8");
   const transaction = readFileSync(rowActivationPath, "utf8");
+  assert.equal(
+    existsSync(programmaticNavigationPath),
+    true,
+    "the shipped Desktop source must retain the bounded controlled-navigation transaction",
+  );
+  const navigationTransaction = readFileSync(programmaticNavigationPath, "utf8");
 
   assert.match(source, /const verifiedRows=new Map\(\)/);
   assert.match(source, /const verifiedHistoryEntries=new Map\(\)/);
@@ -96,33 +102,77 @@ test("PiWebDesktop notification routing uses verified same-document row or histo
   assert.match(source, /stageHistoryEntry\(targetSession,gesture\)/);
   assert.match(source, /confirmHistoryEntry\(proof\.sessionId,historyBinding\)/);
   assert.match(source, /navigationApi\.entries\(\)/);
-  assert.match(source, /nativeTraverseTo\(historyRecord\.key/);
-  assert.match(source, /info===activation\.navigationInfo/);
+  assert.doesNotMatch(
+    source,
+    /nativeTraverseTo|activation\.navigationInfo|beginHistoryEntryRebind|finishHistoryEntryRebind|emitDeferredHistoryApiProof|activation\.navigateSeen|activation\.committed|activation\.entryEventSeen/,
+    "dead history/current activation machinery must stay removed",
+  );
   assert.match(source, /beginProvisionalHistoryEntryRebind\(target,effectiveMethod\)/);
   assert.match(source, /finishProvisionalHistoryEntryRebind\(/);
   assert.match(source, /currentProvisionalHistoryEntry\(/);
   assert.match(source, /proof\.requestGestureSeq===lastCommittedUserGestureSeq/);
   assert.match(source, /proof\.requestGestureSeq===gestureSequence/);
-  assert.match(source, /beginHistoryEntryRebind\(activation,target,effectiveMethod\)/);
-  assert.match(source, /finishHistoryEntryRebind\(activation\)/);
-  assert.match(source, /activation\.finished=true;emitDeferredHistoryApiProof/);
-  assert.match(source, /traverse-correlation-timeout/);
+  assert.doesNotMatch(source, /traverse-correlation-timeout/);
   assert.match(source, /RowActivationHistoryBudgetMs/);
-  assert.match(source, /LogRouteEvent\("route-activation-fail-closed"/);
-  assert.match(source, /reason = rowActivationOutcome ==[\s\S]*"row-and-history-unavailable"/);
   assert.match(transaction, /IsUnavailableWithoutMutation/);
   assert.doesNotMatch(transaction, /CanFallback/);
-  assert.doesNotMatch(source, /route-row-activation-fallback/);
-  assert.doesNotMatch(source, /route-activation-navigation-issued/);
-  assert.doesNotMatch(source, /new ProgrammaticSessionNavigationTransaction/);
-  assert.equal(
-    existsSync(programmaticNavigationPath),
-    false,
-    "notification fresh-navigation transaction must not remain in the shipped Desktop source",
+  assert.match(
+    source,
+    /rowActivationOutcome\s*!=\s*SessionRowActivationOutcome\.Unavailable[\s\S]{0,120}return false/,
   );
   assert.match(
     source,
-    /activation\.navigateSeen[\s\S]*activation\.committed[\s\S]*activation\.entryEventSeen/,
+    /_documentGeneration != activationStartDocumentGeneration[\s\S]{0,260}_pendingDocumentNavigationId != activationStartNavigationId[\s\S]{0,200}_activeDocumentNonce,[\s\S]{0,100}activationStartDocumentNonce/,
+  );
+  assert.match(source, /route-row-activation-fallback/);
+  assert.match(source, /row-unavailable-source-unchanged/);
+  const fallbackFenceStart = source.indexOf(
+    "var activationStartUserSelectionEpoch = _trustedUserSelectionEpoch;",
+  );
+  const fallbackFenceGuard = source.indexOf(
+    "_trustedUserSelectionEpoch !=",
+    fallbackFenceStart,
+  );
+  const controlledNavigation = source.indexOf(
+    "core.Navigate(targetUrl)",
+    fallbackFenceStart,
+  );
+  assert.ok(
+    fallbackFenceStart >= 0 &&
+      fallbackFenceGuard > fallbackFenceStart &&
+      controlledNavigation > fallbackFenceGuard,
+    "a trusted user selection processed during row activation must fence controlled navigation",
+  );
+  assert.match(
+    source,
+    /private void SupersedeProgrammaticSessionSelection[\s\S]{0,220}_trustedUserSelectionEpoch\+\+;/,
+  );
+  assert.match(
+    source,
+    /const historyRecord=verifiedHistoryEntries\.get\(data\.sessionId\);[\s\S]{0,180}removeHistorySession\(data\.sessionId\)[\s\S]{0,220}status:'unavailable'/,
+    "a disconnected row or retained history is only a zero-mutation unavailable signal, never a selector",
+  );
+  assert.match(source, /route-activation-navigation-issued/);
+  assert.match(source, /new ProgrammaticSessionNavigationTransaction/);
+  assert.match(source, /core\.Navigate\(targetUrl\)/);
+  assert.match(
+    source,
+    /rowActivationOutcome\s*!=\s*SessionRowActivationOutcome\.Unavailable[\s\S]{0,900}return false/,
+    "partial, no-proof, ambiguous, and superseded activation must fail closed before navigation",
+  );
+  assert.match(navigationTransaction, /NavigationId/);
+  assert.match(navigationTransaction, /ExpectedDocumentGeneration/);
+  assert.match(navigationTransaction, /DocumentNonce/);
+  assert.match(navigationTransaction, /TrySignalNavigationReady/);
+  assert.match(navigationTransaction, /TryMarkSessionLoaded/);
+  assert.match(navigationTransaction, /TryCommitObservation/);
+  assert.match(navigationTransaction, /TryBeginProvisionalFocus/);
+  assert.match(navigationTransaction, /TryReleaseMask/);
+  assert.match(navigationTransaction, /FailAndReleaseMask/);
+  assert.match(
+    source,
+    /var ownsMask = ReferenceEquals\(_loadingMaskOwner, navigation\);[\s\S]{0,180}navigation\.FailAndReleaseMask\(\)[\s\S]{0,180}if \(!ownsMask \|\| !released\)/,
+    "failure cleanup must not unlock a newer transaction's mask owner",
   );
   assert.match(source, /pendingRowActivation===activation/);
   assert.match(source, /const rowLineageObserver=new MutationObserver/);
@@ -312,6 +362,11 @@ test("PiWebDesktop reports focused row progress without weakening final proof", 
     /await reporter\([\s\S]*DesktopRowFocusedAwaitingProof/,
   );
   assert.match(adapter, /BuildActivateProgress\([\s\S]*ReportProgressAsync/);
+  assert.match(
+    adapter,
+    /if \(!retainTerminalFence\)[\s\S]{0,220}RemoveActivationFinalizer\([\s\S]{0,120}rejectPending: true\)[\s\S]{0,120}ReleaseActivationTerminalFence\(\)/,
+    "exception/cancellation before durable terminal admission must reject fresh-navigation finalization",
+  );
   assert.match(adapter, /response\.Result,[\s\S]*RouteResults\.Pending/);
   assert.match(adapter, /response\.ActivationRequestId,[\s\S]*command\.ActivationRequestId/);
   assert.match(
@@ -377,6 +432,7 @@ test("live Dest activation evidence strips PowerShell provider metadata", () => 
     /\$readyUtc -le \$issuedUtc[\s\S]*\$issuedUtc -le \$historyUtc[\s\S]*\$historyUtc -le \$proofUtc[\s\S]*\$proofUtc -le \$committedUtc[\s\S]*\$committedUtc -le \$confirmedUtc[\s\S]*\$confirmedUtc -le \$acknowledgedUtc[\s\S]*\$acknowledgedUtc -le \$completedUtc/,
   );
   assert.match(source, /ACTIVATION_EVENT_ORDER_INVALID/);
+  assert.match(source, /CONTROLLED_NAVIGATION_EVENT_ORDER_INVALID/);
   assert.match(source, /PHYSICAL_POPUP_CLICK_MISSING/);
   assert.match(source, /broker-popup-click\\s\+popupId/);
   const activationStart = source.indexOf("function Invoke-LiveExactActivation");
@@ -395,11 +451,19 @@ test("live Dest activation evidence strips PowerShell provider metadata", () => 
   assert.match(source, /targetRowState' 'verified'/);
   assert.match(source, /targetHistoryState' 'retained'/);
   assert.match(source, /TWO_ACCEPTED_ACTIVATION_ROUNDS_REQUIRED/);
-  assert.match(source, /RETAINED_HISTORY_ROUND_MISSING/);
+  assert.match(source, /CONTROLLED_NAVIGATION_ROUND_MISSING/);
+  assert.match(source, /SAME_DOCUMENT_ROUND_MISSING/);
+  assert.match(source, /route-row-activation-fail-closed-check/);
+  assert.match(source, /unavailableWithoutMutation' \$true/);
+  assert.match(source, /route-activation-navigation-mask/);
+  assert.match(source, /route-activation-observation-committed/);
+  assert.match(source, /\$navigationIssued\.Count -eq 1/);
+  assert.match(source, /\$navigationStarts\.Count -eq 1/);
+  assert.match(source, /\$afterGeneration -eq \(\$beforeGeneration \+ 1\)/);
   assert.match(source, /BROKER_HANDLED_FINAL_COUNT_INVALID/);
   assert.match(source, /BROKER_HANDLED_TERMINAL_COUNT_INVALID/);
   assert.match(source, /BROKER_FOCUSED_TERMINAL_OBSERVED/);
-  assert.match(source, /DOCUMENT_GENERATION_CHANGED/);
-  assert.match(source, /FreshFallbackCount\s*=\s*0/);
+  assert.match(source, /ACTIVATION_SELECTION_PATH_INVALID/);
+  assert.match(source, /FreshFallbackCount\s*=\s*\$fallbacks\.Count/);
   assert.match(source, /'route-row-binding-diagnostic'/);
 });

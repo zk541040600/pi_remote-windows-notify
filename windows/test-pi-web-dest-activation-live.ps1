@@ -804,6 +804,7 @@ function Invoke-LiveExactActivation {
             HistoryReceiptCount = 0
             SessionGetProofCount = 0; ExplicitOpenEventCount = 0
             NavigationStartingCount = 0; FreshFallbackCount = 0
+            SelectionPath = ''
             BindingCountBefore = 0; BindingCountAfter = 0
             IdentitySamples = 0; ElapsedMs = 0
             PopupElapsedMs = -1; PopupOutcome = ''
@@ -841,6 +842,7 @@ function Invoke-LiveExactActivation {
             HistoryReceiptCount = 0
             SessionGetProofCount = 0; ExplicitOpenEventCount = 0
             NavigationStartingCount = 0; FreshFallbackCount = 0
+            SelectionPath = ''
             BindingCountBefore = 0; BindingCountAfter = 0
             IdentitySamples = 0; ElapsedMs = 0
             PopupElapsedMs = -1; PopupOutcome = ''
@@ -1042,28 +1044,89 @@ function Invoke-LiveExactActivation {
         $confirmedUtc -le $acknowledgedUtc -and
         $acknowledgedUtc -le $completedUtc
 
-    # Notification activation never fresh-navigates and never falls back to a
-    # fresh document. An accepted round must show zero native navigation
-    # starting events and zero fail-closed rejection records: only the exact
-    # verified row or the exact retained Navigation entry may drive selection.
+    # Same-document row/history selection remains the preferred path. The only
+    # accepted fresh-document path is an explicitly classified unchanged-page
+    # unavailable result followed by one controlled navigation transaction.
     $failClosedEvents = @($events | Where-Object {
         [string]$_.eventName -eq 'route-activation-fail-closed' -and
         (Test-EventField $_ 'routingFp' $routingFp)
     })
-    $failClosedChecks = @($events | Where-Object {
+    $fallbackChecks = @($events | Where-Object {
         [string]$_.eventName -eq 'route-row-activation-fail-closed-check' -and
         (Test-EventField $_ 'routingFp' $routingFp)
     })
+    $allFallbacks = @($events | Where-Object {
+        [string]$_.eventName -eq 'route-row-activation-fallback' -and
+        (Test-EventField $_ 'routingFp' $routingFp)
+    })
+    $fallbacks = @($allFallbacks | Where-Object {
+        (Test-EventField $_ 'reason' 'row-unavailable-source-unchanged')
+    })
+    $allNavigationIssued = @($events | Where-Object {
+        [string]$_.eventName -eq 'route-activation-navigation-issued'
+    })
+    $navigationIssued = @($allNavigationIssued | Where-Object {
+        (Test-EventField $_ 'activationFp' $activationFp) -and
+        (Test-EventField $_ 'routingFp' $routingFp)
+    })
+    $navigationMasks = @($events | Where-Object {
+        [string]$_.eventName -eq 'route-activation-navigation-mask' -and
+        (Test-EventField $_ 'routingFp' $routingFp)
+    })
+    $maskShown = @($navigationMasks | Where-Object {
+        (Test-EventField $_ 'state' 'shown') -and
+        (Get-EventDocumentGeneration -EventRecord $_) -eq $beforeGeneration
+    })
+    $maskReleased = @($navigationMasks | Where-Object {
+        (Test-EventField $_ 'state' 'released') -and
+        (Get-EventDocumentGeneration -EventRecord $_) -eq
+            ($beforeGeneration + 1)
+    })
+    $failedMasks = @($navigationMasks | Where-Object {
+        (Test-EventField $_ 'state' 'failed') -or
+        (Test-EventField $_ 'state' 'failure-released')
+    })
 
-    $navigationStarts = @($events | Where-Object {
+    $allNavigationStarts = @($events | Where-Object {
         [string]$_.eventName -eq 'route-navigation-starting'
     })
-    if ($navigationStarts.Count -ne 0) {
-        [void]$failures.Add('FRESH_DOCUMENT_NAVIGATION_OBSERVED')
-    }
-    $documentReady = @($events | Where-Object {
+    $navigationStarts = @($allNavigationStarts | Where-Object {
+        (Test-EventField $_ 'routingFp' $routingFp) -and
+        (Test-EventField $_ 'isProgrammaticSessionNavigation' $true) -and
+        (Test-EventField $_ 'isNewDocumentNavigation' $true)
+    })
+    $allDocumentReady = @($events | Where-Object {
         [string]$_.eventName -eq 'route-document-ready' -and
         (Test-EventField $_ 'accepted' $true)
+    })
+    $documentReady = @($allDocumentReady | Where-Object {
+        (Test-EventField $_ 'accepted' $true) -and
+        (Get-EventDocumentGeneration -EventRecord $_) -eq
+            ($beforeGeneration + 1)
+    })
+    $freshHistory = @($events | Where-Object {
+        [string]$_.eventName -eq 'route-history-changed' -and
+        (Test-EventField $_ 'routingFp' $routingFp) -and
+        (Get-EventDocumentGeneration -EventRecord $_) -eq
+            ($beforeGeneration + 1)
+    })
+    $freshProof = @($events | Where-Object {
+        [string]$_.eventName -eq 'route-session-proof' -and
+        (Test-EventField $_ 'accepted' $true) -and
+        (Test-EventField $_ 'programmatic' $true) -and
+        (Test-EventField $_ 'routingFp' $routingFp) -and
+        (Get-EventDocumentGeneration -EventRecord $_) -eq
+            ($beforeGeneration + 1) -and
+        $_.fields.PSObject.Properties['reason'] -and
+        [string]$_.fields.reason -in @(
+            'api-response-confirmed',
+            'api-response-confirmed-source-promoted')
+    })
+    $freshCommitted = @($events | Where-Object {
+        [string]$_.eventName -eq 'route-activation-observation-committed' -and
+        (Test-EventField $_ 'routingFp' $routingFp) -and
+        (Get-EventDocumentGeneration -EventRecord $_) -eq
+            ($beforeGeneration + 1)
     })
     $explicitOpenEvents = @($events | Where-Object {
         [string]$_.eventName -eq 'route-intent-accepted' -or
@@ -1113,6 +1176,70 @@ function Invoke-LiveExactActivation {
     $bindingAfter = Read-TargetBindingInvariant -Target $Target
     $surfaceAfter = Get-BindingSurfaceInvariant
 
+    $sameDocumentBindingProven =
+        $bindingSnapshots.Count -eq 1 -and
+        (Test-EventField $bindingSnapshots[0] 'targetRowState' 'verified')
+    $sameDocumentPath =
+        $sameDocumentBindingProven -and
+        $fallbackChecks.Count -eq 0 -and
+        $allFallbacks.Count -eq 0 -and
+        $fallbacks.Count -eq 0 -and
+        $allNavigationIssued.Count -eq 0 -and
+        $navigationIssued.Count -eq 0 -and
+        $allNavigationStarts.Count -eq 0 -and
+        $navigationStarts.Count -eq 0 -and
+        $allDocumentReady.Count -eq 0 -and
+        $documentReady.Count -eq 0 -and
+        $beforeGeneration -eq $afterGeneration
+    $controlledNavigationPath =
+        $fallbackChecks.Count -eq 1 -and
+        (Test-EventField $fallbackChecks[0] 'unavailableWithoutMutation' $true) -and
+        $allFallbacks.Count -eq 1 -and
+        $fallbacks.Count -eq 1 -and
+        $allNavigationIssued.Count -eq 1 -and
+        $navigationIssued.Count -eq 1 -and
+        $maskShown.Count -eq 1 -and
+        $maskReleased.Count -eq 1 -and
+        $failedMasks.Count -eq 0 -and
+        $allNavigationStarts.Count -eq 1 -and
+        $navigationStarts.Count -eq 1 -and
+        $allDocumentReady.Count -eq 1 -and
+        $documentReady.Count -eq 1 -and
+        $freshHistory.Count -ge 1 -and
+        $freshProof.Count -eq 1 -and
+        $freshCommitted.Count -eq 1 -and
+        $focus.Count -eq 1 -and
+        (Get-EventDocumentGeneration -EventRecord $focus[0]) -eq
+            ($beforeGeneration + 1) -and
+        $afterGeneration -eq ($beforeGeneration + 1)
+    $controlledNavigationOrderValid = $controlledNavigationPath -and
+        (ConvertTo-EventUtc -EventRecord $fallbackChecks[0]) -le
+            (ConvertTo-EventUtc -EventRecord $fallbacks[0]) -and
+        (ConvertTo-EventUtc -EventRecord $fallbacks[0]) -le
+            (ConvertTo-EventUtc -EventRecord $maskShown[0]) -and
+        (ConvertTo-EventUtc -EventRecord $maskShown[0]) -le
+            (ConvertTo-EventUtc -EventRecord $navigationIssued[0]) -and
+        (ConvertTo-EventUtc -EventRecord $navigationIssued[0]) -le
+            (ConvertTo-EventUtc -EventRecord $navigationStarts[0]) -and
+        (ConvertTo-EventUtc -EventRecord $navigationStarts[0]) -le
+            (ConvertTo-EventUtc -EventRecord $documentReady[0]) -and
+        (ConvertTo-EventUtc -EventRecord $documentReady[0]) -le
+            (ConvertTo-EventUtc -EventRecord $freshProof[0]) -and
+        (ConvertTo-EventUtc -EventRecord $freshProof[0]) -le
+            (ConvertTo-EventUtc -EventRecord $freshCommitted[0]) -and
+        (ConvertTo-EventUtc -EventRecord $freshCommitted[0]) -le
+            (ConvertTo-EventUtc -EventRecord $focus[0]) -and
+        (ConvertTo-EventUtc -EventRecord $focus[0]) -le
+            (ConvertTo-EventUtc -EventRecord $maskReleased[0]) -and
+        (ConvertTo-EventUtc -EventRecord $maskReleased[0]) -le $confirmedUtc
+    $selectionPath = if ($sameDocumentPath) {
+        'same-document'
+    } elseif ($controlledNavigationPath) {
+        'controlled-navigation'
+    } else {
+        'invalid'
+    }
+
     if ($ready.Count -ne 1) { [void]$failures.Add('POLL_READY_COUNT_INVALID') }
     if ([string]::IsNullOrWhiteSpace($activationFp)) {
         [void]$failures.Add('ACTIVATION_FINGERPRINT_MISSING')
@@ -1134,35 +1261,45 @@ function Invoke-LiveExactActivation {
     if (-not $RestorationOnly) {
         if ($rowIssued.Count -ne 1) { [void]$failures.Add('ACTIVATION_COMMAND_RECEIPT_MISSING') }
         if ($bindingSnapshots.Count -ne 1) { [void]$failures.Add('ACTIVATION_BINDING_SNAPSHOT_INVALID') }
-        if ($history.Count -lt 1) { [void]$failures.Add('SAME_DOCUMENT_HISTORY_TARGET_MISSING') }
-        if ($proof.Count -ne 1) { [void]$failures.Add('EXACT_SESSION_GET_PROOF_MISSING') }
-        if ($committed.Count -ne 1) { [void]$failures.Add('ROW_ACTIVATION_COMMIT_MISSING') }
-        if (-not $activationEventOrderValid) {
-            [void]$failures.Add('ACTIVATION_EVENT_ORDER_INVALID')
-        }
         if ($failClosedEvents.Count -ne 0) { [void]$failures.Add('UNEXPECTED_FAIL_CLOSED_ACTIVATION') }
-        if ($failClosedChecks.Count -ne 0) { [void]$failures.Add('ROW_ACTIVATION_FAIL_CLOSED_CHECKED') }
-        if ($navigationStarts.Count -ne 0) { [void]$failures.Add('FRESH_DOCUMENT_NAVIGATION_OBSERVED') }
-        if ($documentReady.Count -ne 0) { [void]$failures.Add('NEW_DOCUMENT_READY_OBSERVED') }
-        if ($beforeGeneration -ne $afterGeneration) {
-            [void]$failures.Add('DOCUMENT_GENERATION_CHANGED')
-        }
-        foreach ($eventRecord in @($rowIssued + $history + $proof + $committed + $focus)) {
-            $generation = Get-EventDocumentGeneration -EventRecord $eventRecord
-            if ($generation -ne [long]::MinValue -and
-                $generation -ne $beforeGeneration) {
-                [void]$failures.Add('CORRELATED_DOCUMENT_GENERATION_CHANGED')
-                break
+        if ($selectionPath -eq 'same-document') {
+            if ($history.Count -lt 1) { [void]$failures.Add('SAME_DOCUMENT_HISTORY_TARGET_MISSING') }
+            if ($proof.Count -ne 1) { [void]$failures.Add('EXACT_SESSION_GET_PROOF_MISSING') }
+            if ($committed.Count -ne 1) { [void]$failures.Add('ROW_ACTIVATION_COMMIT_MISSING') }
+            if (-not $activationEventOrderValid) {
+                [void]$failures.Add('ACTIVATION_EVENT_ORDER_INVALID')
             }
+            foreach ($eventRecord in @($rowIssued + $history + $proof + $committed + $focus)) {
+                $generation = Get-EventDocumentGeneration -EventRecord $eventRecord
+                if ($generation -ne [long]::MinValue -and
+                    $generation -ne $beforeGeneration) {
+                    [void]$failures.Add('CORRELATED_DOCUMENT_GENERATION_CHANGED')
+                    break
+                }
+            }
+        }
+        elseif ($selectionPath -eq 'controlled-navigation') {
+            if ($bindingSnapshots.Count -ne 1 -or
+                (Test-EventField $bindingSnapshots[0] 'targetRowState' 'verified')) {
+                [void]$failures.Add('CONTROLLED_NAVIGATION_BOUND_TARGET_INVALID')
+            }
+            if (-not $controlledNavigationOrderValid) {
+                [void]$failures.Add('CONTROLLED_NAVIGATION_EVENT_ORDER_INVALID')
+            }
+        }
+        else {
+            [void]$failures.Add('ACTIVATION_SELECTION_PATH_INVALID')
         }
         if ($explicitOpenEvents.Count -ne 0) {
             [void]$failures.Add('SYNTHETIC_CLICK_CREATED_EXPLICIT_OPEN')
         }
-        if (-not (Test-BindingInvariantEqual $bindingBefore $bindingAfter)) {
+        if ($sameDocumentPath -and
+            -not (Test-BindingInvariantEqual $bindingBefore $bindingAfter)) {
             [void]$failures.Add('TARGET_BINDING_CHANGED')
         }
-        if ($surfaceBefore.Count -ne $surfaceAfter.Count -or
-            $surfaceBefore.Fingerprint -ne $surfaceAfter.Fingerprint) {
+        if ($sameDocumentPath -and
+            ($surfaceBefore.Count -ne $surfaceAfter.Count -or
+            $surfaceBefore.Fingerprint -ne $surfaceAfter.Fingerprint)) {
             [void]$failures.Add('EXPLICIT_BINDING_SURFACE_CHANGED')
         }
     }
@@ -1203,7 +1340,8 @@ function Invoke-LiveExactActivation {
         SessionGetProofCount       = $proof.Count
         ExplicitOpenEventCount     = $explicitOpenEvents.Count
         NavigationStartingCount    = $navigationStarts.Count
-        FreshFallbackCount         = 0
+        FreshFallbackCount         = $fallbacks.Count
+        SelectionPath              = $selectionPath
         BindingCountBefore         = $surfaceBefore.Count
         BindingCountAfter          = $surfaceAfter.Count
         IdentitySamples            = $script:IdentitySamples - $sampleCountBefore
@@ -1354,6 +1492,11 @@ function Get-SafeRouteEvidence {
         'route-row-activation-progress',
         'activate-progress-result',
         'route-row-activation-committed',
+        'route-row-activation-fallback-check',
+        'route-row-activation-fallback',
+        'route-activation-navigation-issued',
+        'route-activation-navigation-mask',
+        'route-activation-observation-committed',
         'route-row-activation-fail-closed-check',
         'route-activation-fail-closed',
         'route-history-changed',
@@ -1427,8 +1570,8 @@ if (-not $ConfirmLive) {
         deletesSessionData = $false
         actions = @(
             'create two broker-only exact-route popups',
-            'activate different captured Dest App rows automatically',
-            'require same PID/HWND and same-document history plus exact GET proof',
+            'activate one unbound target and one live Dest App row automatically',
+            'require same PID/HWND, one controlled navigation, and one same-document row path',
             'prove synthetic row click creates no explicit open/binding',
             'measure recovering wait and failure auto-close',
             'restore the initially selected session in finally')
@@ -1642,25 +1785,24 @@ try {
     }
     $script:OriginalBindingSurfaceInvariant = Get-BindingSurfaceInvariant
 
-    # Targets must have been authenticated earlier in this document. Their live
-    # row may later disconnect; the activation snapshot decides whether the
-    # accepted round used a verified row or a retained Navigation entry.
+    # Preserve one authenticated current row for the same-document round, while
+    # selecting an uncaptured alternate for the controlled-navigation round.
     $capturedRoutingFingerprints = @(Get-CapturedRowRoutingFingerprints `
         -DocumentGeneration ([long]$initialState.DocumentGeneration))
     if ($capturedRoutingFingerprints -notcontains
         [string]$script:OriginalTarget.RoutingFingerprint) {
         Stop-LiveTest -Code 'CURRENT_ROW_NOT_CAPTURED'
     }
-    $capturedAlternates = @($candidates | Where-Object {
+    $unboundAlternates = @($candidates | Where-Object {
         [string]$_.RoutingFingerprint -ne
             [string]$script:OriginalTarget.RoutingFingerprint -and
-        $capturedRoutingFingerprints -contains
+        $capturedRoutingFingerprints -notcontains
             [string]$_.RoutingFingerprint
     } | Sort-Object ModifiedUtc -Descending)
-    if ($capturedAlternates.Count -lt 1) {
-        Stop-LiveTest -Code 'ALTERNATE_CAPTURED_ROW_UNAVAILABLE'
+    if ($unboundAlternates.Count -lt 1) {
+        Stop-LiveTest -Code 'ALTERNATE_UNBOUND_TARGET_UNAVAILABLE'
     }
-    $otherTarget = $capturedAlternates[0]
+    $otherTarget = $unboundAlternates[0]
 
     $baselineSample = Record-DesktopIdentitySample
     if (-not $baselineSample.ok) {
@@ -1704,6 +1846,7 @@ try {
         explicitOpenEventCount    = $first.ExplicitOpenEventCount
         navigationStartingCount   = $first.NavigationStartingCount
         freshFallbackCount        = $first.FreshFallbackCount
+        selectionPath             = $first.SelectionPath
         identitySamples           = $first.IdentitySamples
         elapsedMs                 = $first.ElapsedMs
         popupElapsedMs            = $first.PopupElapsedMs
@@ -1736,6 +1879,7 @@ try {
             explicitOpenEventCount    = $second.ExplicitOpenEventCount
             navigationStartingCount   = $second.NavigationStartingCount
             freshFallbackCount        = $second.FreshFallbackCount
+            selectionPath             = $second.SelectionPath
             identitySamples           = $second.IdentitySamples
             elapsedMs                 = $second.ElapsedMs
             popupElapsedMs            = $second.PopupElapsedMs
@@ -1750,10 +1894,17 @@ try {
     if ($script:ActivationResults.Count -ne 2) {
         Add-FailureKind -Code 'TWO_ACCEPTED_ACTIVATION_ROUNDS_REQUIRED'
     }
-    elseif (@($script:ActivationResults | Where-Object {
-        $_.RetainedHistorySnapshotCount -eq 1
-    }).Count -lt 1) {
-        Add-FailureKind -Code 'RETAINED_HISTORY_ROUND_MISSING'
+    else {
+        if (@($script:ActivationResults | Where-Object {
+            $_.SelectionPath -eq 'controlled-navigation'
+        }).Count -lt 1) {
+            Add-FailureKind -Code 'CONTROLLED_NAVIGATION_ROUND_MISSING'
+        }
+        if (@($script:ActivationResults | Where-Object {
+            $_.SelectionPath -eq 'same-document'
+        }).Count -lt 1) {
+            Add-FailureKind -Code 'SAME_DOCUMENT_ROUND_MISSING'
+        }
     }
 
     $stateBeforeTiming = Get-LatestStableRouteState -WaitSeconds 3
