@@ -207,14 +207,14 @@ powershell.exe -ExecutionPolicy Bypass -File .\windows\set-paseo-built-in-notifi
 Recommended takeover order (all manual):
 
 1. Keep sender `deliveryMode=live` and Windows bridge healthy.
-2. Enable Pi lease gate only after explicit confirmation (`paseoLeaseGateEnabled` / `PI_NOTIFY_PASEO_LEASE_GATE=1`).
+2. Enable Pi session ownership only after explicit confirmation (`paseoLeaseGateEnabled` / `PI_NOTIFY_PASEO_LEASE_GATE=1`; legacy names retained for compatibility).
 3. Run `set-paseo-built-in-notifications.ps1 -Disable`.
-4. Observe for 24 hours; keep `PI_NOTIFY_ALLOW_PASEO=1` as emergency Pi fallback.
+4. Observe for 24 hours. Ownership is frozen when each session starts; sender lease changes never switch it to Pi/Pi Web. Set `PI_NOTIFY_ALLOW_PASEO=1` before starting/reloading a session only when an explicit Pi fallback is desired.
 
 One-shot rollback:
 
 1. `set-paseo-built-in-notifications.ps1 -Restore`
-2. Disable Pi lease gate / set `PI_NOTIFY_ALLOW_PASEO=1` if needed
+2. Disable Pi session ownership / set `PI_NOTIFY_ALLOW_PASEO=1`, then start or reload affected Pi sessions
 3. Stop or shadow the Linux sender if required
 4. `set-paseo-desktop-routing.ps1 -Disable` if CDP routing must also roll back
 

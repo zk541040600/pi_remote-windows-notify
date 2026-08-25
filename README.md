@@ -31,7 +31,9 @@ two registrations.
 
 The sender uses runtime-local lifecycle ownership: multiple Pi Web sessions and resource-only
 extension discovery in one Node process cannot cancel another live session's notifications.
-Configured Pi Web RPC sessions add opaque exact-route metadata; raw session IDs are never sent.
+For Paseo-managed Pi, the launch marker assigns ownership once at session start; sender lease
+changes cannot rebrand that session as Pi/Pi Web. Configured Pi Web RPC sessions add opaque
+exact-route metadata; raw session IDs are never sent.
 Windows Terminal keeps its canonical-title route. Pi Web exact failures always fail closed and never
 fall back across origins to a Terminal/browser-title guess.
 

@@ -47,5 +47,7 @@ the installer to fail for manual review instead of overwriting it.
 - `PI_NOTIFY_DISABLED=1` - disable notifications.
 - `PI_NOTIFY_ALLOW_NONLOCAL=1` - allow a non-loopback HTTPS endpoint. Non-loopback HTTP is always rejected.
 - `PI_NOTIFY_ALLOW_NONLOCAL_DYNAMIC=1` - additionally allow prompts/replies in notifications sent to a non-loopback HTTPS endpoint; without this flag they are forced to static mode.
+- `PI_NOTIFY_PASEO_LEASE_GATE=1` - legacy-named opt-in that assigns a `PASEO_AGENT_ID`-launched session to Paseo once at session start.
+- `PI_NOTIFY_ALLOW_PASEO=1` - choose the Pi sender instead, but only when present before a new/reloaded session starts.
 
-Notification failures are ignored so they never break Pi.
+Paseo ownership is session-sticky: a stale/missing sender health lease does not switch the popup to Pi/Pi Web. Notification failures are ignored so they never break Pi.

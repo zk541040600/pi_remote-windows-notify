@@ -143,13 +143,16 @@ node scripts/disable.mjs --apply
 
 No crontab fallback. Real enable requires user confirmation at deployment gate.
 
-## Pi-only lease gate
+## Pi session ownership gate
 
-Pi extension keeps title maintenance always. Opt-in only:
+Pi extension keeps title maintenance always. Ownership takeover is opt-in only; the existing
+`paseoLeaseGateEnabled` / `PI_NOTIFY_PASEO_LEASE_GATE` names remain for compatibility:
 
-- config `paseoLeaseGateEnabled: true` or `PI_NOTIFY_PASEO_LEASE_GATE=1`
-- When gate on + `PASEO_AGENT_ID` + healthy lease + `PI_NOTIFY_ALLOW_PASEO != 1` → suppress legacy Pi popup
-- Stale/read/schema/override → Pi fallback
+- gate on + `PASEO_AGENT_ID` + `PI_NOTIFY_ALLOW_PASEO != 1` → Paseo owns that Pi session runtime
+- ownership is frozen at `session_start` (or the first notification if no start event was observed)
+- sender lease health remains readiness diagnostics; stale/missing health never rebrands the session as Pi/Pi Web
+- if Paseo delivery is unhealthy, the session stays Paseo-owned and emits no misleading Pi fallback
+- `PI_NOTIFY_ALLOW_PASEO=1` must be present before a new/reloaded session chooses its owner
 - Codex/Grok never use this gate
 
 ## Privacy
@@ -159,7 +162,7 @@ Never log: title/body/summary, route triple, token, daemon password, HTTP creden
 
 ## Rollback
 
-1. Disable Pi lease gate (`paseoLeaseGateEnabled=false` / unset env)
+1. Disable the Pi session ownership gate (`paseoLeaseGateEnabled=false` / unset env), then start/reload the affected Pi sessions
 2. `node scripts/disable.mjs --apply`
 3. Re-enable Paseo built-in Windows notifications manually (not automatic)
 

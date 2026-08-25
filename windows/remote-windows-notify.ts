@@ -19,9 +19,9 @@ type NotifyConfigFile = {
   /** Pi Web instance UUID (opaque). Required with originKind=pi-web for Web exact fields. */
   instanceKey?: string;
   /**
-   * Manual opt-in: when true (or PI_NOTIFY_PASEO_LEASE_GATE=1), suppress legacy Pi
-   * popups only if PASEO_AGENT_ID is set and paseo-sender health lease is fresh.
-   * Default false — controlled takeover, never auto-enabled by health alone.
+   * Manual opt-in: when true (or PI_NOTIFY_PASEO_LEASE_GATE=1), a
+   * PASEO_AGENT_ID-launched session assigns notification ownership to Paseo once.
+   * Lease health remains diagnostic and never changes ownership mid-session.
    */
   paseoLeaseGateEnabled?: boolean;
   /** Override path to paseo-sender health.json (tests / non-default state dir). */
@@ -41,7 +41,7 @@ type RuntimeConfig = {
   piWebOriginConfigured: boolean;
   /** Validated opaque instance key, or empty when absent/invalid. */
   instanceKey: string;
-  /** Manual Pi-only lease gate (default false). */
+  /** Manual Paseo session-ownership gate (legacy config name; default false). */
   paseoLeaseGateEnabled: boolean;
   /** Absolute path to paseo-sender health lease file. */
   paseoLeasePath: string;
@@ -69,6 +69,7 @@ type ContextSnapshot = {
 
 type NotificationKind = "ask-user" | "turn-complete";
 type OriginKind = "terminal" | "pi-web";
+type SessionNotificationOwner = "pi" | "paseo";
 
 type NotifyRouteFields = {
   routeVersion: 1;
@@ -600,10 +601,7 @@ export async function getRuntimeConfig(): Promise<RuntimeConfig> {
   };
 }
 
-/**
- * Pure lease health check for the Pi-only duplicate gate.
- * Fail-open (return false => send Pi popup) on any doubt.
- */
+/** Pure paseo-sender readiness diagnostic; it never decides session ownership. */
 export function isPaseoLeaseHealthy(
   lease: unknown,
   options: { staleMs?: number; now?: number } = {},
@@ -625,35 +623,27 @@ export function isPaseoLeaseHealthy(
 }
 
 /**
- * Suppress legacy Pi popup only when:
- * - manual gate enabled
- * - PASEO_AGENT_ID present (Paseo-managed Pi)
- * - lease healthy (schema/age/status)
- * - PI_NOTIFY_ALLOW_PASEO != 1
- * Any read/schema/stale/override failure => do not suppress.
+ * Resolve the immutable notification owner for one Pi session runtime.
+ * The launch marker is authoritative; sender health may affect delivery but must
+ * never rebrand a Paseo-launched session as Pi/Pi Web.
  */
+export function resolveSessionNotificationOwner(
+  config: Pick<RuntimeConfig, "paseoLeaseGateEnabled">,
+  options: { env?: NodeJS.ProcessEnv } = {},
+): SessionNotificationOwner {
+  const env = options.env ?? process.env;
+  if (!config.paseoLeaseGateEnabled) return "pi";
+  if (isTruthy(env.PI_NOTIFY_ALLOW_PASEO)) return "pi";
+  if (!configString(env.PASEO_AGENT_ID)) return "pi";
+  return "paseo";
+}
+
+/** Backwards-compatible predicate; the lease no longer participates in ownership. */
 export async function shouldSuppressLegacyPiPopup(
   config: Pick<RuntimeConfig, "paseoLeaseGateEnabled" | "paseoLeasePath">,
-  options: {
-    env?: NodeJS.ProcessEnv;
-    readFileImpl?: typeof readFile;
-    now?: number;
-    staleMs?: number;
-  } = {},
+  options: { env?: NodeJS.ProcessEnv } = {},
 ): Promise<boolean> {
-  const env = options.env ?? process.env;
-  if (!config.paseoLeaseGateEnabled) return false;
-  if (isTruthy(env.PI_NOTIFY_ALLOW_PASEO)) return false;
-  if (!configString(env.PASEO_AGENT_ID)) return false;
-
-  const readImpl = options.readFileImpl ?? readFile;
-  try {
-    const raw = await readImpl(config.paseoLeasePath, "utf8");
-    const parsed = JSON.parse(raw) as unknown;
-    return isPaseoLeaseHealthy(parsed, { staleMs: options.staleMs, now: options.now });
-  } catch {
-    return false;
-  }
+  return resolveSessionNotificationOwner(config, options) === "paseo";
 }
 
 /**
@@ -805,6 +795,13 @@ export default function remoteWindowsNotify(pi: ExtensionAPI): void {
   const isAlive = () => !lifecycleController.signal.aborted;
 
   let currentSnapshot: ContextSnapshot | undefined;
+  let sessionNotificationOwner: SessionNotificationOwner | undefined;
+
+  // First observation wins for this session runtime; later health/config changes cannot rebrand it.
+  const freezeSessionNotificationOwner = (config: RuntimeConfig): SessionNotificationOwner => {
+    sessionNotificationOwner ??= resolveSessionNotificationOwner(config);
+    return sessionNotificationOwner;
+  };
 
   const promptUnsubscribe = pi.events.on(ASK_USER_PROMPT_EVENT, async (data) => {
     const snapshot = currentSnapshot ? { ...currentSnapshot } : undefined;
@@ -816,7 +813,7 @@ export default function remoteWindowsNotify(pi: ExtensionAPI): void {
     if (!isAlive() || !config.enabled || !config.token) {
       return;
     }
-    if (await shouldSuppressLegacyPiPopup(config)) {
+    if (freezeSessionNotificationOwner(config) === "paseo") {
       return;
     }
 
@@ -851,13 +848,18 @@ export default function remoteWindowsNotify(pi: ExtensionAPI): void {
     );
   });
 
-  pi.on("session_start", (_event, ctx) => {
+  pi.on("session_start", async (_event, ctx) => {
     if (!isAlive()) {
       return;
     }
     const snapshot = readContextSnapshot(ctx);
     currentSnapshot = snapshot;
     setTerminalTitle(getNotifyTarget(snapshot.cwd, snapshot.explicitSessionName, snapshot.sessionKey).tabTitle, snapshot.mode);
+
+    const config = await getRuntimeConfig();
+    if (isAlive()) {
+      freezeSessionNotificationOwner(config);
+    }
   });
 
   pi.on("session_info_changed", (event, ctx) => {
@@ -893,7 +895,7 @@ export default function remoteWindowsNotify(pi: ExtensionAPI): void {
     if (!isAlive() || !config.enabled || !config.token) {
       return;
     }
-    if (await shouldSuppressLegacyPiPopup(config)) {
+    if (freezeSessionNotificationOwner(config) === "paseo") {
       return;
     }
 
