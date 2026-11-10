@@ -2,6 +2,7 @@ import { createLogger, fingerprint, normalizeOpaqueId } from "./privacy.mjs";
 
 const DEFAULT_PAGE_LIMIT = 100;
 const DEFAULT_MAX_PAGES = 50;
+const ATTENTION_SUBSCRIPTION_ID = "paseo-sender-attention";
 
 /** Official @getpaseo/client adapter with exact beta.2 cursor contracts. */
 export class DaemonAdapter {
@@ -38,9 +39,9 @@ export class DaemonAdapter {
       // 与锁定的 @getpaseo/client 版本保持一致。
       appVersion: "0.3.0-beta.2",
       password: this.password,
-      // COMPAT(selectiveAgentTimeline)：声明后 daemon 才会向本客户端无条件转发
-      // dedicated agent_attention_required；未声明时 attention 只随已订阅 timeline 的
-      // agent_stream 下发，sender 会漏事件。字面值须与 @getpaseo/protocol 的
+      // COMPAT(selectiveAgentTimeline)：声明 dedicated agent_attention_required 格式，
+      // 避免 attention 只随已订阅 timeline 的 agent_stream 下发；Paseo 0.14 还要求
+      // fetchAllAgents 建立 agents 订阅。字面值须与 @getpaseo/protocol 的
       // CLIENT_CAPS.selectiveAgentTimeline 保持一致（有契约测试守护）。
       capabilities: { selective_agent_timeline: true },
       reconnect: { enabled: true, baseDelayMs: 1500, maxDelayMs: 30000 },
@@ -125,6 +126,9 @@ export class DaemonAdapter {
       limit: options.limit ?? DEFAULT_PAGE_LIMIT,
       maxPages: options.maxPages ?? DEFAULT_MAX_PAGES,
       baseOptions: {},
+      // Paseo 0.14 gates attention on an agents subscription, not a snapshot read.
+      // Reconciliation repeats this after reconnect; the fixed ID replaces the old one.
+      subscriptionId: ATTENTION_SUBSCRIPTION_ID,
       entryValidator(entry) {
         if (!isPlainObject(entry) || !isPlainObject(entry.agent) || !isPlainObject(entry.project)) {
           throw new Error("malformed fetchAgents entry");
@@ -180,7 +184,7 @@ export class DaemonAdapter {
     this.serverId = null;
   }
 
-  async #fetchCursorPages({ method, limit, maxPages, baseOptions, entryValidator }) {
+  async #fetchCursorPages({ method, limit, maxPages, baseOptions, entryValidator, subscriptionId }) {
     requireInteger(limit, 1, 500, "page limit");
     requireInteger(maxPages, 1, 1000, "max pages");
     const values = [];
@@ -188,7 +192,12 @@ export class DaemonAdapter {
     let cursor;
     for (let page = 0; page < maxPages; page += 1) {
       const pageRequest = cursor === undefined ? { limit } : { limit, cursor };
-      const result = await this.client[method]({ ...baseOptions, page: pageRequest });
+      const request = { ...baseOptions, page: pageRequest };
+      if (page === 0 && subscriptionId) request.subscribe = { subscriptionId };
+      const result = await this.client[method](request);
+      if (page === 0 && subscriptionId && result?.subscriptionId !== subscriptionId) {
+        throw new Error(`${method} subscription not acknowledged`);
+      }
       const parsed = validatePagePayload(result, method);
       for (const entry of parsed.entries) values.push(entryValidator(entry));
       if (!parsed.pageInfo.hasMore) return values;

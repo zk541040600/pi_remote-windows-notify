@@ -20,6 +20,8 @@ class FakeClient {
     this.state = { status: "idle" };
     this.serverInfo = { serverId: "server-1" };
     this.calls = [];
+    this.agentSubscriptionId = null;
+    this.subscriptionAck = "echo";
   }
 
   subscribeConnectionStatus(handler) { this.connection.push(handler); return () => {}; }
@@ -34,19 +36,35 @@ class FakeClient {
     assert.equal(this.events.length, 1, "lifecycle callback registered before connect");
     this.state = { status: "connected" };
     for (const handler of this.connection) handler(this.state);
+    // Deliberately inject a handshake-time callback to retain the early-wiring test.
+    // Normal daemon broadcasts below require an agents subscription.
     for (const handler of this.attention) {
       handler({ agentId: "early", reason: "finished", timestamp: "2026-08-06T12:00:00Z" });
     }
   }
 
-  async close() { this.state = { status: "disposed" }; }
-  async fetchAgents(options) { this.calls.push(["agents", options]); return this.agentPages.shift(); }
+  async close() { this.state = { status: "disposed" }; this.agentSubscriptionId = null; }
+  async fetchAgents(options) {
+    this.calls.push(["agents", options]);
+    const result = this.agentPages.shift();
+    if (!options.subscribe) return result;
+    this.agentSubscriptionId = options.subscribe.subscriptionId;
+    const subscriptionId = this.subscriptionAck === "echo" ? this.agentSubscriptionId : this.subscriptionAck;
+    return subscriptionId ? { ...result, subscriptionId } : result;
+  }
   async fetchWorkspaces(options) { this.calls.push(["workspaces", options]); return this.workspacePages.shift(); }
   async fetchAgent(agentId) { this.calls.push(["agent", agentId]); return this.fetchAgentResult; }
 
   emitConnection(status) {
     this.state = status;
+    if (status.status !== "connected") this.agentSubscriptionId = null;
     for (const handler of this.connection) handler(status);
+  }
+
+  emitAttention(event) {
+    // Paseo 0.14 filters legacy clients by their agents subscription, not by page contents.
+    if (this.state.status !== "connected" || !this.agentSubscriptionId) return;
+    for (const handler of this.attention) handler(event);
   }
 
   emitLifecycle(event) { for (const handler of this.events) handler(event); }
@@ -76,10 +94,56 @@ test("exact SDK cursor pages map entry.agent and workspace entries", async () =>
 
   assert.deepEqual((await adapter.fetchAllAgents({ limit: 1 })).map((agent) => agent.id), ["a", "b"]);
   assert.deepEqual((await adapter.fetchAllWorkspaces({ limit: 1 })).map((workspace) => workspace.id), ["ws-1", "ws-2"]);
-  assert.deepEqual(client.calls[0][1], { page: { limit: 1 } });
+  assert.deepEqual(client.calls[0][1], {
+    page: { limit: 1 },
+    subscribe: { subscriptionId: "paseo-sender-attention" },
+  });
   assert.deepEqual(client.calls[1][1], { page: { limit: 1, cursor: "cursor-a" } });
   assert.deepEqual(client.calls[2][1], { page: { limit: 1 } });
   assert.deepEqual(client.calls[3][1], { page: { limit: 1, cursor: "cursor-w" } });
+});
+
+test("attention requires an agents subscription and resumes after reconnect reconciliation", async () => {
+  const adapter = new DaemonAdapter({ url: "ws://127.0.0.1:8787", clientId: "test", DaemonClientImpl: FakeClient });
+  await adapter.connect();
+  const client = FakeClient.instance;
+  const received = [];
+  adapter.onAgentAttentionRequired((event) => received.push(event.agentId));
+  const attentionFor = (agentId) => ({ agentId, reason: "finished", timestamp: "2026-11-10T08:00:00Z" });
+
+  client.emitAttention(attentionFor("before-subscription"));
+  assert.deepEqual(received, [], "a local callback alone must not subscribe to daemon broadcasts");
+  client.agentPages.push(page([agentEntry("snapshot-agent")], false));
+  await adapter.fetchAllAgents();
+  client.emitAttention(attentionFor("snapshot-agent"));
+  client.emitAttention(attentionFor("created-after-snapshot"));
+  assert.deepEqual(received, ["snapshot-agent", "created-after-snapshot"]);
+
+  client.emitConnection({ status: "disconnected" });
+  client.emitConnection({ status: "connected" });
+  client.emitAttention(attentionFor("before-resubscription"));
+  assert.equal(received.length, 2, "disconnect must clear the server subscription");
+  client.agentPages.push(page([agentEntry("snapshot-agent")], false));
+  // The service reconciles on a connected transition by fetching the agent directory again.
+  await adapter.fetchAllAgents();
+  client.emitAttention(attentionFor("created-after-reconnect"));
+  assert.deepEqual(received, ["snapshot-agent", "created-after-snapshot", "created-after-reconnect"]);
+
+  await adapter.close();
+  client.emitAttention(attentionFor("after-close"));
+  assert.equal(received.length, 3);
+});
+
+test("agent reconciliation rejects a missing or mismatched subscription acknowledgment", async () => {
+  for (const acknowledgment of [null, "another-subscription"]) {
+    const adapter = new DaemonAdapter({ url: "ws://127.0.0.1:8787", clientId: "test", DaemonClientImpl: FakeClient });
+    await adapter.connect();
+    const client = FakeClient.instance;
+    client.subscriptionAck = acknowledgment;
+    client.agentPages.push(page([agentEntry("a")], false));
+    await assert.rejects(adapter.fetchAllAgents(), /fetchAgents subscription not acknowledged/u);
+    await adapter.close();
+  }
 });
 
 test("workspace association uses public idPrefix pagination and exact match", async () => {
