@@ -36,14 +36,20 @@ test("QQ bridge config stays flat, bounded, non-sensitive, and disabled by defau
   assert.doesNotMatch(common, /qq(?:Account|Openid|Token|Secret|Recipient|Receiver)/i);
 });
 
-test("listener dispatches QQ exactly once after target, dedupe, and desktop gates", () => {
+test("listener limits desktop UI to Pi Web/Paseo while keeping one independent QQ path", () => {
+  const desktopPolicy = listener.lastIndexOf(
+    "$allowDesktopPopup = $declaredOrigin -eq 'pi-web' -or $declaredOrigin -eq 'paseo'",
+  );
   const noTarget = listener.lastIndexOf("-Body 'no-target'");
   const dedup = listener.lastIndexOf("-Body 'dedup'");
   const desktop = listener.lastIndexOf("Show-Toast -Title $title");
+  const suppressed = listener.lastIndexOf("desktop-suppressed reason=origin-not-pi-web-or-paseo");
   const dispatch = listener.lastIndexOf("Start-NotifyQqDispatch -Title $title -Body $body");
   const ok = listener.lastIndexOf("-Body 'ok'");
-  assert.ok(noTarget >= 0 && noTarget < dedup);
-  assert.ok(dedup < desktop && desktop < dispatch && dispatch < ok);
+  assert.ok(desktopPolicy >= 0 && desktopPolicy < noTarget && noTarget < dedup);
+  assert.ok(dedup < desktop && desktop < suppressed && suppressed < dispatch && dispatch < ok);
+  assert.match(listener, /if \(\$allowDesktopPopup -and \$DisplayMode -eq 'popup-focus'/);
+  assert.match(listener, /if \(\$allowDesktopPopup\) \{[\s\S]*Show-Toast -Title \$title/);
   assert.equal(
     (listener.match(/^\s*Start-NotifyQqDispatch -Title \$title -Body \$body\s*$/gm) ?? []).length,
     1,

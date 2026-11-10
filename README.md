@@ -54,8 +54,9 @@ extension discovery in one Node process cannot cancel another live session's not
 For Paseo-managed Pi, the launch marker assigns ownership once at session start; sender lease
 changes cannot rebrand that session as Pi/Pi Web. Configured Pi Web RPC sessions add opaque
 exact-route metadata; raw session IDs are never sent.
-Windows Terminal keeps its canonical-title route. Pi Web exact failures always fail closed and never
-fall back across origins to a Terminal/browser-title guess.
+The Windows listener shows desktop UI only for Pi Web and Paseo. Terminal, CodexHost
+and other accepted producers remain eligible for QQ-only delivery. Pi Web exact
+failures always fail closed without guessing another surface from terminal titles.
 
 See [`windows/README.md`](windows/README.md#optional-pi-web-exact-routing) for Route Host installation,
 verification, recovery, and uninstall guidance. Browser adapters are not active merely because the

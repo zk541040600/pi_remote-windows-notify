@@ -399,13 +399,15 @@ if ($qqSenderText -notmatch '''--text-file'', \$TextFile' -or $qqSenderText -not
 if ($qqSenderText -match '\b(retry|Start-Sleep)\b' -or $qqSenderText -match 'Write-NotifyQqSenderLog[^\r\n]*(stdout|stderr|senderScript|TextFile)' -or $qqSenderText -match '\b(account|openid|recipient|receiver|clientSecret)\b') {
     throw 'QQ worker must not retry or log sender output, message paths, recipient identity, or credentials.'
 }
+$qqDesktopPolicyIndex = $listenerText.LastIndexOf("`$allowDesktopPopup = `$declaredOrigin -eq 'pi-web' -or `$declaredOrigin -eq 'paseo'")
 $qqNoTargetIndex = $listenerText.LastIndexOf("-Body 'no-target'")
 $qqDedupIndex = $listenerText.LastIndexOf("-Body 'dedup'")
 $qqDesktopIndex = $listenerText.LastIndexOf('Show-Toast -Title $title')
+$qqDesktopSuppressedIndex = $listenerText.LastIndexOf('desktop-suppressed reason=origin-not-pi-web-or-paseo')
 $qqDispatchIndex = $listenerText.LastIndexOf('Start-NotifyQqDispatch -Title $title -Body $body')
 $qqOkIndex = $listenerText.LastIndexOf("-Body 'ok'")
-if ($qqNoTargetIndex -lt 0 -or $qqNoTargetIndex -ge $qqDedupIndex -or $qqDedupIndex -ge $qqDesktopIndex -or $qqDesktopIndex -ge $qqDispatchIndex -or $qqDispatchIndex -ge $qqOkIndex -or ([regex]::Matches($listenerText, '(?m)^\s*Start-NotifyQqDispatch -Title \$title -Body \$body\s*$')).Count -ne 1 -or $listenerText -notmatch 'qq-send-drop reason=capacity' -or $listenerText -notmatch 'SetAccessRuleProtection\(\$true, \$false\)') {
-    throw 'Listener QQ dispatch must run once after target/dedupe/desktop gates with private bounded worker resources.'
+if ($qqDesktopPolicyIndex -lt 0 -or $qqDesktopPolicyIndex -ge $qqNoTargetIndex -or $qqNoTargetIndex -ge $qqDedupIndex -or $qqDedupIndex -ge $qqDesktopIndex -or $qqDesktopIndex -ge $qqDesktopSuppressedIndex -or $qqDesktopSuppressedIndex -ge $qqDispatchIndex -or $qqDispatchIndex -ge $qqOkIndex -or $listenerText -notmatch 'if \(\$allowDesktopPopup -and \$DisplayMode' -or $listenerText -notmatch 'if \(\$allowDesktopPopup\) \{[\s\S]*Show-Toast -Title \$title' -or ([regex]::Matches($listenerText, '(?m)^\s*Start-NotifyQqDispatch -Title \$title -Body \$body\s*$')).Count -ne 1 -or $listenerText -notmatch 'qq-send-drop reason=capacity' -or $listenerText -notmatch 'SetAccessRuleProtection\(\$true, \$false\)') {
+    throw 'Listener must limit desktop UI to Pi Web/Paseo and run one independent QQ dispatch with private bounded worker resources.'
 }
 if ($listenerText -match 'Paseo stays off the QQ mirror path' -or $listenerText -match 'if \(\$routeOriginKind -ne ''paseo''\)\s*\{[\s\S]{0,80}Start-NotifyQqDispatch') {
     throw 'Listener QQ dispatch must include originKind=paseo after desktop display succeeds.'

@@ -1433,7 +1433,10 @@ try {
                 }
             }
 
-            if ($DisplayMode -eq 'popup-focus' -and [string]::IsNullOrWhiteSpace($cwdBase) -and [string]::IsNullOrWhiteSpace($tabTitle) -and [string]::IsNullOrWhiteSpace($routeSnapshotId) -and -not $suppressTerminalFallback -and $routeOriginKind -ne 'paseo') {
+            # Desktop UI belongs only to Pi Web and Paseo. Terminal, CodexHost, and
+            # other authenticated producers remain eligible for the independent QQ path.
+            $allowDesktopPopup = $declaredOrigin -eq 'pi-web' -or $declaredOrigin -eq 'paseo'
+            if ($allowDesktopPopup -and $DisplayMode -eq 'popup-focus' -and [string]::IsNullOrWhiteSpace($cwdBase) -and [string]::IsNullOrWhiteSpace($tabTitle) -and [string]::IsNullOrWhiteSpace($routeSnapshotId) -and -not $suppressTerminalFallback -and $routeOriginKind -ne 'paseo') {
                 Write-NotifyListenerLog -Message ('notify-drop missing-target-metadata targetFingerprint="{0}"' -f (Get-NotifyPopupTargetFingerprint -TargetKey $focusTarget))
                 Write-HttpResponse -Stream $stream -StatusCode 200 -Reason 'OK' -Body 'no-target'
                 continue
@@ -1443,36 +1446,40 @@ try {
                 continue
             }
 
-            $launchUri = Get-NotifyBridgeActivationUri -ActivationId ([Guid]::NewGuid().ToString('N'))
-            $displayTargetFingerprint = if ($routeOriginKind -eq 'paseo' -and -not [string]::IsNullOrWhiteSpace($paseoTargetFingerprint)) {
-                $paseoTargetFingerprint
-            } else {
-                (Get-NotifyPopupTargetFingerprint -TargetKey $focusTarget)
-            }
+            if ($allowDesktopPopup) {
+                $launchUri = Get-NotifyBridgeActivationUri -ActivationId ([Guid]::NewGuid().ToString('N'))
+                $displayTargetFingerprint = if ($routeOriginKind -eq 'paseo' -and -not [string]::IsNullOrWhiteSpace($paseoTargetFingerprint)) {
+                    $paseoTargetFingerprint
+                } else {
+                    (Get-NotifyPopupTargetFingerprint -TargetKey $focusTarget)
+                }
 
-            Write-NotifyListenerLog -Message ('notify targetFingerprint="{0}" hasCwd={1} hasTab={2} originKind={3} notificationFp={4} snapshotFp={5}' -f $displayTargetFingerprint, (-not [string]::IsNullOrWhiteSpace($cwdBase)), (-not [string]::IsNullOrWhiteSpace($tabTitle)), $(if ([string]::IsNullOrWhiteSpace($routeOriginKind)) { 'none' } else { $routeOriginKind }), (Get-NotifyRouteFingerprint -Value $routeNotificationId), (Get-NotifyRouteFingerprint -Value $routeSnapshotId))
-            if ($routeOriginKind -eq 'paseo') {
-                # Agent fingerprint drives same-agent replacement / different-agent stack.
-                # Route transports contain only the opaque activation handle; Terminal metadata is blank.
-                try {
-                    Show-Toast -Title $title -Body $body -ToastAppId $AppId -FocusTarget '' -CwdBase '' -TabTitle '' -SessionName '' -LaunchUri $launchUri -OriginKind 'paseo' -NotificationId $routeNotificationId -SnapshotId $routeSnapshotId -RecoveryTicketId '' -TargetFingerprint $displayTargetFingerprint
+                Write-NotifyListenerLog -Message ('notify targetFingerprint="{0}" hasCwd={1} hasTab={2} originKind={3} notificationFp={4} snapshotFp={5}' -f $displayTargetFingerprint, (-not [string]::IsNullOrWhiteSpace($cwdBase)), (-not [string]::IsNullOrWhiteSpace($tabTitle)), $(if ([string]::IsNullOrWhiteSpace($routeOriginKind)) { 'none' } else { $routeOriginKind }), (Get-NotifyRouteFingerprint -Value $routeNotificationId), (Get-NotifyRouteFingerprint -Value $routeSnapshotId))
+                if ($routeOriginKind -eq 'paseo') {
+                    # Agent fingerprint drives same-agent replacement / different-agent stack.
+                    # Route transports contain only the opaque activation handle; Terminal metadata is blank.
+                    try {
+                        Show-Toast -Title $title -Body $body -ToastAppId $AppId -FocusTarget '' -CwdBase '' -TabTitle '' -SessionName '' -LaunchUri $launchUri -OriginKind 'paseo' -NotificationId $routeNotificationId -SnapshotId $routeSnapshotId -RecoveryTicketId '' -TargetFingerprint $displayTargetFingerprint
+                    }
+                    catch {
+                        Write-NotifyListenerLog -Message ('paseo-display-error result=retry reason={0} notificationFp={1}' -f $_.Exception.GetType().Name, (Get-NotifyRouteFingerprint -Value $routeNotificationId))
+                        Write-HttpResponse -Stream $stream -StatusCode 200 -Reason 'OK' -Body 'retry'
+                        continue
+                    }
+                    # Record five-second dedup only after the desktop path accepted the display.
+                    [void](Test-NotifyDuplicateDrop -Title $title -Body $body -FocusTarget $paseoTargetFingerprint -CwdBase '' -TabTitle '' -OriginKind 'paseo')
                 }
-                catch {
-                    Write-NotifyListenerLog -Message ('paseo-display-error result=retry reason={0} notificationFp={1}' -f $_.Exception.GetType().Name, (Get-NotifyRouteFingerprint -Value $routeNotificationId))
-                    Write-HttpResponse -Stream $stream -StatusCode 200 -Reason 'OK' -Body 'retry'
-                    continue
+                else {
+                    Show-Toast -Title $title -Body $body -ToastAppId $AppId -FocusTarget $focusTarget -CwdBase $cwdBase -TabTitle $tabTitle -SessionName $sessionName -LaunchUri $launchUri -OriginKind $routeOriginKind -NotificationId $routeNotificationId -SnapshotId $routeSnapshotId -RecoveryTicketId $routeRecoveryTicketId
                 }
-                # Record five-second dedup only after the desktop path accepted the display.
-                [void](Test-NotifyDuplicateDrop -Title $title -Body $body -FocusTarget $paseoTargetFingerprint -CwdBase '' -TabTitle '' -OriginKind 'paseo')
             }
             else {
-                Show-Toast -Title $title -Body $body -ToastAppId $AppId -FocusTarget $focusTarget -CwdBase $cwdBase -TabTitle $tabTitle -SessionName $sessionName -LaunchUri $launchUri -OriginKind $routeOriginKind -NotificationId $routeNotificationId -SnapshotId $routeSnapshotId -RecoveryTicketId $routeRecoveryTicketId
+                Write-NotifyListenerLog -Message 'desktop-suppressed reason=origin-not-pi-web-or-paseo'
             }
             $notified = $true
             try {
-                # QQ mirror runs only after desktop display succeeds for every origin
-                # (Terminal / Pi Web / Paseo). Uses the same title/body as the popup;
-                # no-target, dedup, and suppressed-active-agent paths never reach here.
+                # QQ is independent from desktop eligibility. Pi Web/Paseo dispatch after
+                # display succeeds; Terminal/CodexHost dispatch without showing desktop UI.
                 Start-NotifyQqDispatch -Title $title -Body $body
             }
             catch {

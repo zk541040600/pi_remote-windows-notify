@@ -38,7 +38,8 @@ This folder implements a reliable **Windows local notification bridge** for runn
 ```text
 Windows local machine
   notify-listener.ps1 :23118 (public /notify endpoint, token auth)
-    -> popup-focus mode: POST to pi-notify-broker.ps1 :23119 (loopback only)
+    -> Pi Web/Paseo: popup-focus POST to pi-notify-broker.ps1 :23119 (loopback only)
+    -> Terminal/CodexHost/other accepted origins: QQ-only, no desktop popup
        -> long-lived WinForms process shows popup cards without per-notification startup
     -> broker unavailable/post fails: fallback to pi-notify-popup.ps1 process
     -> optional QQ mirror: pi-notify-qq-sender.ps1 starts the existing local sender with a temp text file
@@ -55,7 +56,7 @@ Optional Pi Web exact route
     -> Chrome/Edge adapter through Native Messaging (only after explicit load/config)
 ```
 
-The broker binds only `127.0.0.1` and is never exposed through the SSH tunnel. The listener remains the single public entry point and continues to authenticate every request. Route Host does not replace Terminal matching: `originKind=terminal` keeps the existing canonical-title path, while a declared `originKind=pi-web` is either exact or a fail-closed no-op.
+The broker binds only `127.0.0.1` and is never exposed through the SSH tunnel. The listener remains the single public entry point and authenticates every request. Only `originKind=pi-web` and `originKind=paseo` show desktop UI; Terminal/CodexHost/other accepted origins can use QQ independently, without triggering desktop activation. Pi Web exact-route failure stays fail-closed.
 
 `originKind=paseo` is a third, fully isolated branch. Legitimate Paseo payloads display without Terminal `cwdBase/tabTitle`, use a fixed UI label `Paseo`, and store only an opaque DPAPI-protected activation handle. Click paths (broker, fallback popup, system toast, activate-oldest) all call the same Paseo handler and **never** fall through to Terminal or Pi Web. Activation uses loopback CDP only to dispatch Paseo's existing `paseo:web-notification-click` renderer event (no `Page.navigate`, no handcrafted `paseo://` URLs, no cold-start/kill/restart).
 

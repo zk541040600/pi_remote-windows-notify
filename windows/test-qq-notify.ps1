@@ -375,6 +375,10 @@ if (mode === "timeout") {
             throw ('Listener-to-worker text mismatch: {0}' -f $expectedMessage.Replace("`r`n", ' / '))
         }
     }
+    $desktopCount = if (Test-Path -LiteralPath $desktopSink) { @([System.IO.File]::ReadAllLines($desktopSink)).Count } else { 0 }
+    if ($desktopCount -ne 1) {
+        throw 'Only the Pi Web fixture should create desktop UI; Terminal fixtures stay QQ-only.'
+    }
     $listenerLog = [System.IO.File]::ReadAllText($listenerFixture.ListenerLog, [System.Text.UTF8Encoding]::new($false))
     if ($listenerLog -match 'Ask title|Waiting for answer|Turn title|Turn complete|Web title|Web complete|No target title|No target body') {
         throw 'Listener log exposed QQ message text.'
@@ -403,8 +407,9 @@ if (mode === "timeout") {
         -not (Test-Path -LiteralPath $capacityFixture.PendingDir) -or
         @(Get-ChildItem -LiteralPath $capacityFixture.PendingDir -Filter '*.txt' -File -ErrorAction SilentlyContinue).Count -eq 0
     }
-    if (@([System.IO.File]::ReadAllLines($capacityDesktopSink)).Count -ne 2) {
-        throw 'Capacity limit interfered with desktop notification delivery.'
+    $capacityDesktopCount = if (Test-Path -LiteralPath $capacityDesktopSink) { @([System.IO.File]::ReadAllLines($capacityDesktopSink)).Count } else { 0 }
+    if ($capacityDesktopCount -ne 0) {
+        throw 'Terminal capacity fixtures must not create desktop UI.'
     }
     Stop-NotifyQqTestListener -Fixture $capacityFixture
     $capacityFixture = $null
@@ -413,8 +418,8 @@ if (mode === "timeout") {
     $missingFixture = Start-NotifyQqTestListener -BaseDir $missingDir -NodeExecutable $nodeExecutable -SenderScript (Join-Path $missingDir 'missing-sender.mjs') -DesktopSinkPath $missingDesktopSink
     $noTargetBefore = Get-NotifyQqTestOutputCount -Path $outputPath
     $noTargetPayload = @{ title = 'No target title'; body = 'No target body'; focusTarget = 'qq-test' }
-    if ((Invoke-NotifyQqTestRequest -Port $missingFixture.Port -Token $missingFixture.Token -Payload $noTargetPayload) -ne 'no-target') {
-        throw 'Popup-focus no-target request did not preserve no-target response.'
+    if ((Invoke-NotifyQqTestRequest -Port $missingFixture.Port -Token $missingFixture.Token -Payload $noTargetPayload) -ne 'ok') {
+        throw 'Terminal no-target request must remain eligible for QQ-only delivery.'
     }
     Start-Sleep -Milliseconds 300
     if ((Get-NotifyQqTestOutputCount -Path $outputPath) -ne $noTargetBefore) {
@@ -428,8 +433,9 @@ if (mode === "timeout") {
         (Test-Path -LiteralPath $missingFixture.ListenerLog) -and
         ([System.IO.File]::ReadAllText($missingFixture.ListenerLog) -match 'qq-send-unavailable reason=sender')
     }
-    if (@([System.IO.File]::ReadAllLines($missingDesktopSink)).Count -ne 1) {
-        throw 'Unavailable sender interfered with desktop notification delivery.'
+    $missingDesktopCount = if (Test-Path -LiteralPath $missingDesktopSink) { @([System.IO.File]::ReadAllLines($missingDesktopSink)).Count } else { 0 }
+    if ($missingDesktopCount -ne 0) {
+        throw 'Terminal requests must not create desktop UI when the QQ sender is unavailable.'
     }
     Stop-NotifyQqTestListener -Fixture $missingFixture
     $missingFixture = $null
