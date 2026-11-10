@@ -2,6 +2,11 @@
 
 This folder implements a reliable **Windows local notification bridge** for running Pi on remote host `my` while still receiving desktop notifications on Windows.
 
+> **Source layout:** All commands below run from this repository root.
+> `windows/` is the canonical source; `%USERPROFILE%\.pi-notify\bin`
+> is the installed runtime copy. The legacy `MyCode/scripts/pi-notify` folder
+> is retired and must not be used for upgrades.
+
 ## Files
 
 - `NotifyBridge.Common.ps1` — shared config, path, argument quoting, and toast setup helpers
@@ -226,7 +231,7 @@ CDP has no authentication; any same-user local process that can reach the loopba
 ## First-time remote install
 
 ```powershell
-powershell.exe -ExecutionPolicy Bypass -File .\scripts\pi-notify\install-remote-windows-notify.ps1 -RemoteHostAlias my
+powershell.exe -ExecutionPolicy Bypass -File .\windows\install-remote-windows-notify.ps1 -RemoteHostAlias my
 ```
 
 This creates/updates:
@@ -244,13 +249,13 @@ overwriting it.
 Start the listener:
 
 ```powershell
-powershell.exe -ExecutionPolicy Bypass -File .\scripts\pi-notify\pi-notify-restart-listener.ps1
+powershell.exe -ExecutionPolicy Bypass -File .\windows\pi-notify-restart-listener.ps1
 ```
 
 Start the reverse tunnel:
 
 ```powershell
-powershell.exe -ExecutionPolicy Bypass -File .\scripts\pi-notify\pi-notify-reverse-tunnel.ps1
+powershell.exe -ExecutionPolicy Bypass -File .\windows\pi-notify-reverse-tunnel.ps1
 ```
 
 Or ad-hoc SSH:
@@ -264,15 +269,15 @@ ssh -R 127.0.0.1:23118:127.0.0.1:23118 my
 ### Windows + Linux together
 
 ```powershell
-powershell.exe -ExecutionPolicy Bypass -File .\scripts\pi-notify\install-autostart-all.ps1 -RemoteHostAlias my
+powershell.exe -ExecutionPolicy Bypass -File .\windows\install-autostart-all.ps1 -RemoteHostAlias my
 # custom remote Pi dir:
-# powershell.exe -ExecutionPolicy Bypass -File .\scripts\pi-notify\install-autostart-all.ps1 -RemoteHostAlias my -RemotePiDir /custom/pi/agent
+# powershell.exe -ExecutionPolicy Bypass -File .\windows\install-autostart-all.ps1 -RemoteHostAlias my -RemotePiDir /custom/pi/agent
 ```
 
 ### Windows only
 
 ```powershell
-powershell.exe -ExecutionPolicy Bypass -File .\scripts\pi-notify\install-windows-autostart.ps1 -RemoteHostAlias my
+powershell.exe -ExecutionPolicy Bypass -File .\windows\install-windows-autostart.ps1 -RemoteHostAlias my
 ```
 
 Installer behavior:
@@ -297,7 +302,7 @@ They start at user logon. `PiNotifyListener.vbs` invokes `pi-notify-restart-list
 ## Refresh after pull
 
 ```powershell
-powershell.exe -ExecutionPolicy Bypass -File .\scripts\pi-notify\pi-notify-refresh.ps1
+powershell.exe -ExecutionPolicy Bypass -File .\windows\pi-notify-refresh.ps1
 ```
 
 By default this sets `popup-focus`, `popupPlacement=cursor`, and a 1800 second (30 minute) timeout, syncs Windows runtime files, restarts the listener, and restarts the reverse tunnel. Add `-Pull` to run a fast-forward-only git pull. Add `-SyncRemote` to sync the remote `my` extension/config and update any existing Pi package-cache extension copies. When using a non-default remote Pi directory, pass `-RemotePiDir` together with `-SyncRemote` so refresh updates the same directory that autostart installed. Use `-SkipRemoteSync` only when the remote host is unavailable and you know the remote config is already current.
@@ -305,15 +310,15 @@ By default this sets `popup-focus`, `popupPlacement=cursor`, and a 1800 second (
 Run the fixed-root check script when validating from another working directory:
 
 ```powershell
-powershell.exe -ExecutionPolicy Bypass -File .\scripts\pi-notify\pi-notify-check.ps1
+powershell.exe -ExecutionPolicy Bypass -File .\windows\pi-notify-check.ps1
 ```
 
 ### Linux `my` only
 
 ```powershell
-powershell.exe -ExecutionPolicy Bypass -File .\scripts\pi-notify\install-linux-autostart.ps1 -RemoteHostAlias my
+powershell.exe -ExecutionPolicy Bypass -File .\windows\install-linux-autostart.ps1 -RemoteHostAlias my
 # custom remote Pi dir:
-# powershell.exe -ExecutionPolicy Bypass -File .\scripts\pi-notify\install-linux-autostart.ps1 -RemoteHostAlias my -RemotePiDir /custom/pi/agent
+# powershell.exe -ExecutionPolicy Bypass -File .\windows\install-linux-autostart.ps1 -RemoteHostAlias my -RemotePiDir /custom/pi/agent
 ```
 
 Installs and enables a user-level autostart guard:
@@ -488,8 +493,8 @@ Display modes:
 Switch modes:
 
 ```powershell
-powershell.exe -ExecutionPolicy Bypass -File .\scripts\pi-notify\set-notify-mode.ps1 -Mode system-toast
-powershell.exe -ExecutionPolicy Bypass -File .\scripts\pi-notify\set-notify-mode.ps1 -Mode popup-focus -PopupPlacement cursor
+powershell.exe -ExecutionPolicy Bypass -File .\windows\set-notify-mode.ps1 -Mode system-toast
+powershell.exe -ExecutionPolicy Bypass -File .\windows\set-notify-mode.ps1 -Mode popup-focus -PopupPlacement cursor
 ```
 
 ## Optional Pi Web exact routing
@@ -577,7 +582,7 @@ If the broker is unavailable, the listener automatically falls back to the per-n
 To disable the broker and restore the old per-notification behavior, set `brokerEnabled` to `false` in the config and refresh:
 
 ```powershell
-powershell.exe -ExecutionPolicy Bypass -File .\scripts\pi-notify\pi-notify-refresh.ps1 -SkipTunnel -SkipRemoteSync
+powershell.exe -ExecutionPolicy Bypass -File .\windows\pi-notify-refresh.ps1 -SkipTunnel -SkipRemoteSync
 ```
 
 ### No toast shown
@@ -599,5 +604,5 @@ Check both files use the same token:
 Re-run the installers with a custom port:
 
 ```powershell
-powershell.exe -ExecutionPolicy Bypass -File .\scripts\pi-notify\install-autostart-all.ps1 -RemoteHostAlias my -Port 23118
+powershell.exe -ExecutionPolicy Bypass -File .\windows\install-autostart-all.ps1 -RemoteHostAlias my -Port 23118
 ```

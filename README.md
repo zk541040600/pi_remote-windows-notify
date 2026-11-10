@@ -12,6 +12,26 @@ See [`windows/README.md`](windows/README.md) for installation, autostart, config
 - `browser-extension/` — shared Manifest V3 adapter for Chrome and Edge; it is opt-in and must be explicitly loaded in each browser profile.
 - `test/` — config/lifecycle, ask-user prompt, route metadata, and package-vs-standalone ownership regressions.
 
+## Source of truth and runtime deployment
+
+This repository is the **only source repository** for `pi-notify` on both operating systems.
+Edit Windows listener, popup, broker, installers and tests under `windows/`; edit
+Pi sender/package code under `linux/`. Do not maintain another implementation in
+`MyCode/scripts/pi-notify`, and do not treat the runtime installation as source code.
+
+Windows installs/copies the tested `windows/` scripts into
+`%USERPROFILE%\.pi-notify\bin` (or the configured instance `bin` directory).
+The login startup shortcuts and running processes execute that **installed copy**.
+To deploy an update, run the corresponding `windows/pi-notify-refresh.ps1` from
+this checkout after validation, not by editing `bin` or copying the old MyCode tree.
+Keep the installed `config.json`, logs, runtime state and credentials outside Git.
+Do not overwrite a running installation when it differs from the repository
+without reviewing its diff and preserving a rollback copy.
+
+The `PiWebDesktop` application and its C# adapter remain maintained under
+`MyCode/IggToolsL2/tools/pi-web-desktop`; the notify repository integrates with
+that adapter through Route Host, not a duplicate desktop app.
+
 ## Linux-side Pi package
 
 Install the Pi extension on the remote/Linux machine:
