@@ -467,7 +467,8 @@ $paseoNoRoute = Resolve-NotifyPaseoRouteMetadata -Payload ([pscustomobject]@{ or
 Assert-True (-not $paseoNoRoute.IsValidPaseoExact) 'paseo-missing-route-rejected'
 
 Assert-equal 'Paseo' (Get-NotifyAppLabel -OriginKind 'paseo') 'app-label-paseo'
-Assert-equal 'Pi Remote' (Get-NotifyAppLabel -OriginKind 'pi-web') 'app-label-pi-web'
+Assert-Equal 'Pi Notify' (Get-NotifyAppLabel -OriginKind 'pi-web') 'app-label-pi-web'
+Assert-Equal ([char]::ConvertFromUtf32(0x1F535) + ' Pi Notify') (Get-NotifyPiSourceLabel) 'qq-label-pi-blue'
 Assert-equal 'Pi Remote' (Get-NotifyAppLabel -OriginKind 'terminal') 'app-label-terminal'
 Assert-equal 'Pi Remote' (Get-NotifyAppLabel -OriginKind '') 'app-label-empty'
 

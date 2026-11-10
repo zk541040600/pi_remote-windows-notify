@@ -1816,7 +1816,7 @@ function Show-NotifyBrokerPopup {
     $appLabel.Size = New-Object System.Drawing.Size(240, 18)
     $appLabel.Font = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Regular)
     $appLabel.ForeColor = $mutedColor
-    $appLabel.Text = Get-NotifyAppLabel -OriginKind $OriginKind
+    Set-NotifyAppHeader -Label $appLabel -OriginKind $OriginKind
     $appLabel.Cursor = [System.Windows.Forms.Cursors]::Hand
     [void]$panel.Controls.Add($appLabel)
 

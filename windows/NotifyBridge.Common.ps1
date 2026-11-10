@@ -1973,13 +1973,42 @@ function Invoke-NotifyExactRouteActivate {
 
 # --- Paseo desktop route helpers (opaque activation + loopback CDP contract) ---------
 
+function Get-NotifyPiSourceLabel {
+    # Build the QQ blue-circle emoji without relying on PowerShell 5.1 source encoding.
+    return ([char]::ConvertFromUtf32(0x1F535) + ' Pi Notify')
+}
+
 function Get-NotifyAppLabel {
     [CmdletBinding()]
     param([string]$OriginKind = '')
 
     $kind = if ($null -eq $OriginKind) { '' } else { $OriginKind.Trim() }
     if ($kind -eq 'paseo') { return 'Paseo' }
+    if ($kind -eq 'pi-web') { return 'Pi Notify' }
     return 'Pi Remote'
+}
+
+function Set-NotifyAppHeader {
+    param([System.Windows.Forms.Label]$Label, [string]$OriginKind = '')
+
+    $Label.Text = Get-NotifyAppLabel -OriginKind $OriginKind
+    if (([string]$OriginKind).Trim() -ne 'pi-web') { return }
+
+    # Draw the dot rather than relying on WinForms to render a color emoji.
+    $Label.Padding = [System.Windows.Forms.Padding]::new(16, 0, 0, 0)
+    $Label.Add_Paint({
+        $graphics = $_.Graphics
+        $originalSmoothing = $graphics.SmoothingMode
+        $brush = [System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(96, 165, 250))
+        try {
+            $graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+            $top = [int][Math]::Floor(($this.ClientSize.Height - 10) / 2)
+            $graphics.FillEllipse($brush, 1, $top, 10, 10)
+        } finally {
+            $graphics.SmoothingMode = $originalSmoothing
+            $brush.Dispose()
+        }
+    })
 }
 
 function Test-NotifyPaseoRouteId {

@@ -370,7 +370,8 @@ if (mode === "timeout") {
     }
 
     $listenerMessages = @([System.IO.File]::ReadAllLines($outputPath, [System.Text.UTF8Encoding]::new($false)) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { $_ | ConvertFrom-Json })
-    foreach ($expectedMessage in @("Ask title`r`nWaiting for answer", "Turn title`r`nTurn complete", "Web title`r`nWeb complete")) {
+    $piPrefix = [char]::ConvertFromUtf32(0x1F535) + ' Pi Notify' + [Environment]::NewLine
+    foreach ($expectedMessage in @("${piPrefix}Ask title`r`nWaiting for answer", "${piPrefix}Turn title`r`nTurn complete", "${piPrefix}Web title`r`nWeb complete", "Dedup title`r`nDedup body")) {
         if ($listenerMessages -notcontains $expectedMessage) {
             throw ('Listener-to-worker text mismatch: {0}' -f $expectedMessage.Replace("`r`n", ' / '))
         }

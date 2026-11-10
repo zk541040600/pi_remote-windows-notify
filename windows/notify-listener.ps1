@@ -140,7 +140,8 @@ function Start-NotifyQqDispatch {
         [Parameter(Mandatory = $true)]
         [string]$Title,
         [Parameter(Mandatory = $true)]
-        [string]$Body
+        [string]$Body,
+        [string]$OriginKind = ''
     )
 
     if (-not $script:NotifyQqEnabled) {
@@ -170,6 +171,9 @@ function Start-NotifyQqDispatch {
         $qqTitle = ConvertTo-NotifyQqTextPart -Value $Title -MaxLength 80
         $qqBody = ConvertTo-NotifyQqTextPart -Value $Body -MaxLength 220
         $qqText = if ([string]::IsNullOrWhiteSpace($qqBody)) { $qqTitle } else { $qqTitle + [System.Environment]::NewLine + $qqBody }
+        if ($OriginKind -in @('pi-web', 'terminal')) {
+            $qqText = (Get-NotifyPiSourceLabel) + [System.Environment]::NewLine + $qqText
+        }
         [System.IO.File]::WriteAllText($textFile, $qqText, [System.Text.UTF8Encoding]::new($false))
 
         $workerArgs = Join-NotifyBridgeProcessArguments @(
@@ -1480,7 +1484,7 @@ try {
             try {
                 # QQ is independent from desktop eligibility. Pi Web/Paseo dispatch after
                 # display succeeds; Terminal/CodexHost dispatch without showing desktop UI.
-                Start-NotifyQqDispatch -Title $title -Body $body
+                Start-NotifyQqDispatch -Title $title -Body $body -OriginKind $declaredOrigin
             }
             catch {
                 Write-NotifyListenerLog -Message ('qq-send-error reason={0}' -f $_.Exception.GetType().Name)
