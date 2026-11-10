@@ -329,11 +329,11 @@ test("Fallback popup has an exact close timer independent from activation", () =
     popup.indexOf("function Set-NotifyPopupActivating"),
     popup.indexOf("function Request-NotifyPopupExactWorkerStop"),
   );
-  assert.doesNotMatch(activatingFn, /NotifyPopupPaseoCloseTimer\.Stop/);
-  assert.match(popup, /NotifyPopupPaseoCloseTimer = New-Object System\.Windows\.Forms\.Timer/);
+  assert.doesNotMatch(activatingFn, /NotifyPopupSignalTimer\.Stop/);
+  assert.match(popup, /NotifyPopupSignalTimer = New-Object System\.Windows\.Forms\.Timer/);
   assert.match(popup, /Test-NotifyPaseoCloseSignal -NotificationId \$targetNotificationId/);
   assert.match(popup, /Request-NotifyPopupExactWorkerStop -Reason 'paseo-close'/);
-  assert.match(popup, /NotifyPopupPaseoCloseTimer\.Dispose\(\)/);
+  assert.match(popup, /NotifyPopupSignalTimer\.Dispose\(\)/);
   assert.match(routeTests, /paseo-close-signal-visible-during-activation/);
 });
 

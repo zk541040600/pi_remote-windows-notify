@@ -580,6 +580,53 @@ function Normalize-NotifyBridgePopupPlacement {
     return 'cursor'
 }
 
+
+# Each fallback process owns its activation; the hotkey only signals that existing UI.
+function Get-NotifyPopupActivationEventName {
+    param([int]$ProcessId, [string]$ActivationKey)
+
+    if ($ProcessId -le 0 -or $ActivationKey -notmatch '^[a-f0-9]{32}$') { return '' }
+    return ('Local\PiNotifyPopupActivate.{0}.{1}' -f $ProcessId, $ActivationKey.ToLowerInvariant())
+}
+
+# Convert once so WinForms Interval and the immutable deadline have identical bounds.
+function Get-NotifyPopupLifetimeMs {
+    param([int]$TimeoutSeconds = 1800)
+
+    return [int][Math]::Min([double][int]::MaxValue, [Math]::Max([double]3000, ([double]$TimeoutSeconds * 1000)))
+}
+
+# Shared screen geometry for broker and fallback cards.
+function Get-NotifyPopupWorkingArea {
+    param([string]$Placement = 'cursor')
+
+    if (-not ('System.Windows.Forms.Screen' -as [type])) { Add-Type -AssemblyName System.Windows.Forms }
+    $placementValue = Normalize-NotifyBridgePopupPlacement -Value $Placement
+    if ($placementValue -eq 'cursor') {
+        return [System.Windows.Forms.Screen]::FromPoint([System.Windows.Forms.Cursor]::Position).WorkingArea
+    }
+    if ($placementValue -eq 'right') {
+        return (@([System.Windows.Forms.Screen]::AllScreens | Sort-Object { $_.WorkingArea.Right } -Descending)[0]).WorkingArea
+    }
+    return [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+}
+
+function Get-NotifyPopupStackCapacity {
+    param([int]$WorkingAreaHeight, [int]$FormHeight = 154, [int]$MaxVisible = 4)
+
+    $rows = [Math]::Floor(($WorkingAreaHeight - 32 + 12) / ([Math]::Max(1, $FormHeight) + 12))
+    return [int][Math]::Max(1, [Math]::Min([Math]::Max(1, $MaxVisible), $rows))
+}
+
+function Get-NotifyPopupStackPosition {
+    param($WorkingArea, [int]$StackIndex, [int]$FormWidth, [int]$FormHeight)
+
+    $x = [Math]::Max($WorkingArea.Left, $WorkingArea.Right - $FormWidth - 16)
+    $bottomY = $WorkingArea.Bottom - $FormHeight - 16
+    $y = [Math]::Max($WorkingArea.Top, $bottomY - ([Math]::Max(0, $StackIndex) * ($FormHeight + 12)))
+    return [pscustomobject]@{ X = [int]$x; Y = [int]$y }
+}
+
 function Normalize-NotifyBridgePopupHotkey {
     [CmdletBinding()]
     param(

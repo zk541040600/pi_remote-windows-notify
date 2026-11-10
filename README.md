@@ -69,3 +69,9 @@ configured extension.
 npm test
 npm run check
 ```
+
+Windows popup behavior checks (Windows PowerShell 5.1):
+
+```powershell
+powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File .\windows\test-popup-ui.ps1
+```

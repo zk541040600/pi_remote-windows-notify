@@ -280,6 +280,10 @@ function New-FakeForm {
 }
 function Write-NotifyBrokerLog { param([string]$Message) }
 function Write-NotifyPopupLog { param([string]$Message) }
+$script:BrokerLiveStateRemoveCalls = 0
+$script:PopupLiveStateRemoveCalls = 0
+function Remove-NotifyBrokerLiveState { param([string]$PopupId) $script:BrokerLiveStateRemoveCalls += 1 }
+function Remove-NotifyPopupLiveState { $script:PopupLiveStateRemoveCalls += 1 }
 
 . ([scriptblock]::Create((Get-TestFunctionDefinition -Path $env:PI_NOTIFY_BROKER_TEST_PATH -Name 'Complete-NotifyBrokerPopupLifecycle')))
 . ([scriptblock]::Create((Get-TestFunctionDefinition -Path $env:PI_NOTIFY_BROKER_TEST_PATH -Name 'Invoke-NotifyBrokerOldestPopupActivation')))
@@ -328,6 +332,7 @@ $firstDismiss = Complete-NotifyBrokerPopupLifecycle -Tag $brokerTag -Outcome 'di
 $repeatDismiss = Complete-NotifyBrokerPopupLifecycle -Tag $brokerTag -Outcome 'dismissed' -Reason 'failure-auto-close-repeat'
 if (-not $firstFailure -or $repeatFailure -or -not $firstDismiss -or $repeatDismiss -or
     $brokerTag.FailureCloseTimer.StartCalls -ne 1 -or
+    $script:BrokerLiveStateRemoveCalls -ne 1 -or
     $script:BrokerUnavailableCalls -ne 1 -or
     $brokerForm.CloseCalls -ne 1 -or
     $brokerTag.TerminalOutcome -ne 'failed') {
@@ -358,6 +363,7 @@ $firstDismiss = Complete-NotifyPopupLifecycle -Outcome 'dismissed' -Reason 'fail
 $repeatDismiss = Complete-NotifyPopupLifecycle -Outcome 'dismissed' -Reason 'failure-auto-close-repeat'
 if (-not $firstFailure -or $repeatFailure -or -not $firstDismiss -or $repeatDismiss -or
     $script:NotifyPopupFailureCloseTimer.StartCalls -ne 1 -or
+    $script:PopupLiveStateRemoveCalls -ne 1 -or
     $script:PopupUnavailableCalls -ne 1 -or
     $script:NotifyPopupForm.CloseCalls -ne 1 -or
     $script:NotifyPopupTerminalOutcome -ne 'failed') {
