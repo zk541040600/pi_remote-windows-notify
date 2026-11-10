@@ -1180,7 +1180,7 @@ test("paseo lease health fails open on stale/schema/future", () => {
   assert.equal(isPaseoLeaseHealthy(null, { now }), false);
 });
 
-test("shouldSuppressLegacyPiPopup requires gate + PASEO_AGENT_ID + healthy lease", async (t) => {
+test("shouldSuppressLegacyPiPopup requires gate and Paseo marker, not lease health", async (t) => {
   const dir = mkdtempSync(join(tmpdir(), "pi-paseo-lease-"));
   const leasePath = join(dir, "health.json");
   t.after(() => rmSync(dir, { recursive: true, force: true }));
@@ -1224,11 +1224,12 @@ test("shouldSuppressLegacyPiPopup requires gate + PASEO_AGENT_ID + healthy lease
       { paseoLeaseGateEnabled: true, paseoLeasePath: join(dir, "missing.json") },
       { env: { PASEO_AGENT_ID: "agent-1" } },
     ),
-    false,
+    true,
+    "missing lease must not rebrand a Paseo-owned session",
   );
 });
 
-test("Paseo-managed Pi with healthy lease suppresses popup but keeps title hooks", async (t) => {
+test("Paseo-owned Pi session is sticky; an override takes effect on the next session", async (t) => {
   const dir = mkdtempSync(join(tmpdir(), "pi-paseo-lease-"));
   const leasePath = join(dir, "health.json");
   t.after(() => rmSync(dir, { recursive: true, force: true }));
@@ -1281,10 +1282,16 @@ test("Paseo-managed Pi with healthy lease suppresses popup but keeps title hooks
   assert.equal(requests.length, 0, "healthy lease must suppress legacy Pi popups");
   assert.ok(writes.some((w) => w.includes("\u001b]0;")), "title maintenance must still run");
 
-  // Override forces Pi fallback
+  // The current session owner is frozen; the override applies to new sessions only.
   process.env.PI_NOTIFY_ALLOW_PASEO = "1";
   await runtime.emit("agent_end", { type: "agent_end", messages: [] }, context);
-  assert.equal(requests.length, 1, "PI_NOTIFY_ALLOW_PASEO=1 restores Pi popup");
+  assert.equal(requests.length, 0, "override must not change the owner mid-session");
+
+  const nextRuntime = createFakePi();
+  remoteWindowsNotify(nextRuntime.pi);
+  await nextRuntime.emit("session_start", { type: "session_start" }, context);
+  await nextRuntime.emit("agent_end", { type: "agent_end", messages: [] }, context);
+  assert.equal(requests.length, 1, "override applies to a new Pi session");
 });
 
 test("factory still registers when PASEO_AGENT_ID is set", () => {
