@@ -274,9 +274,9 @@ $script:NotifyRouteHostClientMock = {
     }
 }
 $focusedActivate = Invoke-NotifyExactRouteActivate -NotificationId '11111111-1111-4111-8111-111111111111' -SnapshotId 'snapshot-mock-focused' -WaitMs 45000 -TimeoutMs 48000
-Assert-True $script:MockReturnOnProgress 'mock-activate-requests-progress-return'
+Assert-True (-not $script:MockReturnOnProgress) 'mock-activate-does-not-request-progress-return'
 Assert-Equal 5000 $script:MockActivationEnvelopeTtlMs 'mock-activate-keeps-short-transport-ttl'
-Assert-Equal 'focused' $focusedActivate.Decision.Decision 'mock-activate-focused'
+Assert-Equal 'focused' $focusedActivate.Decision.Decision 'mock-activate-focused-defense'
 Assert-Equal 'background-proof-pending' $focusedActivate.Decision.Reason 'mock-activate-focused-background-proof'
 
 # Unavailable mock

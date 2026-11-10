@@ -330,7 +330,15 @@ function Set-NotifyPopupActivating {
         $script:NotifyPopupBodyLabel.ForeColor = $inactiveTextColor
         $script:NotifyPopupBodyLabel.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
 
-        $watchdogMs = if ([string]::IsNullOrWhiteSpace([string]$script:NotifyPopupTargetSnapshotId)) { $script:NotifyPopupRecoveringActivationWatchdogMs } else { $script:NotifyPopupReadyActivationWatchdogMs }
+        $watchdogMs = if ([string]$script:NotifyPopupTargetOriginKind -eq 'pi-web') {
+            Get-NotifyPiWebActivationWatchdogMs -ExpiresAtUtc $script:NotifyPopupExpiresAtUtc
+        }
+        elseif ([string]::IsNullOrWhiteSpace([string]$script:NotifyPopupTargetSnapshotId)) {
+            $script:NotifyPopupRecoveringActivationWatchdogMs
+        }
+        else {
+            $script:NotifyPopupReadyActivationWatchdogMs
+        }
         $script:NotifyPopupActivationWatchdogTimer.Stop()
         $script:NotifyPopupActivationWatchdogTimer.Interval = $watchdogMs
         $script:NotifyPopupActivationWatchdogTimer.Start()
@@ -1260,8 +1268,13 @@ $script:NotifyPopupExactWorkerTimer.Add_Tick({
         [void](Complete-NotifyPopupLifecycle -Outcome 'handled' -Reason $(if ([string]::IsNullOrWhiteSpace([string]$ui.Result)) { 'activation-handled' } else { [string]$ui.Result }))
         return
     }
-    if ($ui.Action -eq 'close-focused') {
-        [void](Complete-NotifyPopupLifecycle -Outcome 'focused' -Reason $(if ([string]::IsNullOrWhiteSpace([string]$ui.Reason)) { 'background-proof-pending' } else { [string]$ui.Reason }))
+    if ($ui.Action -eq 'keep-focused') {
+        # Focused/pending is non-terminal: keep the card in bounded pending
+        # feedback instead of closing. The original popup deadline stays
+        # authoritative; a later terminal result (or timeout) closes it.
+        if (-not $script:NotifyPopupTerminalState) {
+            Set-NotifyPopupRecoveryUiState -State 'recovering'
+        }
         return
     }
     if ($ui.Action -eq 'restore-retryable') {

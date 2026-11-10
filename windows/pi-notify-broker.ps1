@@ -1340,8 +1340,14 @@ function Ensure-NotifyBrokerExactWorkerTimer {
                 [void](Complete-NotifyBrokerPopupLifecycle -Tag $tag -Outcome 'handled' -Reason $(if ([string]::IsNullOrWhiteSpace([string]$ui.Result)) { 'activation-handled' } else { [string]$ui.Result }))
                 continue
             }
-            if ($ui.Action -eq 'close-focused') {
-                [void](Complete-NotifyBrokerPopupLifecycle -Tag $tag -Outcome 'focused' -Reason $(if ([string]::IsNullOrWhiteSpace([string]$ui.Reason)) { 'background-proof-pending' } else { [string]$ui.Reason }))
+            if ($ui.Action -eq 'keep-focused') {
+                # Focused/pending is non-terminal: keep the card in bounded
+                # pending feedback instead of closing. The original popup
+                # deadline stays authoritative; a later terminal result (or
+                # timeout) closes it.
+                if (-not $tag.TerminalState.Value) {
+                    Set-NotifyBrokerRecoveryUiState -Tag $tag -State 'recovering'
+                }
                 continue
             }
             if ($ui.Action -eq 'restore-retryable') {
@@ -1640,7 +1646,15 @@ function Set-NotifyBrokerPopupActivating {
             $Tag.BodyLabel.ForeColor = $inactiveTextColor
             $Tag.BodyLabel.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
         }
-        $watchdogMs = if ([string]::IsNullOrWhiteSpace([string]$Tag.SnapshotId)) { $script:NotifyBrokerRecoveringActivationWatchdogMs } else { $script:NotifyBrokerReadyActivationWatchdogMs }
+        $watchdogMs = if ([string]$Tag.OriginKind -eq 'pi-web') {
+            Get-NotifyPiWebActivationWatchdogMs -ExpiresAtUtc ([DateTime]$Tag.ExpiresAtUtc)
+        }
+        elseif ([string]::IsNullOrWhiteSpace([string]$Tag.SnapshotId)) {
+            $script:NotifyBrokerRecoveringActivationWatchdogMs
+        }
+        else {
+            $script:NotifyBrokerReadyActivationWatchdogMs
+        }
         $Tag.ActivationWatchdogTimer.Stop()
         $Tag.ActivationWatchdogTimer.Interval = $watchdogMs
         $Tag.ActivationWatchdogTimer.Start()
