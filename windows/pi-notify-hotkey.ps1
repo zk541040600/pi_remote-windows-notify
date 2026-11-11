@@ -124,9 +124,14 @@ function Get-NotifyHotkeyLivePopupStates {
 
     $configFingerprint = Get-NotifyHotkeyFingerprint -Value $config.ConfigPath
     $nowTicks = [DateTime]::UtcNow.Ticks
+    $ownedProcesses = @{}
     foreach ($item in @(Get-ChildItem -LiteralPath $logDir -Filter 'popup-live.*.json' -File -ErrorAction SilentlyContinue)) {
         try {
             $state = [System.IO.File]::ReadAllText($item.FullName, [System.Text.UTF8Encoding]::new($false)) | ConvertFrom-Json
+            # Configurations can share a log directory; leave another instance's state alone.
+            if ($state.PSObject.Properties['configFingerprint'] -and ([string]$state.configFingerprint) -ne $configFingerprint) {
+                continue
+            }
             $pidValue = 0
             if (-not ($state.PSObject.Properties['processId']) -or -not [int]::TryParse([string]$state.processId, [ref]$pidValue)) {
                 Remove-Item -LiteralPath $item.FullName -Force -ErrorAction SilentlyContinue
@@ -139,12 +144,12 @@ function Get-NotifyHotkeyLivePopupStates {
                 continue
             }
 
-            if (-not (Test-NotifyHotkeyPopupProcessOwned -ProcessId $pidValue)) {
-                Remove-Item -LiteralPath $item.FullName -Force -ErrorAction SilentlyContinue
-                continue
+            # Several broker cards share one process. Recheck ownership on each hotkey press.
+            if (-not $ownedProcesses.ContainsKey($pidValue)) {
+                $ownedProcesses[$pidValue] = Test-NotifyHotkeyPopupProcessOwned -ProcessId $pidValue
             }
-
-            if ($state.PSObject.Properties['configFingerprint'] -and ([string]$state.configFingerprint) -ne $configFingerprint) {
+            if (-not $ownedProcesses[$pidValue]) {
+                Remove-Item -LiteralPath $item.FullName -Force -ErrorAction SilentlyContinue
                 continue
             }
 
