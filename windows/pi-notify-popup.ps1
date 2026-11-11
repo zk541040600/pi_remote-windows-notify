@@ -65,34 +65,17 @@ public static class PiNotifyConsoleWindow {
 }
 
 public static class PiNotifyPopupUser32 {
-    public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
-
-    [DllImport("user32.dll")]
-    public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
-
     [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     public static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
 
     [DllImport("user32.dll", SetLastError = true)]
     public static extern int GetWindowTextLength(IntPtr hWnd);
 
-    [DllImport("user32.dll")]
-    public static extern bool IsWindowVisible(IntPtr hWnd);
-
-    [DllImport("user32.dll")]
-    public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
-
     [DllImport("user32.dll", SetLastError = true)]
     public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
 
     [DllImport("user32.dll")]
-    public static extern bool SetForegroundWindow(IntPtr hWnd);
-
-    [DllImport("user32.dll")]
     public static extern IntPtr GetForegroundWindow();
-
-    [DllImport("user32.dll")]
-    public static extern bool IsIconic(IntPtr hWnd);
 
     [DllImport("user32.dll")]
     public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
@@ -120,7 +103,6 @@ $NotificationId = if (-not [string]::IsNullOrWhiteSpace($env:PI_NOTIFY_NOTIFICAT
 $SnapshotId = if (-not [string]::IsNullOrWhiteSpace($env:PI_NOTIFY_SNAPSHOT_ID)) { $env:PI_NOTIFY_SNAPSHOT_ID.Trim() } else { '' }
 $RecoveryTicketId = if (-not [string]::IsNullOrWhiteSpace($env:PI_NOTIFY_RECOVERY_TICKET_ID)) { $env:PI_NOTIFY_RECOVERY_TICKET_ID.Trim() } else { '' }
 $script:NotifyPopupLogPath = Join-Path (Get-NotifyBridgeLogDir) 'popup.log'
-$script:NotifyPopupCachePath = Join-Path (Get-NotifyBridgeLogDir) 'popup-cache.json'
 $popupWallpaperPath = if ($config.PSObject.Properties['PopupWallpaperPath']) { [string]$config.PopupWallpaperPath } else { '' }
 $script:NotifyPopupWallpaperOffsetYPixels = 0
 if ($config.PSObject.Properties['PopupWallpaperOffsetYPixels']) {
@@ -686,103 +668,6 @@ catch {
 }
 Save-NotifyPopupLiveState -TargetHostValue $FocusTarget -CwdBaseValue $CwdBase -SourceTabTitleValue $SourceTabTitle -TargetFingerprintValue $liveTargetFingerprint -StackIndexValue $StackIndex -TimeoutSecondsValue $TimeoutSeconds
 
-function Get-NotifyPopupWindows {
-    param(
-        [switch]$TerminalOnly
-    )
-
-    $windows = New-Object System.Collections.Generic.List[object]
-    $callback = [PiNotifyPopupUser32+EnumWindowsProc]{
-        param([IntPtr]$Handle, [IntPtr]$LParam)
-
-        if (-not [PiNotifyPopupUser32]::IsWindowVisible($Handle)) {
-            return $true
-        }
-
-        $length = [PiNotifyPopupUser32]::GetWindowTextLength($Handle)
-        if ($length -le 0) {
-            return $true
-        }
-
-        $builder = New-Object System.Text.StringBuilder ($length + 1)
-        [void][PiNotifyPopupUser32]::GetWindowText($Handle, $builder, $builder.Capacity)
-        $title = $builder.ToString().Trim()
-        if ([string]::IsNullOrWhiteSpace($title)) {
-            return $true
-        }
-
-        $processId = [uint32]0
-        [void][PiNotifyPopupUser32]::GetWindowThreadProcessId($Handle, [ref]$processId)
-        try {
-            $process = Get-Process -Id $processId -ErrorAction Stop
-        }
-        catch {
-            return $true
-        }
-
-        if ($TerminalOnly -and ($process.ProcessName -notmatch 'WindowsTerminal|Terminal')) {
-            return $true
-        }
-
-        $windows.Add([pscustomobject]@{
-            Handle      = $Handle
-            Title       = $title
-            ProcessId   = $process.Id
-            ProcessName = $process.ProcessName
-        }) | Out-Null
-        return $true
-    }
-
-    [void][PiNotifyPopupUser32]::EnumWindows($callback, [IntPtr]::Zero)
-    return @($windows.ToArray())
-}
-
-function Get-NotifyPopupCache {
-    if (-not (Test-Path -LiteralPath $script:NotifyPopupCachePath)) {
-        return $null
-    }
-
-    try {
-        return ([System.IO.File]::ReadAllText($script:NotifyPopupCachePath, [System.Text.UTF8Encoding]::new($false)) | ConvertFrom-Json)
-    }
-    catch {
-        Write-NotifyPopupLog -Message ('popup-cache-read-error "{0}"' -f $_.Exception.Message)
-        return $null
-    }
-}
-
-function Test-NotifyPopupSessionTaggedTitle {
-    param([string]$Value)
-
-    if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
-    return $Value.Trim() -match ' \u00B7 #[0-9a-f]{12}$'
-}
-
-function Save-NotifyPopupCache {
-    param(
-        [string]$TargetHostValue,
-        [string]$CwdBaseValue,
-        [string]$WindowTitle,
-        [string]$TabTitle,
-        [int]$TabIndex = -1
-    )
-
-    try {
-        $payload = @{
-            hostFingerprint   = Get-NotifyPopupContextFingerprint -Value $TargetHostValue
-            cwdFingerprint    = Get-NotifyPopupContextFingerprint -Value $CwdBaseValue
-            windowFingerprint = Get-NotifyPopupContextFingerprint -Value $WindowTitle
-            tabFingerprint    = Get-NotifyPopupContextFingerprint -Value $TabTitle
-            tabIndex          = $TabIndex
-            updatedAt         = [DateTime]::UtcNow.ToString('o')
-        }
-        [System.IO.File]::WriteAllText($script:NotifyPopupCachePath, ($payload | ConvertTo-Json -Depth 4), [System.Text.UTF8Encoding]::new($false))
-    }
-    catch {
-        Write-NotifyPopupLog -Message ('popup-cache-write-error "{0}"' -f $_.Exception.Message)
-    }
-}
-
 function Get-NotifyPopupTabs {
     param(
         [Parameter(Mandatory = $true)]
@@ -827,51 +712,6 @@ function Get-NotifyPopupTabs {
     }
 
     return @($rows.ToArray())
-}
-
-function Select-NotifyPopupTab {
-    param(
-        [Parameter(Mandatory = $true)]
-        $TabElement
-    )
-
-    try {
-        $patternObj = $null
-        if ($TabElement.TryGetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern, [ref]$patternObj)) {
-            ([System.Windows.Automation.SelectionItemPattern]$patternObj).Select()
-            return $true
-        }
-    }
-    catch {
-    }
-
-    try {
-        $patternObj = $null
-        if ($TabElement.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$patternObj)) {
-            ([System.Windows.Automation.InvokePattern]$patternObj).Invoke()
-            return $true
-        }
-    }
-    catch {
-    }
-
-    return $false
-}
-
-function Get-NotifyPopupSelectedTerminalTarget {
-    foreach ($window in @(Get-NotifyPopupWindows -TerminalOnly)) {
-        foreach ($tab in @(Get-NotifyPopupTabs -Handle $window.Handle)) {
-            if ($tab.IsSelected) {
-                return [pscustomobject]@{
-                    WindowTitle = $window.Title
-                    TabTitle    = $tab.Name
-                    TabIndex    = $tab.Index
-                }
-            }
-        }
-    }
-
-    return $null
 }
 
 # Terminal/legacy only: WT title/cwd foreground auto-dismiss must not run for pi-web or unknown origins.
@@ -946,11 +786,6 @@ function Test-NotifyPopupForegroundTarget {
     return $false
 }
 
-
-$script:NotifyPopupInitialTarget = Get-NotifyPopupSelectedTerminalTarget
-if ($null -ne $script:NotifyPopupInitialTarget) {
-    Write-NotifyPopupLog -Message ('popup-initial-captured windowFingerprint={0} tabFingerprint={1} tabIndex={2}' -f (Get-NotifyPopupContextFingerprint -Value $script:NotifyPopupInitialTarget.WindowTitle), (Get-NotifyPopupContextFingerprint -Value $script:NotifyPopupInitialTarget.TabTitle), $script:NotifyPopupInitialTarget.TabIndex)
-}
 
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
