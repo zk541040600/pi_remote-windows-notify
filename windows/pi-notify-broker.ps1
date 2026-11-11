@@ -854,8 +854,7 @@ function Start-NotifyBrokerNextDeferredActivation {
                 if ($deferredTag.ContainsKey('TargetFingerprint')) { $targetFingerprint = [string]$deferredTag.TargetFingerprint }
             }
         }
-        [void](Start-NotifyBrokerExactWorker -PopupId $deferred.PopupId -Mode 'activate' -OriginKind $originKind -NotificationId $deferred.NotificationId -SnapshotId $deferred.SnapshotId -RecoveryTicketId $deferred.RecoveryTicketId -TargetHost $targetHost -CurrentDirBase $cwdBase -SourceTabTitleValue $tabTitle -TargetFingerprint $targetFingerprint)
-        return
+        if (Start-NotifyBrokerExactWorker -PopupId $deferred.PopupId -Mode 'activate' -OriginKind $originKind -NotificationId $deferred.NotificationId -SnapshotId $deferred.SnapshotId -RecoveryTicketId $deferred.RecoveryTicketId -TargetHost $targetHost -CurrentDirBase $cwdBase -SourceTabTitleValue $tabTitle -TargetFingerprint $targetFingerprint) { return }
     }
 }
 
@@ -1009,6 +1008,16 @@ function Start-NotifyBrokerExactWorker {
         [string]$SourceTabTitleValue = '',
         [string]$TargetFingerprint = ''
     )
+
+    if (-not $script:NotifyBrokerActivePopups.ContainsKey($PopupId)) { return $false }
+    $entry = $script:NotifyBrokerActivePopups[$PopupId]
+    if ($null -eq $entry -or $null -eq $entry.Form -or $entry.Form.IsDisposed -or $entry.Form.Disposing -or $null -eq $entry.Form.Tag) { return $false }
+    $tag = $entry.Form.Tag
+    if ($tag.TerminalState.Value -or $tag.CloseRequested.Value) { return $false }
+    if ((Get-NotifyActivationRemainingMs -ExpiresAtUtc ([DateTime]$tag.ExpiresAtUtc)) -le 0) {
+        [void](Complete-NotifyBrokerPopupLifecycle -Tag $tag -Outcome 'dismissed' -Reason 'expired')
+        return $false
+    }
 
     $resolvedOrigin = if ([string]::IsNullOrWhiteSpace($OriginKind)) {
         if ($Mode -eq 'resolve') { 'pi-web' } else { '' }

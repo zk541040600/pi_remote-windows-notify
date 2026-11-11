@@ -537,6 +537,14 @@ $ast = [System.Management.Automation.Language.Parser]::ParseFile(
   [ref]$tokens,
   [ref]$errors)
 if ($errors.Count -ne 0) { throw 'broker parse failed' }
+$activationAst = [System.Management.Automation.Language.Parser]::ParseFile(
+  (Join-Path (Split-Path -Parent $env:PI_NOTIFY_BROKER_TEST_PATH) 'NotifyBridge.Activation.ps1'),
+  [ref]$tokens, [ref]$errors)
+if ($errors.Count -ne 0) { throw 'activation parse failed' }
+$remaining = $activationAst.Find({ param($node)
+  $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-NotifyActivationRemainingMs'
+}, $true)
+. ([scriptblock]::Create($remaining.Extent.Text))
 $wanted = @(
   'Request-NotifyBrokerExactWorkerStop',
   'Add-NotifyBrokerDeferredActivation',
@@ -588,7 +596,13 @@ $script:NotifyBrokerExactWorkerMax = 1
 $script:NotifyBrokerDeferredActivationMax = 32
 $script:NotifyBrokerDeferredActivationSequence = 0
 $script:NotifyBrokerDeferredActivations = @{}
-$script:NotifyBrokerActivePopups = @{ 'popup-a' = [pscustomobject]@{} }
+function New-FakePopup {
+  return [pscustomobject]@{ Form = [pscustomobject]@{
+    IsDisposed = $false; Disposing = $false
+    Tag = @{ TerminalState = [ref]$false; CloseRequested = [ref]$false; ExpiresAtUtc = [datetime]::UtcNow.AddMinutes(1) }
+  } }
+}
+$script:NotifyBrokerActivePopups = @{ 'popup-a' = (New-FakePopup) }
 $script:FailClosed = @()
 
 # A user click preempts resolver V. Closing V must not erase target A because
@@ -652,7 +666,7 @@ if (-not $firstAdded -or -not $duplicateAdded -or $overflowAdded -or $script:Not
 # Once a slot is reclaimed, a queued target starts exactly once.
 $script:NotifyBrokerDeferredActivationMax = 32
 $script:NotifyBrokerExactWorkers = @{}
-$script:NotifyBrokerActivePopups = @{ 'popup-a' = [pscustomobject]@{} }
+$script:NotifyBrokerActivePopups = @{ 'popup-a' = (New-FakePopup) }
 $script:NotifyBrokerDeferredActivations = @{}
 [void](Add-NotifyBrokerDeferredActivation -PopupId 'popup-a' -NotificationId 'notification-a' -RecoveryTicketId 'ticket-a')
 $script:StartedPopupIds = @()

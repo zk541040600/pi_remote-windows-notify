@@ -415,7 +415,13 @@ function Start-NotifyPopupExactWorker {
         [string]$SnapshotId = ''
     )
 
-    if ($script:NotifyPopupTerminalState -or $null -ne $script:NotifyPopupExactWorker) { return $false }
+    if ($null -eq $script:NotifyPopupForm -or $script:NotifyPopupForm.IsDisposed -or $script:NotifyPopupForm.Disposing -or
+        $script:NotifyPopupCloseRequested -or $script:NotifyPopupTerminalState) { return $false }
+    if ((Get-NotifyActivationRemainingMs -ExpiresAtUtc $script:NotifyPopupExpiresAtUtc) -le 0) {
+        [void](Complete-NotifyPopupLifecycle -Outcome 'dismissed' -Reason 'expired')
+        return $false
+    }
+    if ($null -ne $script:NotifyPopupExactWorker) { return $false }
     $runspace = $null
     $powerShell = $null
     $workerScript = Get-NotifyActivationWorkerScript
