@@ -909,6 +909,7 @@ function Send-NotifyBrokerPopup {
     $port = [int]$config.BrokerPort
     $client = [System.Net.Sockets.TcpClient]::new()
     $connectHandle = $null
+    $requestWritten = $false
     try {
         $connectResult = $client.BeginConnect('127.0.0.1', $port, $null, $null)
         $connectHandle = $connectResult.AsyncWaitHandle
@@ -924,33 +925,38 @@ function Send-NotifyBrokerPopup {
         $stream.Write($requestBytes, 0, $requestBytes.Length)
         $stream.Write($bodyBytes, 0, $bodyBytes.Length)
         $stream.Flush()
+        $requestWritten = $true
 
         $responseWaitMs = [Math]::Min(150, $timeoutMs)
-        $deadline = [DateTime]::UtcNow.AddMilliseconds($responseWaitMs)
-        while (-not $stream.DataAvailable -and [DateTime]::UtcNow -lt $deadline) {
-            Start-Sleep -Milliseconds 10
-        }
-        if (-not $stream.DataAvailable) {
-            Write-NotifyListenerLog -Message 'broker-post-accepted-no-response'
-            return $true
-        }
-
+        $responseClock = [System.Diagnostics.Stopwatch]::StartNew()
+        $responseText = ''
         $buffer = [byte[]]::new(256)
-        $read = $stream.Read($buffer, 0, $buffer.Length)
-        if ($read -le 0) {
-            Write-NotifyListenerLog -Message 'broker-post-accepted-empty-response'
-            return $true
+        while ($responseClock.ElapsedMilliseconds -lt $responseWaitMs -and $responseText.Length -lt $buffer.Length) {
+            if (-not $stream.DataAvailable) {
+                Start-Sleep -Milliseconds 10
+                continue
+            }
+            $read = $stream.Read($buffer, 0, ($buffer.Length - $responseText.Length))
+            if ($read -le 0) { break }
+            $responseText += [System.Text.Encoding]::ASCII.GetString($buffer, 0, $read)
+            $lineEnd = $responseText.IndexOf("`n")
+            if ($lineEnd -ge 0) {
+                $firstLine = $responseText.Substring(0, $lineEnd).TrimEnd([char]13)
+                if ($firstLine -notmatch '^HTTP/1\.1 200\b') {
+                    Write-NotifyListenerLog -Message ('broker-post-rejected status="{0}"' -f $firstLine)
+                    return $false
+                }
+                return $true
+            }
         }
-        $responseText = [System.Text.Encoding]::ASCII.GetString($buffer, 0, $read)
-        if ($responseText -notmatch '^HTTP/1\.1 200\b') {
-            $firstLine = (($responseText -split "`r?`n") | Select-Object -First 1)
-            throw ('broker returned {0}' -f $firstLine)
-        }
+        # A missing or partial acknowledgement cannot prove the popup was rejected.
+        # Avoid a second popup after an already-written request; only a complete status can reject it.
+        Write-NotifyListenerLog -Message ('broker-post-response-unconfirmed bytes={0}' -f $responseText.Length)
         return $true
     }
     catch {
-        Write-NotifyListenerLog -Message ('broker-post-error "{0}"' -f $_.Exception.Message)
-        return $false
+        Write-NotifyListenerLog -Message ('broker-post-error requestWritten={0} "{1}"' -f $requestWritten, $_.Exception.Message)
+        return $requestWritten
     }
     finally {
         if ($null -ne $connectHandle) { try { $connectHandle.Close() } catch {} }
@@ -984,19 +990,21 @@ function Invoke-NotifyBrokerPopup {
         return $false
     }
 
-    if (-not (Test-NotifyBrokerHealth)) {
+    $brokerHealthy = Test-NotifyBrokerHealth
+    if (-not $brokerHealthy) {
         Write-NotifyListenerLog -Message 'broker-health-miss attempting-start'
         $started = Start-NotifyBroker
         if ($started) {
             $deadline = [DateTime]::UtcNow.AddMilliseconds([Math]::Max(100, [int]$config.BrokerStartupTimeoutMs))
             while ([DateTime]::UtcNow -lt $deadline) {
                 Start-Sleep -Milliseconds 50
-                if (Test-NotifyBrokerHealth) { break }
+                $brokerHealthy = Test-NotifyBrokerHealth
+                if ($brokerHealthy) { break }
             }
         }
     }
 
-    if (-not (Test-NotifyBrokerHealth)) {
+    if (-not $brokerHealthy) {
         Write-NotifyListenerLog -Message 'broker-unavailable fallback=popup-process'
         return $false
     }
