@@ -134,6 +134,11 @@ $script:NotifyBrokerReadyActivationWatchdogMs = 20000
 $script:NotifyBrokerDeferredActivations = @{}
 $script:NotifyBrokerDeferredActivationSequence = 0
 $script:NotifyBrokerDeferredActivationMax = 32
+$script:NotifyBrokerListener = $null
+$script:NotifyBrokerListenerRunspace = $null
+$script:NotifyBrokerListenerPowerShell = $null
+$script:NotifyBrokerListenerHandle = $null
+$script:NotifyBrokerListenerState = $null
 if ($config.PSObject.Properties['PopupMaxVisible']) {
     try { $script:NotifyBrokerPopupMaxVisible = [Math]::Max(1, [Math]::Min(8, [int]$config.PopupMaxVisible)) } catch { $script:NotifyBrokerPopupMaxVisible = 4 }
 }
@@ -1882,6 +1887,7 @@ function Exit-NotifyBrokerSingleton {
 # Background listener runspace: handle HTTP requests and enqueue /popup and /close
 function Start-NotifyBrokerHttpListener {
     $brokerIoTimeoutMs = [Math]::Max(300, [int]$config.BrokerRequestTimeoutMs)
+    $script:NotifyBrokerListenerState = [hashtable]::Synchronized(@{ Stopping = $false; Client = $null })
     $script:NotifyBrokerListener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $brokerPort)
     $script:NotifyBrokerListener.Server.ReceiveTimeout = $brokerIoTimeoutMs
     $script:NotifyBrokerListener.Server.SendTimeout = $brokerIoTimeoutMs
@@ -1889,12 +1895,8 @@ function Start-NotifyBrokerHttpListener {
 
     $script:NotifyBrokerListenerRunspace = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
     $script:NotifyBrokerListenerRunspace.Open()
-    $script:NotifyBrokerListenerRunspace.SessionStateProxy.SetVariable('NotifyBrokerListener', $script:NotifyBrokerListener)
-    $script:NotifyBrokerListenerRunspace.SessionStateProxy.SetVariable('NotifyBrokerPopupQueue', $script:NotifyBrokerPopupQueue)
-    $script:NotifyBrokerListenerRunspace.SessionStateProxy.SetVariable('NotifyBrokerIoTimeoutMs', $brokerIoTimeoutMs)
-
     $scriptText = @'
-param($Listener, $Queue, $LogPath, $LogLock, $IoTimeoutMs)
+param($Listener, $Queue, $LogPath, $LogLock, $IoTimeoutMs, $State)
 $ErrorActionPreference = 'Stop'
 # Append one background log line through the shared lock without stopping the listener.
 function Write-BrokerBgLog($Msg) {
@@ -2002,10 +2004,12 @@ function Read-BgRequest {
     }
     finally { $memory.Dispose() }
 }
-while ($true) {
+while (-not $State.Stopping) {
     $client = $null
     try {
         $client = $Listener.AcceptTcpClient()
+        $State.Client = $client
+        if ($State.Stopping) { break }
         $client.ReceiveTimeout = $IoTimeoutMs
         $client.SendTimeout = $IoTimeoutMs
         $stream = $client.GetStream()
@@ -2030,18 +2034,21 @@ while ($true) {
         Write-BgResponse -Stream $stream -StatusCode 404 -Reason 'Not Found' -Body '{"ok":false}' -ContentType 'application/json; charset=utf-8'
     }
     catch {
+        if ($State.Stopping) { break }
         if ($null -ne $client) {
             try { Write-BgResponse -Stream $client.GetStream() -StatusCode 400 -Reason 'Bad Request' -Body '{"ok":false}' -ContentType 'application/json; charset=utf-8' } catch {}
         }
         try { Write-BrokerBgLog ('broker-bg-error "{0}"' -f $_.Exception.Message) } catch {}
     }
     finally {
+        $State.Client = $null
         if ($null -ne $client) { try { $client.Close() } catch {} }
     }
 }
 '@
 
     $ps = [System.Management.Automation.PowerShell]::Create()
+    $script:NotifyBrokerListenerPowerShell = $ps
     $ps.Runspace = $script:NotifyBrokerListenerRunspace
     [void]$ps.AddScript($scriptText)
     [void]$ps.AddParameter('Listener', $script:NotifyBrokerListener)
@@ -2049,8 +2056,39 @@ while ($true) {
     [void]$ps.AddParameter('LogPath', $script:NotifyBrokerLogPath)
     [void]$ps.AddParameter('LogLock', $script:NotifyBrokerLogLock)
     [void]$ps.AddParameter('IoTimeoutMs', $brokerIoTimeoutMs)
+    [void]$ps.AddParameter('State', $script:NotifyBrokerListenerState)
     $script:NotifyBrokerListenerHandle = $ps.BeginInvoke()
     Write-NotifyBrokerLog -Message ('broker-listener-start port={0} pid={1}' -f $brokerPort, $PID)
+}
+
+function Stop-NotifyBrokerHttpListener {
+    # Close both sockets before stopping the pipeline: Accept/Read must unblock.
+    if ($null -ne $script:NotifyBrokerListenerState) {
+        $script:NotifyBrokerListenerState.Stopping = $true
+        $client = $script:NotifyBrokerListenerState.Client
+        if ($null -ne $client) { try { $client.Close() } catch {} }
+    }
+    if ($null -ne $script:NotifyBrokerListener) { try { $script:NotifyBrokerListener.Stop() } catch {} }
+    if ($null -ne $script:NotifyBrokerListenerPowerShell) {
+        try {
+            if ($null -ne $script:NotifyBrokerListenerHandle) {
+                if (-not $script:NotifyBrokerListenerHandle.IsCompleted) { $script:NotifyBrokerListenerPowerShell.Stop() }
+                [void]$script:NotifyBrokerListenerPowerShell.EndInvoke($script:NotifyBrokerListenerHandle)
+            }
+        }
+        catch {}
+        finally { try { $script:NotifyBrokerListenerPowerShell.Dispose() } catch {} }
+    }
+    if ($null -ne $script:NotifyBrokerListenerRunspace) {
+        try { $script:NotifyBrokerListenerRunspace.Close() }
+        catch {}
+        finally { try { $script:NotifyBrokerListenerRunspace.Dispose() } catch {} }
+    }
+    $script:NotifyBrokerListenerHandle = $null
+    $script:NotifyBrokerListenerPowerShell = $null
+    $script:NotifyBrokerListenerRunspace = $null
+    $script:NotifyBrokerListener = $null
+    $script:NotifyBrokerListenerState = $null
 }
 
 # UI timer: consume the request queue on the WinForms main thread, create/close popups
@@ -2201,6 +2239,7 @@ try {
     [System.Windows.Forms.Application]::Run($script:NotifyBrokerMainForm)
 }
 finally {
+    Stop-NotifyBrokerHttpListener
     try {
         $script:NotifyBrokerDispatchTimer.Stop()
         $script:NotifyBrokerDispatchTimer.Dispose()
@@ -2213,21 +2252,6 @@ finally {
             $script:NotifyBrokerExactWorkerTimer.Dispose()
         }
         Stop-NotifyBrokerAllExactWorkers -Reason 'broker-exit'
-    }
-    catch {
-    }
-    try {
-        if ($null -ne $script:NotifyBrokerListener) {
-            $script:NotifyBrokerListener.Stop()
-        }
-    }
-    catch {
-    }
-    try {
-        if ($null -ne $script:NotifyBrokerListenerHandle) {
-            $script:NotifyBrokerListenerRunspace.Stop()
-            $script:NotifyBrokerListenerRunspace.Close()
-        }
     }
     catch {
     }

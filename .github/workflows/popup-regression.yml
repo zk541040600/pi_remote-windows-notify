@@ -1,0 +1,44 @@
+name: Popup regression
+
+on:
+  push:
+    branches: [main, 'codex/pi-notify-popup-*']
+    paths: ['windows/**', 'test/**', 'scripts/**', 'linux/paseo-sender/**', 'package.json', '.github/workflows/popup-regression.yml']
+  pull_request:
+    paths: ['windows/**', 'test/**', 'scripts/**', 'linux/paseo-sender/**', 'package.json', '.github/workflows/popup-regression.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: popup-regression-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+      - name: Install sender test dependencies
+        run: npm ci --ignore-scripts --prefix linux/paseo-sender
+      - name: Package checks
+        run: npm run check
+      - name: Sender regressions
+        run: npm run test:paseo-sender
+      - name: Windows PowerShell 5.1 popup regressions
+        run: npm run test:popup
+      - name: Windows route regressions
+        run: powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File windows/test-route.ps1
+      - name: Standalone Node regressions
+        shell: pwsh
+        run: |
+          # The desktop source contract belongs to a separate sibling repository.
+          # It is checked locally with that source present, never copied into CI.
+          $tests = @(Get-ChildItem test/*.test.mjs | Where-Object Name -ne 'pi-web-desktop-lifecycle.test.mjs' | ForEach-Object FullName)
+          node --experimental-transform-types --test @tests
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
