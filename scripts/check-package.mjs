@@ -116,7 +116,7 @@ const desktopIndex = listener.lastIndexOf("Show-Toast -Title $title");
 const qqIndex = listener.lastIndexOf("Start-NotifyQqDispatch -Title $title -Body $body");
 const okIndex = listener.lastIndexOf("-Body 'ok'");
 assert.ok(noTargetIndex >= 0 && noTargetIndex < dedupIndex && dedupIndex < desktopIndex && desktopIndex < qqIndex && qqIndex < okIndex, "QQ dispatch must occur once after target/dedupe/desktop gates and before the unchanged ok response");
-assert.equal((listener.match(/^\s*Start-NotifyQqDispatch -Title \$title -Body \$body\s*$/gm) ?? []).length, 1, "the accepted listener path must start exactly one QQ worker");
+assert.equal((listener.match(/^\s*Start-NotifyQqDispatch -Title \$title -Body \$body -OriginKind \$declaredOrigin\s*$/gm) ?? []).length, 1, "the accepted listener path must start exactly one QQ worker");
 requirePattern(listener, /qq-send-drop reason=capacity/, "listener must enforce a QQ worker concurrency limit");
 requirePattern(listener, /SetAccessRuleProtection\(\$true, \$false\)/, "listener must protect its QQ pending directory");
 

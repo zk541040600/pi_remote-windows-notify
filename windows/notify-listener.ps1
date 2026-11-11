@@ -44,17 +44,19 @@ $script:NotifyQqEnabled = [bool]$config.QqNotifyEnabled
 $script:NotifyQqSenderScript = [string]$config.QqSenderScript
 $script:NotifyQqMaxConcurrent = [Math]::Max(1, [Math]::Min(8, [int]$config.QqMaxConcurrent))
 $script:NotifyQqTimeoutSeconds = [Math]::Max(1, [Math]::Min(120, [int]$config.QqSendTimeoutSeconds))
-New-Item -ItemType Directory -Force -Path (Split-Path -Parent $script:NotifyListenerLogPath) | Out-Null
+try { New-Item -ItemType Directory -Force -Path (Split-Path -Parent $script:NotifyListenerLogPath) | Out-Null } catch {}
 Clear-NotifyBridgePopupArtifacts -MaxAgeMinutes 10
 
 function Write-NotifyListenerLog {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Message
-    )
+    param([Parameter(Mandatory = $true)][string]$Message)
 
-    $line = ('[{0}] {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'), $Message)
-    Add-Content -LiteralPath $script:NotifyListenerLogPath -Value $line -Encoding UTF8
+    try {
+        $line = ('[{0}] {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'), $Message)
+        Add-Content -LiteralPath $script:NotifyListenerLogPath -Value $line -Encoding UTF8 -ErrorAction Stop
+    }
+    catch {
+        # Diagnostic I/O must not interrupt notification delivery or a UI callback.
+    }
 }
 
 # Normalize one display field before it crosses into the QQ sender boundary.
@@ -667,6 +669,7 @@ function Get-NotifyPopupProcesses {
             [int]::TryParse((Get-NotifyCommandLineArgument -CommandLine $commandLine -Name 'StackIndex'), [ref]$slot) | Out-Null
             $rows += [pscustomobject]@{
                 ProcessId         = [int]$process.ProcessId
+                CreatedAtUtc      = ([DateTime]$process.CreationDate).ToUniversalTime()
                 TargetFingerprint = $targetFingerprint
                 StackIndex        = $slot
             }
@@ -690,33 +693,45 @@ function Get-NotifyPopupStackPlan {
     } else {
         $TargetFingerprint
     }
+    $area = Get-NotifyPopupWorkingArea -Placement ([string]$config.PopupPlacement)
+    $maxVisible = Get-NotifyPopupStackCapacity -WorkingAreaHeight $area.Height -MaxVisible ([int]$config.PopupMaxVisible)
     $usedSlots = @{}
     $reuseSlot = -1
-    foreach ($popup in Get-NotifyPopupProcesses) {
-        $popupFingerprint = [string]$popup.TargetFingerprint
-        $sameTarget = (-not [string]::IsNullOrWhiteSpace($popupFingerprint) -and $popupFingerprint -eq $targetFingerprint)
+    $remaining = @()
+    foreach ($popup in @(Get-NotifyPopupProcesses | Sort-Object CreatedAtUtc)) {
+        $sameTarget = -not [string]::IsNullOrWhiteSpace([string]$popup.TargetFingerprint) -and $popup.TargetFingerprint -eq $targetFingerprint
         $slot = [int]$popup.StackIndex
-
-        if ($sameTarget) {
-            if ($slot -ge 0 -and ($reuseSlot -lt 0 -or $slot -lt $reuseSlot)) { $reuseSlot = $slot }
+        if ($sameTarget -or $slot -ge $maxVisible) {
             try {
                 Stop-Process -Id $popup.ProcessId -Force -ErrorAction Stop
-                Write-NotifyListenerLog -Message ('popup-replace-same-target pid={0} targetFingerprint="{1}" slot={2}' -f $popup.ProcessId, $targetFingerprint, $slot)
+                if ($sameTarget -and $slot -ge 0 -and $slot -lt $maxVisible) { $reuseSlot = $slot }
+                Write-NotifyListenerLog -Message ('popup-replace pid={0} sameTarget={1} slot={2}' -f $popup.ProcessId, $sameTarget, $slot)
+                continue
             }
             catch {
-                Write-NotifyListenerLog -Message ('popup-replace-stop-error pid={0} targetFingerprint="{1}" "{2}"' -f $popup.ProcessId, $targetFingerprint, $_.Exception.Message)
+                Write-NotifyListenerLog -Message ('popup-replace-stop-error pid={0}' -f $popup.ProcessId)
             }
-            continue
         }
-
+        $remaining += $popup
         if ($slot -ge 0) { $usedSlots[[string]$slot] = $true }
     }
 
+    foreach ($popup in $remaining) {
+        if ($usedSlots.Count -lt $maxVisible) { break }
+        try {
+            Stop-Process -Id $popup.ProcessId -Force -ErrorAction Stop
+            $usedSlots.Remove([string]$popup.StackIndex)
+            Write-NotifyListenerLog -Message ('popup-drop-overflow pid={0} maxVisible={1}' -f $popup.ProcessId, $maxVisible)
+        }
+        catch {
+            Write-NotifyListenerLog -Message ('popup-overflow-stop-error pid={0}' -f $popup.ProcessId)
+        }
+    }
     if ($reuseSlot -ge 0 -and -not $usedSlots.ContainsKey([string]$reuseSlot)) { return $reuseSlot }
-    for ($slot = 0; $slot -lt 64; $slot++) {
+    for ($slot = 0; $slot -lt $maxVisible; $slot++) {
         if (-not $usedSlots.ContainsKey([string]$slot)) { return $slot }
     }
-    return 63
+    return -1
 }
 
 function Stop-NotifyPopupTarget {
@@ -1102,6 +1117,10 @@ function Show-Toast {
         }
 
         $stackIndex = Get-NotifyPopupStackPlan -TargetKey $targetKey -TargetFingerprint $targetFingerprint
+        if ($stackIndex -lt 0) {
+            Write-NotifyListenerLog -Message 'popup-drop no-free-screen-slot'
+            return
+        }
         Clear-NotifyBridgePopupArtifacts -Aggressive
 
         Write-NotifyListenerLog -Message ('popup-launch targetFingerprint={0} slot={1} timeout={2} source=fallback originKind={3}' -f $targetFingerprint, $stackIndex, $PopupTimeoutSeconds, $(if ([string]::IsNullOrWhiteSpace($originKind)) { 'none' } else { $originKind }))

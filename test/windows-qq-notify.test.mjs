@@ -51,7 +51,7 @@ test("listener limits desktop UI to Pi Web/Paseo while keeping one independent Q
   assert.match(listener, /if \(\$allowDesktopPopup -and \$DisplayMode -eq 'popup-focus'/);
   assert.match(listener, /if \(\$allowDesktopPopup\) \{[\s\S]*Show-Toast -Title \$title/);
   assert.equal(
-    (listener.match(/^\s*Start-NotifyQqDispatch -Title \$title -Body \$body\s*$/gm) ?? []).length,
+    (listener.match(/^\s*Start-NotifyQqDispatch -Title \$title -Body \$body -OriginKind \$declaredOrigin\s*$/gm) ?? []).length,
     1,
   );
   assert.match(listener, /qq-pending/);

@@ -53,12 +53,18 @@ if ($PSBoundParameters.ContainsKey('ConfigPath')) { $configArgs.ConfigPath = $Co
 $config = Ensure-NotifyBridgeConfig @configArgs
 
 $script:NotifyHotkeyLogPath = Join-Path (Get-NotifyBridgeLogDir) 'hotkey.log'
-New-Item -ItemType Directory -Force -Path (Split-Path -Parent $script:NotifyHotkeyLogPath) | Out-Null
+try { New-Item -ItemType Directory -Force -Path (Split-Path -Parent $script:NotifyHotkeyLogPath) | Out-Null } catch {}
 
 function Write-NotifyHotkeyLog {
-    param([string]$Message)
-    $line = ('[{0}] {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'), $Message)
-    Add-Content -LiteralPath $script:NotifyHotkeyLogPath -Value $line -Encoding UTF8
+    param([Parameter(Mandatory = $true)][string]$Message)
+
+    try {
+        $line = ('[{0}] {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'), $Message)
+        Add-Content -LiteralPath $script:NotifyHotkeyLogPath -Value $line -Encoding UTF8 -ErrorAction Stop
+    }
+    catch {
+        # Diagnostic I/O must not interrupt notification delivery or a UI callback.
+    }
 }
 
 function Get-NotifyHotkeyFingerprint {
@@ -72,21 +78,6 @@ function Get-NotifyHotkeyFingerprint {
     }
     finally {
         $sha.Dispose()
-    }
-}
-
-function Unprotect-NotifyHotkeyValue {
-    param([string]$Value)
-
-    if ([string]::IsNullOrWhiteSpace($Value)) { return '' }
-    try {
-        $protected = [Convert]::FromBase64String($Value)
-        $bytes = [System.Security.Cryptography.ProtectedData]::Unprotect($protected, $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser)
-        return [System.Text.Encoding]::UTF8.GetString($bytes)
-    }
-    catch {
-        Write-NotifyHotkeyLog -Message ('popup-state-unprotect-error "{0}"' -f $_.Exception.Message)
-        return ''
     }
 }
 
@@ -157,12 +148,10 @@ function Get-NotifyHotkeyLivePopupStates {
                 continue
             }
 
-            $targetHost = if ($state.PSObject.Properties['protectedHost']) { Unprotect-NotifyHotkeyValue -Value ([string]$state.protectedHost) } else { '' }
-            $cwdBase = if ($state.PSObject.Properties['protectedCwd']) { Unprotect-NotifyHotkeyValue -Value ([string]$state.protectedCwd) } else { '' }
-            $tabTitle = if ($state.PSObject.Properties['protectedTab']) { Unprotect-NotifyHotkeyValue -Value ([string]$state.protectedTab) } else { '' }
             $brokerManaged = $false
             if ($state.PSObject.Properties['brokerManaged']) { $brokerManaged = [bool]$state.brokerManaged }
-            if (-not $brokerManaged -and [string]::IsNullOrWhiteSpace($cwdBase) -and [string]::IsNullOrWhiteSpace($tabTitle)) {
+            $activationKey = if ($state.PSObject.Properties['activationKey']) { [string]$state.activationKey } else { '' }
+            if (-not $brokerManaged -and [string]::IsNullOrWhiteSpace((Get-NotifyPopupActivationEventName -ProcessId $pidValue -ActivationKey $activationKey))) {
                 continue
             }
 
@@ -174,15 +163,13 @@ function Get-NotifyHotkeyLivePopupStates {
             if ($state.PSObject.Properties['stackIndex']) {
                 [int]::TryParse([string]$state.stackIndex, [ref]$stackIndex) | Out-Null
             }
-            $targetFingerprint = if ($state.PSObject.Properties['targetFingerprint']) { [string]$state.targetFingerprint } else { Get-NotifyHotkeyFingerprint -Value $targetHost }
+            $targetFingerprint = if ($state.PSObject.Properties['targetFingerprint']) { [string]$state.targetFingerprint } else { '' }
             $popupId = if ($state.PSObject.Properties['popupId']) { [string]$state.popupId } else { '' }
 
             $rows += [pscustomobject]@{
                 ProcessId         = $pidValue
                 Path              = $item.FullName
-                TargetHost        = $targetHost
-                CwdBase           = $cwdBase
-                TabTitle          = $tabTitle
+                ActivationKey     = $activationKey
                 TargetFingerprint = $targetFingerprint
                 StackIndex        = $stackIndex
                 StartedAtTicks    = $startedAtTicks
@@ -199,42 +186,9 @@ function Get-NotifyHotkeyLivePopupStates {
 }
 
 function Start-NotifyHotkeyActivation {
-    param(
-        [Parameter(Mandatory = $true)]
-        $PopupState
-    )
+    param([Parameter(Mandatory = $true)]$PopupState)
 
-    $activationScript = Join-Path (Get-NotifyBridgeBinDir) 'pi-notify-activate.ps1'
-    if (-not (Test-Path -LiteralPath $activationScript)) {
-        $activationScript = Join-Path $PSScriptRoot 'pi-notify-activate.ps1'
-    }
-    if (-not (Test-Path -LiteralPath $activationScript)) {
-        Write-NotifyHotkeyLog -Message 'activate-missing-script'
-        return $false
-    }
-
-    $arguments = Join-NotifyBridgeProcessArguments @(
-        '-NoProfile',
-        '-WindowStyle', 'Hidden',
-        '-ExecutionPolicy', 'Bypass',
-        '-File', $activationScript,
-        '-ConfigPath', $config.ConfigPath
-    )
-    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
-    $startInfo.FileName = Get-NotifyBridgePowerShellExe
-    $startInfo.Arguments = $arguments
-    $startInfo.UseShellExecute = $false
-    $startInfo.CreateNoWindow = $true
-    $startInfo.EnvironmentVariables['PI_NOTIFY_FOCUS_TARGET'] = [string]$PopupState.TargetHost
-    $startInfo.EnvironmentVariables['PI_NOTIFY_CWD_BASE'] = [string]$PopupState.CwdBase
-    $startInfo.EnvironmentVariables['PI_NOTIFY_TAB_TITLE'] = [string]$PopupState.TabTitle
-
-    $hasCwd = -not [string]::IsNullOrWhiteSpace([string]$PopupState.CwdBase)
-    $hasTab = -not [string]::IsNullOrWhiteSpace([string]$PopupState.TabTitle)
-    $brokerManaged = [bool]$PopupState.BrokerManaged
-    Write-NotifyHotkeyLog -Message ('activate-oldest pid={0} targetFingerprint={1} hasCwd={2} hasTab={3} stackIndex={4} brokerManaged={5}' -f $PopupState.ProcessId, $PopupState.TargetFingerprint, $hasCwd, $hasTab, $PopupState.StackIndex, $brokerManaged)
-
-    if ($brokerManaged) {
+    if ([bool]$PopupState.BrokerManaged) {
         $brokerCloseUrl = $null
         if ($config.PSObject.Properties['BrokerCloseUrl']) { $brokerCloseUrl = [string]$config.BrokerCloseUrl }
         elseif ($config.PSObject.Properties['BrokerPort']) {
@@ -266,64 +220,25 @@ function Start-NotifyHotkeyActivation {
         }
     }
 
-    $process = [System.Diagnostics.Process]::Start($startInfo)
-    if ($null -eq $process) { return $false }
 
-    $completed = $process.WaitForExit(8000)
-    if (-not $completed) {
-        Write-NotifyHotkeyLog -Message ('activate-timeout pid={0} activationPid={1}' -f $PopupState.ProcessId, $process.Id)
-        return $false
-    }
-
-    if ($process.ExitCode -eq 0) {
-        if ($brokerManaged) {
-            # Broker-managed popups: do NOT kill the broker process; ask the broker to close this popup card.
-            $brokerCloseUrl = $null
-            if ($config.PSObject.Properties['BrokerCloseUrl']) { $brokerCloseUrl = [string]$config.BrokerCloseUrl }
-            elseif ($config.PSObject.Properties['BrokerPort']) {
-                $brokerCloseUrl = ('http://127.0.0.1:{0}/close' -f [int]$config.BrokerPort)
-            }
-            if (-not [string]::IsNullOrWhiteSpace($brokerCloseUrl) -and -not [string]::IsNullOrWhiteSpace([string]$PopupState.PopupId)) {
-                try {
-                    $closePayload = ('{{"popupId":"{0}"}}' -f ([string]$PopupState.PopupId))
-                    $closeBytes = [System.Text.Encoding]::UTF8.GetBytes($closePayload)
-                    $closeReq = [System.Net.HttpWebRequest]::Create($brokerCloseUrl)
-                    $closeReq.Method = 'POST'
-                    $closeReq.ContentType = 'application/json; charset=utf-8'
-                    $closeReq.ContentLength = $closeBytes.Length
-                    $closeReq.Timeout = 2000
-                    $closeReq.ReadWriteTimeout = 2000
-                    $closeStream = $closeReq.GetRequestStream()
-                    try { $closeStream.Write($closeBytes, 0, $closeBytes.Length) } finally { $closeStream.Close() }
-                    $closeResp = $closeReq.GetResponse()
-                    try { } finally { $closeResp.Close() }
-                    Write-NotifyHotkeyLog -Message ('broker-popup-close-after-activate popupId={0}' -f $PopupState.PopupId)
-                }
-                catch {
-                    Write-NotifyHotkeyLog -Message ('broker-popup-close-after-activate-error popupId={0} "{1}"' -f $PopupState.PopupId, $_.Exception.Message)
-                    # Fallback: remove the live-state file so the stale popup is not re-activated
-                    Remove-Item -LiteralPath ([string]$PopupState.Path) -Force -ErrorAction SilentlyContinue
-                }
-            }
-            else {
-                Remove-Item -LiteralPath ([string]$PopupState.Path) -Force -ErrorAction SilentlyContinue
-            }
-        }
-        else {
-            try {
-                Stop-Process -Id ([int]$PopupState.ProcessId) -Force -ErrorAction Stop
-                Remove-Item -LiteralPath ([string]$PopupState.Path) -Force -ErrorAction SilentlyContinue
-                Write-NotifyHotkeyLog -Message ('popup-close-after-activate pid={0}' -f $PopupState.ProcessId)
-            }
-            catch {
-                Write-NotifyHotkeyLog -Message ('popup-close-after-activate-error pid={0} "{1}"' -f $PopupState.ProcessId, $_.Exception.Message)
-            }
-        }
+    # Reuse the popup's click handler, including origin, expiry, retry and final-proof checks.
+    $activationKey = if ($PopupState.PSObject.Properties['ActivationKey']) { [string]$PopupState.ActivationKey } else { '' }
+    $eventName = Get-NotifyPopupActivationEventName -ProcessId ([int]$PopupState.ProcessId) -ActivationKey $activationKey
+    if ([string]::IsNullOrWhiteSpace($eventName) -or -not (Test-NotifyHotkeyPopupProcessOwned -ProcessId ([int]$PopupState.ProcessId))) { return $false }
+    $signal = $null
+    try {
+        $signal = [System.Threading.EventWaitHandle]::OpenExisting($eventName)
+        [void]$signal.Set()
+        Write-NotifyHotkeyLog -Message ('popup-activate-signal pid={0}' -f $PopupState.ProcessId)
         return $true
     }
-
-    Write-NotifyHotkeyLog -Message ('activate-failed pid={0} exitCode={1}' -f $PopupState.ProcessId, $process.ExitCode)
-    return $false
+    catch {
+        Write-NotifyHotkeyLog -Message ('popup-activate-signal-unavailable pid={0}' -f $PopupState.ProcessId)
+        return $false
+    }
+    finally {
+        if ($null -ne $signal) { $signal.Dispose() }
+    }
 }
 
 function Send-NotifyHotkeyBrokerPost {
@@ -383,15 +298,12 @@ function Invoke-NotifyHotkeyBrokerActivateOldest {
 }
 
 function Invoke-NotifyHotkeyOldestPopup {
-    if (Invoke-NotifyHotkeyBrokerActivateOldest) { return $true }
-
-    $states = @(Get-NotifyHotkeyLivePopupStates)
-    if ($states.Count -eq 0) {
-        Write-NotifyHotkeyLog -Message 'hotkey-no-live-popups'
-        return $false
+    foreach ($state in @(Get-NotifyHotkeyLivePopupStates)) {
+        if (Start-NotifyHotkeyActivation -PopupState $state) { return $true }
     }
 
-    return (Start-NotifyHotkeyActivation -PopupState $states[0])
+    # Live-state writing is best effort; the broker can still know about an unlisted card.
+    return (Invoke-NotifyHotkeyBrokerActivateOldest)
 }
 
 function ConvertTo-NotifyHotkeyRegistration {
