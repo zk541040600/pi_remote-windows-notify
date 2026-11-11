@@ -1351,7 +1351,8 @@ function Get-NotifyBrokerPopupSlot {
                 else { $drop.Form.Close() }
             }
             catch {}
-            if ($dropSlot -ge 0 -and -not $script:NotifyBrokerActivePopups.ContainsKey($drop.PopupId)) { $usedSlots.Remove([string]$dropSlot) }
+            if ($script:NotifyBrokerActivePopups.ContainsKey($drop.PopupId)) { return -1 }
+            if ($dropSlot -ge 0) { $usedSlots.Remove([string]$dropSlot) }
         }
     }
 
