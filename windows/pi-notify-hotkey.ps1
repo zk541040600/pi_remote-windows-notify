@@ -82,22 +82,21 @@ function Get-NotifyHotkeyFingerprint {
 }
 
 function Test-NotifyHotkeyCommandLineContainsPath {
-    param(
-        [string]$CommandLine,
-        [string]$Path
-    )
+    param([string]$CommandLine, [string]$Path)
 
     if ([string]::IsNullOrWhiteSpace($CommandLine) -or [string]::IsNullOrWhiteSpace($Path)) { return $false }
-    $needle = [System.IO.Path]::GetFullPath($Path).TrimEnd([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
-    $start = 0
-    while ($start -lt $CommandLine.Length) {
-        $index = $CommandLine.IndexOf($needle, $start, [System.StringComparison]::OrdinalIgnoreCase)
-        if ($index -lt 0) { return $false }
-        $end = $index + $needle.Length
-        if ($end -ge $CommandLine.Length) { return $true }
-        $next = [string]$CommandLine[$end]
-        if ([char]::IsWhiteSpace($CommandLine[$end]) -or $next -eq '"' -or $next -eq "'" -or $next -eq '\' -or $next -eq '/') { return $true }
-        $start = $index + 1
+    # Inspect the actual config argument; another option's value or a child path is not ownership.
+    $arguments = @([regex]::Matches($CommandLine, '(?:"[^"]*"|[^\s"]+)+') | ForEach-Object { $_.Value.Replace('"', '') })
+    for ($i = 0; $i -lt $arguments.Count; $i++) {
+        $argument = ''
+        if ($arguments[$i] -ieq '-ConfigPath' -and ($i + 1) -lt $arguments.Count) { $argument = $arguments[$i + 1] }
+        elseif ($arguments[$i].StartsWith('-ConfigPath:', [System.StringComparison]::OrdinalIgnoreCase)) { $argument = $arguments[$i].Substring(12) }
+        else { continue }
+        try {
+            if (-not [System.IO.Path]::IsPathRooted($argument)) { return $false }
+            return [System.IO.Path]::GetFullPath($argument).Equals([System.IO.Path]::GetFullPath($Path), [System.StringComparison]::OrdinalIgnoreCase)
+        }
+        catch { return $false }
     }
     return $false
 }

@@ -26,7 +26,7 @@ function Read-HotkeyTestFunctions {
     return ($parts -join "`n")
 }
 
-. ([scriptblock]::Create((Read-HotkeyTestFunctions 'pi-notify-hotkey.ps1' @('Get-NotifyHotkeyLivePopupStates', 'Get-NotifyHotkeyFingerprint', 'Send-NotifyHotkeyBrokerPost', 'Start-NotifyHotkeyActivation', 'Invoke-NotifyHotkeyBrokerActivateOldest', 'Invoke-NotifyHotkeyOldestPopup'))))
+. ([scriptblock]::Create((Read-HotkeyTestFunctions 'pi-notify-hotkey.ps1' @('Get-NotifyHotkeyLivePopupStates', 'Get-NotifyHotkeyFingerprint', 'Send-NotifyHotkeyBrokerPost', 'Start-NotifyHotkeyActivation', 'Invoke-NotifyHotkeyBrokerActivateOldest', 'Invoke-NotifyHotkeyOldestPopup', 'Test-NotifyHotkeyCommandLineContainsPath'))))
 . ([scriptblock]::Create((Read-HotkeyTestFunctions 'NotifyBridge.Common.ps1' @('Get-NotifyPopupActivationEventName', 'Read-NotifyPopupLiveJson'))))
 
 $script:HotkeyTestDirectory = Join-Path ([System.IO.Path]::GetTempPath()) ('pi-notify-hotkey-' + [Guid]::NewGuid().ToString('N'))
@@ -214,5 +214,28 @@ Assert-Hotkey ($response.Accepted -and $response.ElapsedMs -lt 1200) 'fragmented
     Assert-Hotkey (-not (Send-NotifyHotkeyBrokerPost -Path '/close' -TimeoutMs 100)) 'connection failure before sending permits fallback'
     Assert-Hotkey (-not (Invoke-NotifyHotkeyBrokerActivateOldest)) 'oldest wrapper does not report a rejected POST as success'
 }
+
+# A config filename must be the complete -ConfigPath value, not arbitrary command text.
+$expectedConfig = Join-Path ([System.IO.Path]::GetTempPath()) 'pi notify [1]/config.json'
+$otherConfig = Join-Path ([System.IO.Path]::GetTempPath()) 'other/config.json'
+$cases = @(
+    @{ Name='quoted config argument matches'; Command=('powershell.exe -File pi-notify-popup.ps1 -ConfigPath "' + $expectedConfig + '"'); Expected=$true }
+    @{ Name='config argument ignores case'; Command=('powershell.exe -File pi-notify-broker.ps1 -CONFIGPATH "' + $expectedConfig.ToUpperInvariant() + '"'); Expected=$true }
+    @{ Name='colon config syntax matches'; Command=('powershell.exe -ConfigPath:"' + $expectedConfig + '"'); Expected=$true }
+    @{ Name='quoted parameter token matches'; Command=('powershell.exe "-ConfigPath" "' + $expectedConfig + '"'); Expected=$true }
+    @{ Name='child config path is not this instance'; Command=('powershell.exe -ConfigPath "' + $expectedConfig + '/child.json"'); Expected=$false }
+    @{ Name='config filename suffix is not this instance'; Command=('powershell.exe -ConfigPath "' + $expectedConfig + '.backup"'); Expected=$false }
+    @{ Name='path in another argument is not ownership'; Command=('powershell.exe -Title "' + $expectedConfig + '" -ConfigPath "' + $otherConfig + '"'); Expected=$false }
+    @{ Name='quoted config-like text is not an option'; Command=('powershell.exe -Title "message -ConfigPath ' + $expectedConfig + '"'); Expected=$false }
+    @{ Name='missing config value is rejected'; Command='powershell.exe -ConfigPath'; Expected=$false }
+    @{ Name='relative config cannot establish another process cwd'; Command='powershell.exe -ConfigPath config.json'; Expected=$false }
+    @{ Name='empty command is rejected'; Command=''; Expected=$false }
+)
+foreach ($case in $cases) {
+    $actual = Test-NotifyHotkeyCommandLineContainsPath -CommandLine $case.Command -Path $expectedConfig
+    Assert-Hotkey ($actual -eq $case.Expected) $case.Name
+}
+$plainConfig = Join-Path ([System.IO.Path]::GetTempPath()) 'pi-config.json'
+Assert-Hotkey (Test-NotifyHotkeyCommandLineContainsPath -CommandLine ('powershell.exe -ConfigPath ' + $plainConfig) -Path $plainConfig) 'unquoted simple config argument matches'
 
 Write-Output ("Popup hotkey tests passed: {0}" -f $script:PassCount)
