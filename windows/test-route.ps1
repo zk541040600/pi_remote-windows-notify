@@ -776,13 +776,18 @@ try {
     $newId = 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff'
     Assert-True (-not (Test-NotifyPaseoCloseTombstone -NotificationId $oldId)) 'paseo-tombstone-absent-initially'
 
-    # Corrupt/partial/tampered markers never suppress and are cleaned.
+    # Queries never suppress on corrupt/partial/tampered markers or delete them.
     $corruptId = 'cccccccc-dddd-4eee-8fff-aaaaaaaaaaaa'
     [void](Save-NotifyPaseoCloseTombstone -NotificationId $corruptId -TtlSeconds 60)
     $corruptFp = Get-NotifyPaseoNotificationFingerprint -NotificationId $corruptId
     $corruptPath = Get-NotifyPaseoCloseTombstonePath -NotificationFingerprint $corruptFp
     [System.IO.File]::WriteAllText($corruptPath, '{"version":1}', [System.Text.UTF8Encoding]::new($false))
     Assert-True (-not (Test-NotifyPaseoCloseTombstone -NotificationId $corruptId)) 'paseo-tombstone-partial-does-not-suppress'
+    Assert-True (Test-Path -LiteralPath $corruptPath) 'paseo-tombstone-partial-read-is-read-only'
+    $cleanupLock = Enter-NotifyPaseoCloseTombstoneLock
+    if ($null -eq $cleanupLock) { throw 'Could not acquire isolated tombstone cleanup lock' }
+    try { Clear-NotifyPaseoCloseTombstones }
+    finally { Exit-NotifyPaseoCloseTombstoneLock -Mutex $cleanupLock }
     Assert-True (-not (Test-Path -LiteralPath $corruptPath)) 'paseo-tombstone-partial-cleaned'
 
     [void](Save-NotifyPaseoCloseTombstone -NotificationId $corruptId -TtlSeconds 60)
@@ -790,6 +795,30 @@ try {
     $tampered.fingerprint = Get-NotifyPaseoNotificationFingerprint -NotificationId $newId
     [System.IO.File]::WriteAllText($corruptPath, ($tampered | ConvertTo-Json -Compress), [System.Text.UTF8Encoding]::new($false))
     Assert-True (-not (Test-NotifyPaseoCloseTombstone -NotificationId $corruptId)) 'paseo-tombstone-fingerprint-mismatch-does-not-suppress'
+
+    # Deterministically replace the file after the query read, before it returns.
+    # A stale invalid read must not remove a newer valid close marker.
+    $raceId = 'eeeeeeee-ffff-4aaa-8bbb-cccccccccccc'
+    $raceFp = Get-NotifyPaseoNotificationFingerprint -NotificationId $raceId
+    $racePath = Get-NotifyPaseoCloseTombstonePath -NotificationFingerprint $raceFp
+    $raceReplacementPath = $racePath + '.replacement'
+    [System.IO.File]::WriteAllText($racePath, '{"version":1}', [System.Text.UTF8Encoding]::new($false))
+    $racePayload = @{ version = 1; fingerprint = $raceFp; expiresAtTicks = [DateTime]::UtcNow.AddSeconds(60).Ticks }
+    [System.IO.File]::WriteAllText($raceReplacementPath, ($racePayload | ConvertTo-Json -Compress), [System.Text.UTF8Encoding]::new($false))
+    $originalTombstoneValidator = ${function:Test-NotifyPaseoCloseTombstonePayload}
+    try {
+        function Test-NotifyPaseoCloseTombstonePayload {
+            param($Payload, [string]$ExpectedFingerprint)
+            [System.IO.File]::Replace($raceReplacementPath, $racePath, [NullString]::Value)
+            return $false
+        }
+        Assert-True (-not (Test-NotifyPaseoCloseTombstone -NotificationId $raceId)) 'paseo-tombstone-stale-read-does-not-suppress'
+    }
+    finally {
+        Set-Item -Path Function:Test-NotifyPaseoCloseTombstonePayload -Value $originalTombstoneValidator
+    }
+    Assert-True (Test-Path -LiteralPath $racePath) 'paseo-tombstone-stale-read-preserves-new-file'
+    Assert-True (Test-NotifyPaseoCloseTombstone -NotificationId $raceId) 'paseo-tombstone-new-close-survives-stale-read'
 
     $signalId = 'dddddddd-eeee-4fff-8aaa-bbbbbbbbbbbb'
     [void](Save-NotifyPaseoCloseTombstone -NotificationId $signalId -TtlSeconds 60)

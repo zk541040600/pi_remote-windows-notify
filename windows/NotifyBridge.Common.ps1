@@ -3138,8 +3138,8 @@ function Test-NotifyPaseoCloseTombstone {
     }
     catch {}
 
-    # Corrupt, partial, expired, or fingerprint-mismatched markers never suppress.
-    try { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue } catch {}
+    # A writer may have replaced this marker since the read. Leave cleanup to
+    # Clear-NotifyPaseoCloseTombstones under the writer's lock.
     return $false
 }
 
