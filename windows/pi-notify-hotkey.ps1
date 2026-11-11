@@ -306,7 +306,8 @@ function ConvertTo-NotifyHotkeyRegistration {
     param([string]$HotkeyValue)
 
     $value = if ([string]::IsNullOrWhiteSpace($HotkeyValue)) { 'Alt+L' } else { [string]$HotkeyValue }
-    $parts = @($value -split '\+' | ForEach-Object { $_.Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    # A final plus is the key itself (Ctrl++); split only separator plus signs.
+    $parts = @($value -split '\+(?!\s*$)' | ForEach-Object { $_.Trim() })
     if ($parts.Count -lt 2) {
         throw ('Invalid popupHotkey "{0}". Use Alt+L, Ctrl+{{, Alt+P, Ctrl+P, Ctrl+Alt+P, Shift+F8, or Win+P style syntax.' -f $value)
     }

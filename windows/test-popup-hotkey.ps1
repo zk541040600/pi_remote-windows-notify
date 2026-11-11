@@ -26,7 +26,7 @@ function Read-HotkeyTestFunctions {
     return ($parts -join "`n")
 }
 
-. ([scriptblock]::Create((Read-HotkeyTestFunctions 'pi-notify-hotkey.ps1' @('Get-NotifyHotkeyLivePopupStates', 'Get-NotifyHotkeyFingerprint', 'Send-NotifyHotkeyBrokerPost', 'Start-NotifyHotkeyActivation', 'Invoke-NotifyHotkeyBrokerActivateOldest', 'Invoke-NotifyHotkeyOldestPopup', 'Test-NotifyHotkeyCommandLineContainsPath'))))
+. ([scriptblock]::Create((Read-HotkeyTestFunctions 'pi-notify-hotkey.ps1' @('Get-NotifyHotkeyLivePopupStates', 'Get-NotifyHotkeyFingerprint', 'Send-NotifyHotkeyBrokerPost', 'Start-NotifyHotkeyActivation', 'Invoke-NotifyHotkeyBrokerActivateOldest', 'Invoke-NotifyHotkeyOldestPopup', 'Test-NotifyHotkeyCommandLineContainsPath', 'ConvertTo-NotifyHotkeyRegistration'))))
 . ([scriptblock]::Create((Read-HotkeyTestFunctions 'NotifyBridge.Common.ps1' @('Get-NotifyPopupActivationEventName', 'Read-NotifyPopupLiveJson'))))
 
 $script:HotkeyTestDirectory = Join-Path ([System.IO.Path]::GetTempPath()) ('pi-notify-hotkey-' + [Guid]::NewGuid().ToString('N'))
@@ -237,5 +237,25 @@ foreach ($case in $cases) {
 }
 $plainConfig = Join-Path ([System.IO.Path]::GetTempPath()) 'pi-config.json'
 Assert-Hotkey (Test-NotifyHotkeyCommandLineContainsPath -CommandLine ('powershell.exe -ConfigPath ' + $plainConfig) -Path $plainConfig) 'unquoted simple config argument matches'
+
+# Literal '+' must survive separator parsing; malformed empty modifiers must not.
+foreach ($value in @('Ctrl++', ' Ctrl + + ')) {
+    $registrations = @(ConvertTo-NotifyHotkeyRegistration -HotkeyValue $value)
+    Assert-Hotkey ($registrations.Count -eq 2 -and $registrations[0].VirtualKey -eq 0xBB -and $registrations[0].Modifiers -eq 0x4006 -and $registrations[0].Primary) "$value registers the shifted plus key"
+    Assert-Hotkey ($registrations[1].Label -eq 'Ctrl+=' -and $registrations[1].Modifiers -eq 0x4002 -and -not $registrations[1].Primary) "$value retains the established unshifted alternate"
+}
+$registrations = @(ConvertTo-NotifyHotkeyRegistration -HotkeyValue 'Ctrl+Shift++')
+Assert-Hotkey ($registrations.Count -eq 1 -and $registrations[0].VirtualKey -eq 0xBB -and $registrations[0].Modifiers -eq 0x4006) 'explicit Shift plus does not register a duplicate'
+$registrations = @(ConvertTo-NotifyHotkeyRegistration -HotkeyValue 'Alt+L')
+Assert-Hotkey ($registrations.Count -eq 1 -and $registrations[0].VirtualKey -eq 0x4C -and $registrations[0].Modifiers -eq 0x4001) 'default Alt+L registration is unchanged'
+$registrations = @(ConvertTo-NotifyHotkeyRegistration -HotkeyValue 'Ctrl+{')
+Assert-Hotkey ($registrations.Count -eq 2 -and $registrations[0].VirtualKey -eq 0xDB -and $registrations[0].Modifiers -eq 0x4006) 'existing shifted punctuation remains supported'
+$registrations = @(ConvertTo-NotifyHotkeyRegistration -HotkeyValue 'Shift+F24')
+Assert-Hotkey ($registrations.Count -eq 1 -and $registrations[0].VirtualKey -eq 0x87 -and $registrations[0].Modifiers -eq 0x4004) 'function key registration remains supported'
+foreach ($value in @('Ctrl+', 'Ctrl++L', '+L', 'Ctrl+++', 'Ctrl+Shift+', '+')) {
+    $rejected = $false
+    try { [void](ConvertTo-NotifyHotkeyRegistration -HotkeyValue $value) } catch { $rejected = $true }
+    Assert-Hotkey $rejected "$value rejects a missing key or modifier"
+}
 
 Write-Output ("Popup hotkey tests passed: {0}" -f $script:PassCount)
