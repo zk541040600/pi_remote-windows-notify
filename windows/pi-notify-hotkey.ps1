@@ -194,37 +194,12 @@ function Start-NotifyHotkeyActivation {
     param([Parameter(Mandatory = $true)]$PopupState)
 
     if ([bool]$PopupState.BrokerManaged) {
-        $brokerCloseUrl = $null
-        if ($config.PSObject.Properties['BrokerCloseUrl']) { $brokerCloseUrl = [string]$config.BrokerCloseUrl }
-        elseif ($config.PSObject.Properties['BrokerPort']) {
-            $brokerCloseUrl = ('http://127.0.0.1:{0}/close' -f [int]$config.BrokerPort)
-        }
-        if ([string]::IsNullOrWhiteSpace($brokerCloseUrl) -or [string]::IsNullOrWhiteSpace([string]$PopupState.PopupId)) {
-            Remove-Item -LiteralPath ([string]$PopupState.Path) -Force -ErrorAction SilentlyContinue
-            return $false
-        }
-        try {
-            $closePayload = ('{{"popupId":"{0}","activate":true}}' -f ([string]$PopupState.PopupId))
-            $closeBytes = [System.Text.Encoding]::UTF8.GetBytes($closePayload)
-            $closeReq = [System.Net.HttpWebRequest]::Create($brokerCloseUrl)
-            $closeReq.Method = 'POST'
-            $closeReq.ContentType = 'application/json; charset=utf-8'
-            $closeReq.ContentLength = $closeBytes.Length
-            $closeReq.Timeout = 2000
-            $closeReq.ReadWriteTimeout = 2000
-            $closeStream = $closeReq.GetRequestStream()
-            try { $closeStream.Write($closeBytes, 0, $closeBytes.Length) } finally { $closeStream.Close() }
-            $closeResp = $closeReq.GetResponse()
-            try { } finally { $closeResp.Close() }
-            Write-NotifyHotkeyLog -Message ('broker-popup-activate-request popupId={0}' -f $PopupState.PopupId)
-            return $true
-        }
-        catch {
-            Write-NotifyHotkeyLog -Message ('broker-popup-activate-request-error popupId={0} "{1}"' -f $PopupState.PopupId, $_.Exception.Message)
-            return $false
-        }
+        if ([string]::IsNullOrWhiteSpace([string]$PopupState.PopupId)) { return $false }
+        $payload = @{ popupId = [string]$PopupState.PopupId; activate = $true } | ConvertTo-Json -Compress
+        $accepted = Send-NotifyHotkeyBrokerPost -Path '/close' -Body $payload
+        if ($accepted) { Write-NotifyHotkeyLog -Message ('broker-popup-activate-request popupId={0}' -f $PopupState.PopupId) }
+        return $accepted
     }
-
 
     # Reuse the popup's click handler, including origin, expiry, retry and final-proof checks.
     $activationKey = if ($PopupState.PSObject.Properties['ActivationKey']) { [string]$PopupState.ActivationKey } else { '' }
@@ -248,41 +223,58 @@ function Start-NotifyHotkeyActivation {
 
 function Send-NotifyHotkeyBrokerPost {
     param(
-        [Parameter(Mandatory = $true)]
-        [string]$Path,
+        [Parameter(Mandatory = $true)][string]$Path,
+        [string]$Body = '{}',
         [int]$TimeoutMs = 700
     )
 
-    if (-not $config.PSObject.Properties['BrokerPort']) { throw 'BrokerPort is not configured.' }
+    if (-not $config.PSObject.Properties['BrokerPort']) { return $false }
     $port = [int]$config.BrokerPort
     $client = [System.Net.Sockets.TcpClient]::new()
     $connectHandle = $null
+    $requestWritten = $false
+    $budgetMs = [Math]::Max(1, $TimeoutMs)
+    $clock = [System.Diagnostics.Stopwatch]::StartNew()
     try {
         $connectResult = $client.BeginConnect('127.0.0.1', $port, $null, $null)
         $connectHandle = $connectResult.AsyncWaitHandle
-        if (-not $connectHandle.WaitOne($TimeoutMs)) {
-            throw ('broker connect timeout after {0}ms' -f $TimeoutMs)
-        }
+        if (-not $connectHandle.WaitOne($budgetMs)) { throw 'broker connect timeout.' }
         $client.EndConnect($connectResult)
-        $client.ReceiveTimeout = $TimeoutMs
-        $client.SendTimeout = $TimeoutMs
-        $body = '{}'
-        $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($body)
+        $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($Body)
         $requestHead = "POST $Path HTTP/1.1`r`nHost: 127.0.0.1:$port`r`nContent-Type: application/json; charset=utf-8`r`nContent-Length: $($bodyBytes.Length)`r`nConnection: close`r`n`r`n"
         $requestBytes = [System.Text.Encoding]::ASCII.GetBytes($requestHead)
         $stream = $client.GetStream()
-        $stream.Write($requestBytes, 0, $requestBytes.Length)
-        $stream.Write($bodyBytes, 0, $bodyBytes.Length)
-        $stream.Flush()
-        $buffer = [byte[]]::new(256)
-        $read = $stream.Read($buffer, 0, $buffer.Length)
-        if ($read -le 0) { throw 'broker returned an empty response.' }
-        $responseText = [System.Text.Encoding]::ASCII.GetString($buffer, 0, $read)
-        if ($responseText -notmatch '^HTTP/1\.1 200\b') {
-            $firstLine = (($responseText -split "`r?`n") | Select-Object -First 1)
-            throw ('broker returned {0}' -f $firstLine)
+        foreach ($bytes in @($requestBytes, $bodyBytes)) {
+            $remainingMs = $budgetMs - [int]$clock.ElapsedMilliseconds
+            if ($remainingMs -le 0) { throw 'broker write timeout.' }
+            $client.SendTimeout = $remainingMs
+            $stream.Write($bytes, 0, $bytes.Length)
         }
+        $requestWritten = $true
+        $stream.Flush()
+        $responseText = ''
+        $buffer = [byte[]]::new(256)
+        while ($responseText.Length -lt $buffer.Length) {
+            $remainingMs = $budgetMs - [int]$clock.ElapsedMilliseconds
+            if ($remainingMs -le 0) { break }
+            $client.ReceiveTimeout = $remainingMs
+            $read = $stream.Read($buffer, 0, ($buffer.Length - $responseText.Length))
+            if ($read -le 0) { break }
+            $responseText += [System.Text.Encoding]::ASCII.GetString($buffer, 0, $read)
+            $lineEnd = $responseText.IndexOf("`n")
+            if ($lineEnd -ge 0) {
+                $firstLine = $responseText.Substring(0, $lineEnd).TrimEnd([char]13)
+                if ($firstLine -match '^HTTP/1\.[01] ([0-9]{3})(?: |$)') { return ([int]$Matches[1] -eq 200) }
+                break
+            }
+        }
+        # The broker may already be activating this card. Do not select another on an ambiguous reply.
+        Write-NotifyHotkeyLog -Message ('broker-post-response-unconfirmed bytes={0}' -f $responseText.Length)
         return $true
+    }
+    catch {
+        Write-NotifyHotkeyLog -Message ('broker-post-error requestWritten={0} "{1}"' -f $requestWritten, $_.Exception.Message)
+        return $requestWritten
     }
     finally {
         if ($null -ne $connectHandle) { try { $connectHandle.Close() } catch {} }
@@ -292,7 +284,7 @@ function Send-NotifyHotkeyBrokerPost {
 
 function Invoke-NotifyHotkeyBrokerActivateOldest {
     try {
-        [void](Send-NotifyHotkeyBrokerPost -Path '/activate-oldest' -TimeoutMs 700)
+        if (-not (Send-NotifyHotkeyBrokerPost -Path '/activate-oldest')) { return $false }
         Write-NotifyHotkeyLog -Message 'broker-activate-oldest-request'
         return $true
     }

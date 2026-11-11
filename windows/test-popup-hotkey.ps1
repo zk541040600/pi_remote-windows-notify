@@ -26,7 +26,7 @@ function Read-HotkeyTestFunctions {
     return ($parts -join "`n")
 }
 
-. ([scriptblock]::Create((Read-HotkeyTestFunctions 'pi-notify-hotkey.ps1' @('Get-NotifyHotkeyLivePopupStates', 'Get-NotifyHotkeyFingerprint'))))
+. ([scriptblock]::Create((Read-HotkeyTestFunctions 'pi-notify-hotkey.ps1' @('Get-NotifyHotkeyLivePopupStates', 'Get-NotifyHotkeyFingerprint', 'Send-NotifyHotkeyBrokerPost', 'Start-NotifyHotkeyActivation', 'Invoke-NotifyHotkeyBrokerActivateOldest', 'Invoke-NotifyHotkeyOldestPopup'))))
 . ([scriptblock]::Create((Read-HotkeyTestFunctions 'NotifyBridge.Common.ps1' @('Get-NotifyPopupActivationEventName', 'Read-NotifyPopupLiveJson'))))
 
 $script:HotkeyTestDirectory = Join-Path ([System.IO.Path]::GetTempPath()) ('pi-notify-hotkey-' + [Guid]::NewGuid().ToString('N'))
@@ -97,6 +97,122 @@ try {
 }
 finally {
     Remove-Item -LiteralPath $script:HotkeyTestDirectory -Recurse -Force
+}
+
+# Real loopback exchanges exercise fragmented, missing and delayed acknowledgements.
+function Invoke-HotkeyResponseTest {
+    param([string[]]$Chunks, [int]$ChunkDelayMs = 0, [int]$TimeoutMs = 500, [switch]$ResetAfterRequest, [switch]$Oldest)
+    $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+    $listener.Start()
+    $ready = [System.Threading.ManualResetEvent]::new($false)
+    $server = [System.Management.Automation.PowerShell]::Create()
+    $async = $null
+    try {
+        [void]$server.AddScript(@'
+param($Listener, $Chunks, $ChunkDelayMs, $Ready, $ResetAfterRequest)
+$ErrorActionPreference = 'Stop'
+$client = $null; $reader = $null
+try {
+    [void]$Ready.Set()
+    $client = $Listener.AcceptTcpClient()
+    $client.ReceiveTimeout = 3000; $client.SendTimeout = 3000
+    $stream = $client.GetStream()
+    $reader = [System.IO.StreamReader]::new($stream, [System.Text.Encoding]::UTF8, $false, 1024, $true)
+    $requestLine = $reader.ReadLine()
+    $contentLength = 0
+    while ($true) {
+        $line = $reader.ReadLine()
+        if ($null -eq $line) { throw 'Incomplete hotkey request header.' }
+        if ($line.Length -eq 0) { break }
+        if ($line -match '^Content-Length:\s*(\d+)') { $contentLength = [int]$Matches[1] }
+    }
+    $body = [char[]]::new($contentLength)
+    $received = 0
+    while ($received -lt $contentLength) {
+        $count = $reader.Read($body, $received, ($contentLength - $received))
+        if ($count -le 0) { throw 'Incomplete hotkey request body.' }
+        $received += $count
+    }
+    [pscustomobject]@{ RequestLine = $requestLine; Body = (-join $body) }
+    try {
+        foreach ($chunk in $Chunks) {
+            $bytes = [System.Text.Encoding]::ASCII.GetBytes([string]$chunk)
+            $stream.Write($bytes, 0, $bytes.Length)
+            $stream.Flush()
+            if ($ChunkDelayMs -gt 0) { Start-Sleep -Milliseconds $ChunkDelayMs }
+        }
+    }
+    catch [System.IO.IOException] { } # The bounded client may leave before a slow responder.
+    if ($ResetAfterRequest) { $client.Client.LingerState = [System.Net.Sockets.LingerOption]::new($true, 0) }
+}
+finally {
+    if ($null -ne $reader) { $reader.Dispose() }
+    if ($null -ne $client) { $client.Close() }
+}
+'@)
+        [void]$server.AddParameter('Listener', $listener)
+        [void]$server.AddParameter('Chunks', $Chunks)
+        [void]$server.AddParameter('ChunkDelayMs', $ChunkDelayMs)
+        [void]$server.AddParameter('Ready', $ready)
+        [void]$server.AddParameter('ResetAfterRequest', [bool]$ResetAfterRequest)
+        $async = $server.BeginInvoke()
+        if (-not $ready.WaitOne(5000)) { throw 'Hotkey test responder did not become ready.' }
+        $config = [pscustomobject]@{ BrokerPort = ([System.Net.IPEndPoint]$listener.LocalEndpoint).Port }
+        $clock = [System.Diagnostics.Stopwatch]::StartNew()
+        $script:HotkeyActivationAttempts = [System.Collections.Generic.List[string]]::new()
+        if ($Oldest) {
+            function Get-NotifyHotkeyLivePopupStates {
+                return @([pscustomobject]@{ BrokerManaged = $true; PopupId = 'first"card' }, [pscustomobject]@{ BrokerManaged = $true; PopupId = 'second-card' })
+            }
+            $realActivation = ${function:Start-NotifyHotkeyActivation}
+            function Start-NotifyHotkeyActivation {
+                param($PopupState)
+                $script:HotkeyActivationAttempts.Add([string]$PopupState.PopupId)
+                return (& $realActivation -PopupState $PopupState)
+            }
+            $accepted = Invoke-NotifyHotkeyOldestPopup
+        }
+        else { $accepted = Send-NotifyHotkeyBrokerPost -Path '/activate-oldest' -TimeoutMs $TimeoutMs }
+        $elapsedMs = $clock.ElapsedMilliseconds
+        if (-not $async.AsyncWaitHandle.WaitOne(5000)) { throw 'Hotkey test responder did not finish.' }
+        $serverOutput = @($server.EndInvoke($async))
+        if ($server.HadErrors -or $serverOutput.Count -ne 1) { throw ('Hotkey responder failed: ' + ($server.Streams.Error | Out-String)) }
+        return [pscustomobject]@{ Accepted = $accepted; ElapsedMs = $elapsedMs; Request = $serverOutput[0]; Attempts = @($script:HotkeyActivationAttempts.ToArray()) }
+    }
+    finally {
+        $listener.Stop()
+        if ($null -ne $async -and -not $async.IsCompleted) { try { $server.Stop() } catch {} }
+        $server.Dispose()
+        $ready.Dispose()
+    }
+}
+
+$response = Invoke-HotkeyResponseTest -Chunks @('HT', 'TP/1.1 ', '200', " OK`r`nContent-Length: 0`r`n`r`n") -ChunkDelayMs 15
+Assert-Hotkey $response.Accepted 'fragmented HTTP 200 is accepted'
+Assert-Hotkey ($response.Request.RequestLine -eq 'POST /activate-oldest HTTP/1.1' -and $response.Request.Body -eq '{}') 'oldest path sends a complete bounded POST'
+$response = Invoke-HotkeyResponseTest -Chunks @('HTTP/1.1 5', "03 Service Unavailable`r`nContent-Length: 0`r`n`r`n") -ChunkDelayMs 15
+Assert-Hotkey (-not $response.Accepted) 'complete fragmented rejection permits the next candidate'
+foreach ($scenario in @('empty', 'partial', 'reset', 'overlong')) {
+    $chunks = switch ($scenario) {
+        'partial' { 'HTTP/1.1 5' }
+        'reset' { 'HTTP/1.' }
+        'overlong' { 'HTTP/1.1 200 ' + ('x' * 300) }
+    }
+    $response = Invoke-HotkeyResponseTest -Chunks @($chunks) -ResetAfterRequest:($scenario -eq 'reset') -Oldest
+    Assert-Hotkey $response.Accepted "$scenario acknowledgement consumes the key after a full request"
+    Assert-Hotkey ($response.Attempts.Count -eq 1 -and $response.Attempts[0] -eq 'first"card') "$scenario acknowledgement cannot activate a second card"
+    $payload = $response.Request.Body | ConvertFrom-Json
+    Assert-Hotkey ($response.Request.RequestLine -eq 'POST /close HTTP/1.1' -and $payload.popupId -eq 'first"card' -and $payload.activate -eq $true) "$scenario card request preserves JSON values"
+}
+$response = Invoke-HotkeyResponseTest -Chunks @('H', 'T', 'T', 'P', '/', '1') -ChunkDelayMs 80 -TimeoutMs 150
+Assert-Hotkey ($response.Accepted -and $response.ElapsedMs -lt 1200) 'fragmented acknowledgement shares one elapsed time budget'
+& {
+    $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+    $listener.Start()
+    $config = [pscustomobject]@{ BrokerPort = ([System.Net.IPEndPoint]$listener.LocalEndpoint).Port }
+    $listener.Stop()
+    Assert-Hotkey (-not (Send-NotifyHotkeyBrokerPost -Path '/close' -TimeoutMs 100)) 'connection failure before sending permits fallback'
+    Assert-Hotkey (-not (Invoke-NotifyHotkeyBrokerActivateOldest)) 'oldest wrapper does not report a rejected POST as success'
 }
 
 Write-Output ("Popup hotkey tests passed: {0}" -f $script:PassCount)

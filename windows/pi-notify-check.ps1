@@ -483,14 +483,14 @@ if ($listenerText -notmatch 'Invoke-NotifyBrokerPopup' -or $listenerText -notmat
 if ($listenerText -notmatch 'Dictionary\[string,string\][\s\S]{0,120}OrdinalIgnoreCase' -or ([regex]::Matches($brokerText, 'Dictionary\[string,string\][\s\S]{0,120}OrdinalIgnoreCase')).Count -lt 1) {
     throw 'Listener and broker HTTP parsers must treat headers as case-insensitive so Node fetch lowercase content-length is honored.'
 }
-if ($listenerText -notmatch 'TcpClient' -or $listenerText -notmatch 'BeginConnect' -or $listenerText -notmatch 'Content-Length: \$\(\$bodyBytes\.Length\)' -or $listenerText -notmatch 'broker-post-accepted-no-response' -or ([regex]::Matches($hotkeyText, 'ContentLength\s*=\s*\$closeBytes\.Length')).Count -lt 2) {
+if ($listenerText -notmatch 'TcpClient' -or $listenerText -notmatch 'BeginConnect' -or $listenerText -notmatch 'Content-Length: \$\(\$bodyBytes\.Length\)' -or $listenerText -notmatch 'broker-post-accepted-no-response' -or $hotkeyText -notmatch 'Send-NotifyHotkeyBrokerPost -Path ''/close'' -Body' -or $hotkeyText -notmatch 'Content-Length: \$\(\$bodyBytes\.Length\)') {
     throw 'Broker popup/close POST requests must use bounded loopback POSTs with Content-Length and avoid false fallback when the broker accepts but responds slowly.'
 }
 if ($listenerText -notmatch 'Invoke-NotifyBrokerPopup[^\r\n]+-StackIndex -1') {
     throw 'Listener must let the broker allocate popup stack slots; otherwise broker-managed popups overlap at slot 0.'
 }
 # Hotkey broker compatibility and resident registration
-if ($hotkeyText -notmatch 'brokerManaged' -or $hotkeyText -notmatch 'BrokerCloseUrl' -or $hotkeyText -notmatch '"activate":true' -or $hotkeyText -notmatch 'pi-notify-broker.ps1' -or $hotkeyText -notmatch '-not \$brokerManaged') {
+if ($hotkeyText -notmatch 'brokerManaged' -or $hotkeyText -notmatch 'Send-NotifyHotkeyBrokerPost -Path ''/close'' -Body' -or $hotkeyText -notmatch 'activate\s*=\s*\$true' -or $hotkeyText -notmatch 'pi-notify-broker.ps1' -or $hotkeyText -notmatch '-not \$brokerManaged') {
     throw 'Hotkey must recognize broker-managed popups, including popupId-only broker live-state, and activate/close them via broker /close without killing the broker.'
 }
 if ($brokerText -notmatch 'Set-NotifyBrokerPopupActivating' -or $brokerText -notmatch '0x8df3' -or $brokerText -notmatch 'broker-activation-feedback' -or $brokerText -notmatch 'FormToClose') {
