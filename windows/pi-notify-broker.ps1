@@ -1927,62 +1927,80 @@ function Write-BgResponse($Stream, $StatusCode, $Reason, $Body, $ContentType) {
         try { Write-BrokerBgLog ('broker-client-disconnect stage=response status={0} "{1}"' -f $StatusCode, $_.Exception.Message) } catch {}
     }
 }
-function Read-BgRequest($Stream) {
+function Read-BgRequest {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.IO.Stream]$Stream
+    )
+
     $maxBodyBytes = 65536
     $buffer = [byte[]]::new(4096)
     $memory = [System.IO.MemoryStream]::new()
-    $headerEnd = -1
-    while ($headerEnd -lt 0) {
-        $read = $Stream.Read($buffer, 0, $buffer.Length)
-        if ($read -le 0) { break }
-        $memory.Write($buffer, 0, $read)
-        $bytes = $memory.ToArray()
-        $startIndex = [Math]::Max(0, $bytes.Length - $read - 3)
-        for ($i = $startIndex; $i -le $bytes.Length - 4; $i++) {
-            if ($bytes[$i] -eq 13 -and $bytes[$i + 1] -eq 10 -and $bytes[$i + 2] -eq 13 -and $bytes[$i + 3] -eq 10) {
-                $headerEnd = $i + 4
-                break
+    try {
+        $headerEnd = -1
+        while ($headerEnd -lt 0) {
+            $read = $Stream.Read($buffer, 0, $buffer.Length)
+            if ($read -le 0) { throw 'Incomplete HTTP request header.' }
+
+            $memory.Write($buffer, 0, $read)
+            $bytes = $memory.ToArray()
+            $startIndex = [Math]::Max(0, $bytes.Length - $read - 3)
+            for ($i = $startIndex; $i -le $bytes.Length - 4; $i++) {
+                if ($bytes[$i] -eq 13 -and $bytes[$i + 1] -eq 10 -and $bytes[$i + 2] -eq 13 -and $bytes[$i + 3] -eq 10) {
+                    $headerEnd = $i + 4
+                    break
+                }
+            }
+            if ($headerEnd -gt 65536 -or ($headerEnd -lt 0 -and $memory.Length -gt 65536)) {
+                throw 'HTTP header too large.'
             }
         }
-        if ($memory.Length -gt 65536) { throw "HTTP header too large." }
-    }
-    if ($headerEnd -lt 0) { throw "Incomplete HTTP request header." }
-    $allBytes = $memory.ToArray()
-    $headerText = [System.Text.Encoding]::ASCII.GetString($allBytes, 0, $headerEnd)
-    $lines = $headerText -split "`r`n"
-    $requestLine = if ($lines.Length -gt 0) { [string]$lines[0] } else { '' }
-    $requestLine = $requestLine.Trim()
-    if ([string]::IsNullOrWhiteSpace($requestLine)) { throw "Missing HTTP request line." }
-    $headers = [System.Collections.Generic.Dictionary[string,string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-    if ($lines.Length -gt 1) {
+
+        $allBytes = $memory.ToArray()
+        $headerText = [System.Text.Encoding]::ASCII.GetString($allBytes, 0, $headerEnd)
+        $lines = $headerText -split "`r`n"
+        $requestLine = ([string]$lines[0]).Trim()
+        if ([string]::IsNullOrWhiteSpace($requestLine)) { throw 'Missing HTTP request line.' }
+
+        $headers = [System.Collections.Generic.Dictionary[string,string]]::new([System.StringComparer]::OrdinalIgnoreCase)
         foreach ($line in $lines[1..($lines.Length - 1)]) {
             if ([string]::IsNullOrWhiteSpace($line)) { continue }
             $index = $line.IndexOf(':')
-            if ($index -le 0) { continue }
-            $headers[$line.Substring(0, $index).Trim()] = $line.Substring($index + 1).Trim()
+            if ($index -le 0) { throw 'Invalid HTTP header.' }
+            $name = $line.Substring(0, $index).Trim()
+            if ($name -eq 'Content-Length' -and $headers.ContainsKey($name)) {
+                throw 'Duplicate HTTP content length.'
+            }
+            $headers[$name] = $line.Substring($index + 1).Trim()
+        }
+        if ($headers.ContainsKey('Transfer-Encoding')) { throw 'Unsupported HTTP transfer encoding.' }
+
+        $contentLength = 0
+        if ($headers.ContainsKey('Content-Length')) {
+            $value = [string]$headers['Content-Length']
+            if ($value -notmatch '^[0-9]+$' -or -not [int]::TryParse($value, [ref]$contentLength)) {
+                throw 'Invalid HTTP content length.'
+            }
+        }
+        if ($contentLength -gt $maxBodyBytes) { throw 'HTTP request body too large.' }
+
+        # Read exactly the declared body. EOF is a rejected delivery, never a successful short message.
+        $bodyBytes = [byte[]]::new($contentLength)
+        $received = [Math]::Min($contentLength, $allBytes.Length - $headerEnd)
+        if ($received -gt 0) { [Array]::Copy($allBytes, $headerEnd, $bodyBytes, 0, $received) }
+        while ($received -lt $contentLength) {
+            $read = $Stream.Read($bodyBytes, $received, $contentLength - $received)
+            if ($read -le 0) { throw 'Incomplete HTTP request body.' }
+            $received += $read
+        }
+
+        return [pscustomobject]@{
+            RequestLine = $requestLine
+            Headers     = $headers
+            BodyBytes   = $bodyBytes
         }
     }
-    $contentLength = 0
-    if ($headers.ContainsKey('Content-Length')) { [int]::TryParse([string]$headers['Content-Length'], [ref]$contentLength) | Out-Null }
-    if ($contentLength -lt 0) { throw "Invalid HTTP content length." }
-    if ($contentLength -gt $maxBodyBytes) { throw "HTTP request body too large." }
-    $bodyMemory = [System.IO.MemoryStream]::new()
-    $existingBytes = $allBytes.Length - $headerEnd
-    if ($existingBytes -gt $maxBodyBytes) { throw "HTTP request body too large." }
-    if ($existingBytes -gt 0) { $bodyMemory.Write($allBytes, $headerEnd, $existingBytes) }
-    while ($bodyMemory.Length -lt $contentLength) {
-        $remaining = [Math]::Min($buffer.Length, $contentLength - [int]$bodyMemory.Length)
-        $read = $Stream.Read($buffer, 0, $remaining)
-        if ($read -le 0) { break }
-        $bodyMemory.Write($buffer, 0, $read)
-    }
-    $bodyBytes = $bodyMemory.ToArray()
-    if ($bodyBytes.Length -gt $contentLength) {
-        $trimmed = [byte[]]::new($contentLength)
-        [Array]::Copy($bodyBytes, 0, $trimmed, 0, $contentLength)
-        $bodyBytes = $trimmed
-    }
-    return [pscustomobject]@{ RequestLine = $requestLine; Headers = $headers; BodyBytes = $bodyBytes }
+    finally { $memory.Dispose() }
 }
 while ($true) {
     $client = $null
@@ -2012,6 +2030,9 @@ while ($true) {
         Write-BgResponse -Stream $stream -StatusCode 404 -Reason 'Not Found' -Body '{"ok":false}' -ContentType 'application/json; charset=utf-8'
     }
     catch {
+        if ($null -ne $client) {
+            try { Write-BgResponse -Stream $client.GetStream() -StatusCode 400 -Reason 'Bad Request' -Body '{"ok":false}' -ContentType 'application/json; charset=utf-8' } catch {}
+        }
         try { Write-BrokerBgLog ('broker-bg-error "{0}"' -f $_.Exception.Message) } catch {}
     }
     finally {

@@ -25,9 +25,68 @@ function Get-DeliveryFunctions {
     }
     return ($definitions -join "`n")
 }
-. ([scriptblock]::Create((Get-DeliveryFunctions @('Send-NotifyBrokerPopup', 'Invoke-NotifyBrokerPopup', 'Get-NotifyPopupStackPlan'))))
+. ([scriptblock]::Create((Get-DeliveryFunctions @('Read-HttpRequest', 'Send-NotifyBrokerPopup', 'Invoke-NotifyBrokerPopup', 'Get-NotifyPopupStackPlan'))))
 function Write-NotifyListenerLog { param($Message) }
 function Get-NotifyRouteFingerprint { param($Value) return 'fixture-fingerprint' }
+
+$brokerAst = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot 'pi-notify-broker.ps1'), [ref]$tokens, [ref]$errors)
+if ($errors.Count) { throw ($errors | Out-String) }
+$backgroundText = $brokerAst.Find({ param($node) $node -is [System.Management.Automation.Language.StringConstantExpressionAst] -and $node.Value.StartsWith('param($Listener, $Queue,') }, $true)
+if ($null -eq $backgroundText) { throw 'Missing broker background script.' }
+$backgroundAst = [System.Management.Automation.Language.Parser]::ParseInput($backgroundText.Value, [ref]$tokens, [ref]$errors)
+if ($errors.Count) { throw ($errors | Out-String) }
+$backgroundParser = $backgroundAst.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Read-BgRequest' }, $true)
+if ($null -eq $backgroundParser) { throw 'Missing broker request parser.' }
+. ([scriptblock]::Create($backgroundParser.Extent.Text))
+
+# Exercise both actual parsers with a stream that splits headers and UTF-8 bodies.
+Add-Type @'
+using System;
+using System.IO;
+public sealed class NotifyDeliveryFragmentStream : MemoryStream {
+    private readonly int maxRead;
+    public NotifyDeliveryFragmentStream(byte[] bytes, int maxRead) : base(bytes) { this.maxRead = maxRead; }
+    public override int Read(byte[] buffer, int offset, int count) { return base.Read(buffer, offset, Math.Min(count, maxRead)); }
+}
+'@
+function Read-DeliveryFixture {
+    param([string]$Request, [int]$MaxRead = 4096)
+    $stream = [NotifyDeliveryFragmentStream]::new([System.Text.Encoding]::UTF8.GetBytes($Request), $MaxRead)
+    try { return & $script:DeliveryParser -Stream $stream }
+    finally { $stream.Dispose() }
+}
+function Assert-DeliveryRequestRejected {
+    param([string]$Request, [string]$Name)
+    $rejected = $false
+    try { [void](Read-DeliveryFixture -Request $Request -MaxRead 3) }
+    catch { $rejected = $true }
+    Assert-Delivery $rejected $Name
+}
+
+foreach ($surface in @('listener', 'broker')) {
+    $script:DeliveryParser = if ($surface -eq 'listener') { 'Read-HttpRequest' } else { 'Read-BgRequest' }
+    $body = '{"body":"' + [char]0x4e2d + '"}'
+    $length = [System.Text.Encoding]::UTF8.GetByteCount($body)
+    foreach ($fragmentSize in @(1, 7, 4096)) {
+        $request = Read-DeliveryFixture -Request "POST /notify HTTP/1.1`r`nContent-Length: $length`r`n`r`n$body" -MaxRead $fragmentSize
+        Assert-Delivery ([System.Text.Encoding]::UTF8.GetString($request.BodyBytes) -ceq $body) "$surface preserves exact UTF-8 bytes with fragment size $fragmentSize"
+    }
+    $request = Read-DeliveryFixture -Request "GET /health HTTP/1.1`r`nHost: localhost`r`n`r`n"
+    Assert-Delivery ($request.RequestLine -eq 'GET /health HTTP/1.1' -and $request.BodyBytes.Length -eq 0) "$surface accepts a bodyless health request"
+    $request = Read-DeliveryFixture -Request "POST /notify HTTP/1.1`r`nContent-Length: 2`r`n`r`n{}ignored"
+    Assert-Delivery ([System.Text.Encoding]::UTF8.GetString($request.BodyBytes) -eq '{}') "$surface consumes only the declared body"
+    Assert-DeliveryRequestRejected "POST /notify HTTP/1.1`r`nContent-Length: 20`r`n`r`n{}" "$surface rejects EOF even when the short body is valid JSON"
+    Assert-DeliveryRequestRejected "POST /notify HTTP/1.1`r`nContent-Length: 2`r`n`r`n{" "$surface rejects a truncated JSON body"
+    Assert-DeliveryRequestRejected "POST /notify HTTP/1.1`r`nContent-Length: 2" "$surface rejects an incomplete header"
+    foreach ($lengthValue in @('-1', '+2', 'abc', '', '2147483648', '65537')) {
+        Assert-DeliveryRequestRejected "POST /notify HTTP/1.1`r`nContent-Length: $lengthValue`r`n`r`n{}" "$surface rejects invalid or oversized content length '$lengthValue'"
+    }
+    Assert-DeliveryRequestRejected "POST /notify HTTP/1.1`r`nContent-Length: 2`r`ncontent-length: 3`r`n`r`n{}" "$surface rejects conflicting content lengths"
+    Assert-DeliveryRequestRejected "POST /notify HTTP/1.1`r`nContent-Length: 2`r`ncontent-length: 2`r`n`r`n{}" "$surface rejects duplicate framing headers"
+    Assert-DeliveryRequestRejected "POST /notify HTTP/1.1`r`nTransfer-Encoding: chunked`r`n`r`n0`r`n`r`n" "$surface rejects unsupported transfer encoding"
+    $request = Read-DeliveryFixture -Request ("POST /notify HTTP/1.1`r`nContent-Length: 65536`r`n`r`n" + ('x' * 65536))
+    Assert-Delivery ($request.BodyBytes.Length -eq 65536) "$surface accepts the maximum permitted complete body"
+}
 
 # A loopback-only responder controls TCP fragmentation independently of the sender under test.
 function Invoke-DeliveryResponseTest {
