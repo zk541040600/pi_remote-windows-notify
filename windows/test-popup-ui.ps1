@@ -43,6 +43,10 @@ $activationAst = Read-TestAst 'NotifyBridge.Activation.ps1'
 
 function Write-NotifyBrokerLog { param($Message) }
 function Write-NotifyPopupLog { param($Message) }
+function Save-NotifyBrokerLiveState { param($Tag) }
+function Save-NotifyPopupLiveState {}
+function Remove-NotifyBrokerLiveState { param($PopupId) }
+function Remove-NotifyPopupLiveState {}
 function Complete-NotifyBrokerPopupLifecycle {
     param($Tag, $Outcome, $Reason)
     $Tag.TerminalState.Value = $true
@@ -476,7 +480,7 @@ try {
                     Set-TestFallbackState $card
                     $null=Complete-NotifyPopupLifecycle -Outcome failed -Reason $reason -Retryable $retry
                 }
-                Assert-Ui ($script:RemovedLiveStates -eq $(if($retry){0}else{1})) "$surface retry=$retry hotkey eligibility"
+                Assert-Ui ($script:RemovedLiveStates -eq 1) "$surface retry=$retry clears prior hotkey eligibility"
                 Assert-Ui (-not $card.Form.IsDisposed) "$surface retry=$retry keeps feedback visible"
             } finally { Remove-TestCard $card }
         }

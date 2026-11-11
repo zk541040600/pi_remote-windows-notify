@@ -589,6 +589,21 @@ function Get-NotifyPopupActivationEventName {
     return ('Local\PiNotifyPopupActivate.{0}.{1}' -f $ProcessId, $ActivationKey.ToLowerInvariant())
 }
 
+# Hotkey readers must observe a complete old or new live-state document.
+function Write-NotifyPopupLiveJson {
+    param([Parameter(Mandatory = $true)][string]$Path, [Parameter(Mandatory = $true)]$Payload)
+
+    $tempPath = $Path + ('.tmp-{0}' -f [Guid]::NewGuid().ToString('N'))
+    try {
+        [System.IO.File]::WriteAllText($tempPath, ($Payload | ConvertTo-Json -Depth 4 -Compress), [System.Text.UTF8Encoding]::new($false))
+        if ([System.IO.File]::Exists($Path)) { [System.IO.File]::Replace($tempPath, $Path, [NullString]::Value) }
+        else { [System.IO.File]::Move($tempPath, $Path) }
+    }
+    finally {
+        try { [System.IO.File]::Delete($tempPath) } catch {}
+    }
+}
+
 # Convert once so WinForms Interval and the immutable deadline have identical bounds.
 function Get-NotifyPopupLifetimeMs {
     param([int]$TimeoutSeconds = 1800)

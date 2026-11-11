@@ -467,7 +467,9 @@ test("immutable popup expiry is absolute and retry timers use only remaining lif
   assert.match(broker, /broker-popup-expired[\s\S]*ignoredOutcome/);
   assert.doesNotMatch(broker, /restore clickable retry UI[\s\S]{0,500}\$Tag\.Timer\.Interval\s*=\s*\$popupLifetimeMs/);
 
-  assert.match(popup, /NotifyPopupExpiresAtUtc\s*=\s*\[DateTime\]::UtcNow\.AddMilliseconds\(\$popupLifetimeMs\)/);
+  assert.match(popup, /NotifyPopupCreatedAtUtc\s*=\s*\[DateTime\]::UtcNow/);
+  assert.match(popup, /NotifyPopupExpiresAtUtc\s*=\s*\$script:NotifyPopupCreatedAtUtc\.AddMilliseconds\(\$popupLifetimeMs\)/);
+  assert.equal((popup.match(/NotifyPopupExpiresAtUtc\s*=/g) ?? []).length, 1, "retry must never replace the original popup deadline");
   assert.match(popup, /Get-NotifyActivationRemainingMs -ExpiresAtUtc \$script:NotifyPopupExpiresAtUtc/);
   assert.match(popup, /\$script:NotifyPopupTimer\.Interval = \$remainingMs/);
   assert.match(popup, /popup-expired ignoredOutcome/);

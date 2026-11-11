@@ -193,6 +193,7 @@ function Complete-NotifyPopupLifecycle {
     )
 
     if ($null -eq $script:NotifyPopupForm -or $script:NotifyPopupForm.IsDisposed) { return $false }
+    if (-not $script:NotifyPopupTerminalState) { Remove-NotifyPopupLiveState }
     $remainingMs = Get-NotifyActivationRemainingMs -ExpiresAtUtc $script:NotifyPopupExpiresAtUtc
     if ($Outcome -ne 'dismissed' -and $remainingMs -le 0) {
         $script:NotifyPopupTerminalState = $true
@@ -257,10 +258,10 @@ function Complete-NotifyPopupLifecycle {
             $script:NotifyPopupTimer.Interval = $remainingMs
             $script:NotifyPopupTimer.Start()
             $script:NotifyPopupFocusWatchTimer.Start()
+            Save-NotifyPopupLiveState
             Write-NotifyPopupLog -Message ('popup-retry-ready originKind={0} reason={1} remainingMs={2}' -f $(if ([string]::IsNullOrWhiteSpace($originKind)) { 'terminal' } else { $originKind }), $Reason, $remainingMs)
             return $true
         }
-        Remove-NotifyPopupLiveState
         if (([string]$script:NotifyPopupTargetOriginKind -eq 'paseo') -and ($Reason -in @('expired', 'invalid', 'activation-missing'))) {
             $expiredText = -join @([char]0x901a, [char]0x77e5, [char]0x5df2, [char]0x5931, [char]0x6548)
             Set-NotifyPopupRecoveryUiState -State 'unavailable'
@@ -294,6 +295,7 @@ function Set-NotifyPopupActivating {
 
     try {
         $script:NotifyPopupActivating = $true
+        Remove-NotifyPopupLiveState
         if ([string]$script:NotifyPopupTargetOriginKind -ne 'paseo') { $script:NotifyPopupTimer.Stop() }
         $script:NotifyPopupFocusWatchTimer.Stop()
         $inactiveCardColor = [System.Drawing.Color]::FromArgb(48, 52, 60)
@@ -567,30 +569,28 @@ function Get-NotifyPopupLiveStatePath {
 }
 
 function Save-NotifyPopupLiveState {
-    param(
-        [string]$TargetHostValue,
-        [string]$CwdBaseValue,
-        [string]$SourceTabTitleValue,
-        [string]$TargetFingerprintValue,
-        [int]$StackIndexValue,
-        [int]$TimeoutSecondsValue
-    )
-
     $path = Get-NotifyPopupLiveStatePath
     try {
-        $ttlSeconds = [Math]::Max(300, ([Math]::Ceiling((Get-NotifyPopupLifetimeMs -TimeoutSeconds $TimeoutSecondsValue) / 1000) + 60))
+        if (-not $script:NotifyPopupHasShown -or $null -eq $script:NotifyPopupForm -or
+            $script:NotifyPopupForm.IsDisposed -or $script:NotifyPopupForm.Disposing -or
+            $script:NotifyPopupCloseRequested -or $script:NotifyPopupTerminalState -or $script:NotifyPopupActivating -or
+            $script:NotifyPopupRecoveryState -notin @('ready', 'recovering') -or $null -eq $script:NotifyPopupActivationEvent -or
+            (Get-NotifyActivationRemainingMs -ExpiresAtUtc $script:NotifyPopupExpiresAtUtc) -le 0) {
+            Remove-NotifyPopupLiveState
+            return
+        }
         $payload = @{
             processId         = $PID
             configFingerprint = Get-NotifyPopupContextFingerprint -Value $config.ConfigPath
-            targetFingerprint = $TargetFingerprintValue
-            stackIndex        = $StackIndexValue
-            startedAtTicks    = [DateTime]::UtcNow.Ticks
-            createdAtUtc      = [DateTime]::UtcNow.ToString('o')
-            expiresAtTicks    = [DateTime]::UtcNow.AddSeconds($ttlSeconds).Ticks
-            activationKey     = if ($null -ne $script:NotifyPopupActivationEvent) { $script:NotifyPopupActivationKey } else { '' }
+            targetFingerprint = $script:NotifyPopupTargetFingerprint
+            stackIndex        = $StackIndex
+            startedAtTicks    = $script:NotifyPopupCreatedAtUtc.Ticks
+            createdAtUtc      = $script:NotifyPopupCreatedAtUtc.ToString('o')
+            expiresAtTicks    = $script:NotifyPopupExpiresAtUtc.Ticks
+            activationKey     = $script:NotifyPopupActivationKey
         }
-        [System.IO.File]::WriteAllText($path, ($payload | ConvertTo-Json -Depth 4), [System.Text.UTF8Encoding]::new($false))
-        Write-NotifyPopupLog -Message ('popup-live-state pid={0} targetFingerprint={1} stackIndex={2} pathFingerprint={3}' -f $PID, $TargetFingerprintValue, $StackIndexValue, (Get-NotifyPopupContextFingerprint -Value $path))
+        Write-NotifyPopupLiveJson -Path $path -Payload $payload
+        Write-NotifyPopupLog -Message ('popup-live-state pid={0} targetFingerprint={1} stackIndex={2} pathFingerprint={3}' -f $PID, $script:NotifyPopupTargetFingerprint, $StackIndex, (Get-NotifyPopupContextFingerprint -Value $path))
     }
     catch {
         Write-NotifyPopupLog -Message ('popup-live-state-write-error "{0}"' -f $_.Exception.Message)
@@ -656,7 +656,6 @@ catch {
 }
 
 Write-NotifyPopupLog -Message ('popup-start targetFingerprint={0} hasCwd={1} hasTab={2} timeout={3} stackIndex={4}' -f (Get-NotifyPopupContextFingerprint -Value $FocusTarget), (-not [string]::IsNullOrWhiteSpace($CwdBase)), (-not [string]::IsNullOrWhiteSpace($SourceTabTitle)), $TimeoutSeconds, $StackIndex)
-$liveTargetFingerprint = if ([string]::IsNullOrWhiteSpace($TargetFingerprint)) { Get-NotifyPopupContextFingerprint -Value $FocusTarget } else { $TargetFingerprint }
 $script:NotifyPopupActivationKey = [Guid]::NewGuid().ToString('N')
 $script:NotifyPopupActivationEvent = $null
 try {
@@ -666,7 +665,6 @@ try {
 catch {
     Write-NotifyPopupLog -Message 'popup-hotkey-signal-unavailable'
 }
-Save-NotifyPopupLiveState -TargetHostValue $FocusTarget -CwdBaseValue $CwdBase -SourceTabTitleValue $SourceTabTitle -TargetFingerprintValue $liveTargetFingerprint -StackIndexValue $StackIndex -TimeoutSecondsValue $TimeoutSeconds
 
 function Get-NotifyPopupTabs {
     param(
@@ -985,6 +983,7 @@ $script:NotifyPopupTerminalOutcome = ''
 $script:NotifyPopupTerminalReason = ''
 $script:NotifyPopupCloseRequested = $false
 $script:NotifyPopupActivating = $false
+$script:NotifyPopupHasShown = $false
 $script:NotifyPopupExactWorkerTimer = New-Object System.Windows.Forms.Timer
 $script:NotifyPopupExactWorkerTimer.Interval = 100
 $script:NotifyPopupExactWorkerTimer.Add_Tick({
@@ -1125,7 +1124,8 @@ $closeLabel.Add_Click($closeAction)
 $timer = New-Object System.Windows.Forms.Timer
 $script:NotifyPopupTimer = $timer
 $popupLifetimeMs = Get-NotifyPopupLifetimeMs -TimeoutSeconds $TimeoutSeconds
-$script:NotifyPopupExpiresAtUtc = [DateTime]::UtcNow.AddMilliseconds($popupLifetimeMs)
+$script:NotifyPopupCreatedAtUtc = [DateTime]::UtcNow
+$script:NotifyPopupExpiresAtUtc = $script:NotifyPopupCreatedAtUtc.AddMilliseconds($popupLifetimeMs)
 $timer.Interval = $popupLifetimeMs
 $timer.Add_Tick({
     Write-NotifyPopupLog -Message 'popup-timeout-close'
@@ -1201,8 +1201,10 @@ $form.Add_Shown({
         [void](Start-NotifyPopupExactWorker -Mode 'resolve')
     }
     elseif ($script:NotifyPopupRecoveryState -eq 'unavailable') {
-        [void](Complete-NotifyPopupLifecycle -Outcome 'failed' -Reason 'exact-route-unavailable')
+        [void](Complete-NotifyPopupLifecycle -Outcome 'failed' -Reason 'exact-route-unavailable' -Retryable $false)
     }
+    $script:NotifyPopupHasShown = $true
+    Save-NotifyPopupLiveState
 })
 
 $form.Add_FormClosed({

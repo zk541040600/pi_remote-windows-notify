@@ -319,34 +319,31 @@ function Get-NotifyBrokerLiveStatePath {
 }
 
 function Save-NotifyBrokerLiveState {
-    param(
-        [Parameter(Mandatory = $true)][string]$PopupId,
-        [string]$TargetHostValue,
-        [string]$CwdBaseValue,
-        [string]$SourceTabTitleValue,
-        [string]$TargetFingerprintValue,
-        [int]$StackIndexValue,
-        [int]$TimeoutSecondsValue
-    )
+    param([Parameter(Mandatory = $true)][hashtable]$Tag)
 
-    $path = Get-NotifyBrokerLiveStatePath -PopupId $PopupId
     try {
-        $ttlSeconds = [Math]::Max(300, ([Math]::Ceiling((Get-NotifyPopupLifetimeMs -TimeoutSeconds $TimeoutSecondsValue) / 1000) + 60))
+        if (-not $Tag.HasShown -or $null -eq $Tag.Form -or $Tag.Form.IsDisposed -or $Tag.Form.Disposing -or
+            $Tag.CloseRequested.Value -or $Tag.TerminalState.Value -or $Tag.Activating.Value -or
+            $Tag.RecoveryState -notin @('ready', 'recovering') -or
+            (Get-NotifyActivationRemainingMs -ExpiresAtUtc $Tag.ExpiresAtUtc) -le 0) {
+            Remove-NotifyBrokerLiveState -PopupId $Tag.PopupId
+            return
+        }
         $payload = @{
             processId         = $PID
             brokerManaged     = $true
-            popupId           = $PopupId
+            popupId           = $Tag.PopupId
             configFingerprint = Get-NotifyBrokerContextFingerprint -Value $config.ConfigPath
-            targetFingerprint = $TargetFingerprintValue
-            stackIndex        = $StackIndexValue
-            startedAtTicks    = [DateTime]::UtcNow.Ticks
-            createdAtUtc      = [DateTime]::UtcNow.ToString('o')
-            expiresAtTicks    = [DateTime]::UtcNow.AddSeconds($ttlSeconds).Ticks
+            targetFingerprint = $Tag.TargetFingerprint
+            stackIndex        = $Tag.StackIndex
+            startedAtTicks    = $Tag.CreatedAtUtc.Ticks
+            createdAtUtc      = $Tag.CreatedAtUtc.ToString('o')
+            expiresAtTicks    = $Tag.ExpiresAtUtc.Ticks
         }
-        [System.IO.File]::WriteAllText($path, ($payload | ConvertTo-Json -Depth 4), [System.Text.UTF8Encoding]::new($false))
+        Write-NotifyPopupLiveJson -Path (Get-NotifyBrokerLiveStatePath -PopupId $Tag.PopupId) -Payload $payload
     }
     catch {
-        Write-NotifyBrokerLog -Message ('broker-live-state-write-error popupId={0} "{1}"' -f $PopupId, $_.Exception.Message)
+        Write-NotifyBrokerLog -Message ('broker-live-state-write-error popupId={0} "{1}"' -f $Tag.PopupId, $_.Exception.Message)
     }
 }
 
@@ -606,6 +603,7 @@ function Complete-NotifyBrokerPopupLifecycle {
     )
 
     if ($null -eq $Tag -or $null -eq $Tag.Form -or $Tag.Form.IsDisposed) { return $false }
+    if (-not $Tag.TerminalState.Value) { Remove-NotifyBrokerLiveState -PopupId $Tag.PopupId }
     $remainingMs = Get-NotifyActivationRemainingMs -ExpiresAtUtc ([DateTime]$Tag.ExpiresAtUtc)
     if ($Outcome -ne 'dismissed' -and $remainingMs -le 0) {
         $Tag.TerminalState.Value = $true
@@ -673,10 +671,10 @@ function Complete-NotifyBrokerPopupLifecycle {
             $Tag.Timer.Interval = $remainingMs
             $Tag.Timer.Start()
             $Tag.FocusWatchTimer.Start()
+            Save-NotifyBrokerLiveState -Tag $Tag
             Write-NotifyBrokerLog -Message ('broker-retry-ready popupId={0} originKind={1} reason={2} remainingMs={3}' -f $Tag.PopupId, $(if ([string]::IsNullOrWhiteSpace($originKind)) { 'terminal' } else { $originKind }), $Reason, $remainingMs)
             return $true
         }
-        Remove-NotifyBrokerLiveState -PopupId ([string]$Tag.PopupId)
         if (([string]$Tag.OriginKind -eq 'paseo') -and ($Reason -in @('expired', 'invalid', 'activation-missing'))) {
             $expiredText = -join @([char]0x901a, [char]0x77e5, [char]0x5df2, [char]0x5931, [char]0x6548)
             Set-NotifyBrokerRecoveryUiState -Tag $Tag -State 'unavailable'
@@ -1245,6 +1243,7 @@ function Set-NotifyBrokerPopupActivating {
     }
     try {
         $Tag.Activating.Value = $true
+        Remove-NotifyBrokerLiveState -PopupId $Tag.PopupId
         if ([string]$Tag.OriginKind -ne 'paseo') { $Tag.Timer.Stop() }
         $Tag.FocusWatchTimer.Stop()
 
@@ -1578,6 +1577,7 @@ function Show-NotifyBrokerPopup {
         PopupPlacement    = $PopupPlacementValue
         CreatedAtUtc      = $popupCreatedAtUtc
         ExpiresAtUtc      = $popupExpiresAtUtc
+        HasShown          = $false
         DidActivate       = [ref]$didActivate
         ShouldActivate    = [ref]$shouldActivate
         Activating        = [ref]$false
@@ -1680,8 +1680,10 @@ function Show-NotifyBrokerPopup {
             [void](Start-NotifyBrokerExactWorker -PopupId $tag.PopupId -Mode 'resolve' -NotificationId $tag.NotificationId -RecoveryTicketId $tag.RecoveryTicketId)
         }
         elseif ($tag.RecoveryState -eq 'unavailable') {
-            [void](Complete-NotifyBrokerPopupLifecycle -Tag $tag -Outcome 'failed' -Reason 'exact-route-unavailable')
+            [void](Complete-NotifyBrokerPopupLifecycle -Tag $tag -Outcome 'failed' -Reason 'exact-route-unavailable' -Retryable $false)
         }
+        $tag.HasShown = $true
+        Save-NotifyBrokerLiveState -Tag $tag
     })
 
     $form.Add_FormClosed({
@@ -1724,7 +1726,6 @@ function Show-NotifyBrokerPopup {
     $form.Region = New-Object System.Drawing.Region($roundedPath)
     $roundedPath.Dispose()
 
-    Save-NotifyBrokerLiveState -PopupId $PopupId -TargetHostValue $targetHost -CwdBaseValue $targetCwdBase -SourceTabTitleValue $targetSourceTabTitle -TargetFingerprintValue $TargetFingerprint -StackIndexValue $StackIndex -TimeoutSecondsValue $TimeoutSeconds
     $script:NotifyBrokerActivePopups[$PopupId] = [pscustomobject]@{
         PopupId           = $PopupId
         Form              = $form
