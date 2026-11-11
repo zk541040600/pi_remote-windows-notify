@@ -1291,6 +1291,12 @@ function Set-NotifyBrokerPopupActivating {
         else {
             $script:NotifyBrokerReadyActivationWatchdogMs
         }
+        $remainingMs = Get-NotifyActivationRemainingMs -ExpiresAtUtc ([DateTime]$Tag.ExpiresAtUtc)
+        if ($remainingMs -le 0) {
+            [void](Complete-NotifyBrokerPopupLifecycle -Tag $Tag -Outcome 'dismissed' -Reason 'expired')
+            return $false
+        }
+        $watchdogMs = [Math]::Min($watchdogMs, $remainingMs)
         $Tag.ActivationWatchdogTimer.Stop()
         $Tag.ActivationWatchdogTimer.Interval = $watchdogMs
         $Tag.ActivationWatchdogTimer.Start()

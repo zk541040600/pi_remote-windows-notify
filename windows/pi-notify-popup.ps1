@@ -347,6 +347,12 @@ function Set-NotifyPopupActivating {
         else {
             $script:NotifyPopupReadyActivationWatchdogMs
         }
+        $remainingMs = Get-NotifyActivationRemainingMs -ExpiresAtUtc $script:NotifyPopupExpiresAtUtc
+        if ($remainingMs -le 0) {
+            [void](Complete-NotifyPopupLifecycle -Outcome 'dismissed' -Reason 'expired')
+            return $false
+        }
+        $watchdogMs = [Math]::Min($watchdogMs, $remainingMs)
         $script:NotifyPopupActivationWatchdogTimer.Stop()
         $script:NotifyPopupActivationWatchdogTimer.Interval = $watchdogMs
         $script:NotifyPopupActivationWatchdogTimer.Start()

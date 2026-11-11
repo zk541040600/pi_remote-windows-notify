@@ -135,6 +135,31 @@ foreach ($surface in @('broker', 'fallback')) {
 }
 
 
+# Activation for every source is bounded by the same original popup deadline.
+$script:NotifyBrokerRecoveringActivationWatchdogMs = 12000
+$script:NotifyBrokerReadyActivationWatchdogMs = 20000
+$script:NotifyPopupRecoveringActivationWatchdogMs = 12000
+$script:NotifyPopupReadyActivationWatchdogMs = 20000
+foreach ($surface in @('broker', 'fallback')) {
+    foreach ($origin in @('terminal', '', 'paseo', 'pi-web')) {
+        foreach ($snapshot in @('', 'ready-snapshot')) {
+            $card = New-TestCard
+            try {
+                $card.OriginKind = $origin
+                $card.SnapshotId = $snapshot
+                $card.ExpiresAtUtc = [DateTime]::UtcNow.AddSeconds(2)
+                $deadline = $card.ExpiresAtUtc
+                if ($surface -eq 'broker') { $accepted = Set-NotifyBrokerPopupActivating -Tag $card }
+                else { Set-TestFallbackState $card; $accepted = Set-NotifyPopupActivating }
+                Assert-Ui $accepted "$surface $origin activation accepted near expiry snapshot=$snapshot"
+                Assert-Ui ($card.ActivationWatchdogTimer.Interval -gt 0 -and $card.ActivationWatchdogTimer.Interval -le 2000) "$surface $origin watchdog stays within remaining life snapshot=$snapshot"
+                Assert-Ui ($card.ExpiresAtUtc -eq $deadline) "$surface $origin preserves deadline snapshot=$snapshot"
+            }
+            finally { Remove-TestCard $card }
+        }
+    }
+}
+
 # Each request selects its own screen, independent of the broker's startup setting.
 $commonAst = Read-TestAst 'NotifyBridge.Common.ps1'
 . ([scriptblock]::Create((Get-TestFunctions $commonAst @('Normalize-NotifyBridgePopupPlacement', 'Get-NotifyPopupStackCapacity', 'Get-NotifyPopupStackPosition'))))
