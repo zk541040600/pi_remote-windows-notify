@@ -1103,7 +1103,8 @@ function Show-Toast {
         $stackIndex = Get-NotifyPopupStackPlan -TargetKey $targetKey -TargetFingerprint $targetFingerprint
         if ($stackIndex -lt 0) {
             Write-NotifyListenerLog -Message 'popup-drop no-free-screen-slot'
-            return
+            # Propagate non-delivery so the caller can return retry instead of acknowledging a lost card.
+            throw [System.InvalidOperationException]::new('No popup slot could be allocated.')
         }
         Clear-NotifyBridgePopupArtifacts -Aggressive
 

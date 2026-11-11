@@ -25,7 +25,7 @@ function Get-DeliveryFunctions {
     }
     return ($definitions -join "`n")
 }
-. ([scriptblock]::Create((Get-DeliveryFunctions @('Read-HttpRequest', 'Send-NotifyBrokerPopup', 'Invoke-NotifyBrokerPopup', 'Get-NotifyPopupStackPlan'))))
+. ([scriptblock]::Create((Get-DeliveryFunctions @('Read-HttpRequest', 'Send-NotifyBrokerPopup', 'Invoke-NotifyBrokerPopup', 'Get-NotifyPopupStackPlan', 'Show-Toast'))))
 function Write-NotifyListenerLog { param($Message) }
 function Get-NotifyRouteFingerprint { param($Value) return 'fixture-fingerprint' }
 
@@ -263,6 +263,38 @@ Assert-Delivery ($response.ElapsedMs -lt 1500) 'reset acknowledgement remains bo
     $script:StopAttempts.Clear()
     $slot = Get-NotifyPopupStackPlan -TargetKey 'b' -TargetFingerprint 'b'
     Assert-Delivery ($slot -eq 1 -and ($script:StopAttempts -join ',') -eq '102') 'successful same-target replacement reuses its slot'
+}
+
+# A failed fallback allocation must reach the existing delivery-error handler.
+& {
+    $TestDesktopSinkPath = ''
+    $DisplayMode = 'popup-focus'
+    $PopupTimeoutSeconds = 10
+    $script:NotifyPopupScript = Join-Path $PSScriptRoot 'pi-notify-popup.ps1'
+    $config = [pscustomobject]@{ RemoteHostAlias = 'fixture'; PopupPlacement = 'cursor' }
+    $script:FallbackLaunches = 0; $script:FallbackAllocations = 0; $script:ArtifactCleanups = 0
+    $script:BrokerAccepted = $false; $script:AllocatedSlot = -1
+    function Get-NotifyPopupTargetKey { param($TargetHost, $CwdBase, $TabTitle) return 'target' }
+    function Invoke-NotifyBrokerPopup { return $script:BrokerAccepted }
+    function Get-NotifyPopupStackPlan { $script:FallbackAllocations += 1; return $script:AllocatedSlot }
+    function Clear-NotifyBridgePopupArtifacts { param([switch]$Aggressive) $script:ArtifactCleanups += 1 }
+    function Start-NotifyPopupProcess { $script:FallbackLaunches += 1 }
+    $showArgs = @{ Title = 'fixture'; Body = 'body'; ToastAppId = 'fixture'; OriginKind = 'paseo'; TargetFingerprint = 'target'; SnapshotId = 'activation' }
+    $failed = $false
+    try { Show-Toast @showArgs }
+    catch [System.InvalidOperationException] { $failed = $true }
+    Assert-Delivery $failed 'no free fallback slot reports a delivery failure for retry'
+    Assert-Delivery ($script:FallbackLaunches -eq 0 -and $script:ArtifactCleanups -eq 0) 'failed allocation does not launch or clean up unrelated popup state'
+
+    $script:AllocatedSlot = 0
+    Show-Toast @showArgs
+    Assert-Delivery ($script:FallbackLaunches -eq 1) 'a later successful allocation can deliver the retried notification'
+
+    $script:BrokerAccepted = $true
+    $script:AllocatedSlot = -1
+    $allocationsBefore = $script:FallbackAllocations
+    Show-Toast @showArgs
+    Assert-Delivery ($script:FallbackAllocations -eq $allocationsBefore -and $script:FallbackLaunches -eq 1) 'broker acceptance still skips the fallback allocation and process'
 }
 
 Write-Output ("PASS popup delivery: {0} assertions" -f $script:PassCount)
