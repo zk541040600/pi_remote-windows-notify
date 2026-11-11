@@ -79,4 +79,4 @@ npm run test:popup
 This covers lifecycle and deadlines, hotkey ownership, atomic live-state publication,
 fragmented broker replies, fallback stacking, exact foreground identity, and drawing cleanup.
 
-See [the 2026-11-11 popup improvement report](docs/popup-10-rounds-20261111.md) for the ten changes and validation results.
+See [the latest ten-round popup report](docs/popup-10-rounds-20261111-r3.md) for cancellation coordination, delivery and hotkey fixes, listener shutdown, and native Windows CI results. The [previous improvement report](docs/popup-10-rounds-20261111.md) records the preceding ten rounds.
