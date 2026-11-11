@@ -2023,8 +2023,10 @@ $script:NotifyBrokerDispatchTimer = New-Object System.Windows.Forms.Timer
 $script:NotifyBrokerDispatchTimer.Interval = 50
 $script:NotifyBrokerDispatchTimer.Add_Tick({
     $item = $null
-    # Yield back to WinForms after a small batch so clicks and close timers stay responsive.
-    for ($processed = 0; $processed -lt 8 -and $script:NotifyBrokerPopupQueue.TryDequeue([ref]$item); $processed++) {
+    $dispatchClock = [System.Diagnostics.Stopwatch]::StartNew()
+    # Limit both count and elapsed time; a slow card must not hold up seven more.
+    for ($processed = 0; $processed -lt 8 -and ($processed -eq 0 -or $dispatchClock.ElapsedMilliseconds -lt 20) -and
+        $script:NotifyBrokerPopupQueue.TryDequeue([ref]$item); $processed++) {
         if ($null -eq $item) { continue }
         try {
             if ($item.Action -eq '/popup') {

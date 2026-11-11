@@ -291,11 +291,13 @@ $script:NotifyBrokerPopupQueue=[System.Collections.Concurrent.ConcurrentQueue[ob
 $script:DispatchSeen=[System.Collections.Generic.List[string]]::new()
 $script:DispatchErrors=[System.Collections.Generic.List[string]]::new()
 $script:ReplenishQueue=$false
+$script:DispatchDelayMs=0
 function Write-NotifyBrokerLog { param($Message) if ($Message -like 'broker-dispatch-error*') { $script:DispatchErrors.Add($Message) } }
 function Get-NotifyBrokerContextFingerprint { param($Value) return 'test-fingerprint' }
 function Get-NotifyRouteFingerprint { param($Value) return 'test-fingerprint' }
 function Show-NotifyBrokerPopup {
     param($Title)
+    if ($script:DispatchDelayMs -gt 0) { Start-Sleep -Milliseconds $script:DispatchDelayMs }
     $script:DispatchSeen.Add(('popup:' + $Title))
     if ($script:ReplenishQueue) {
         $script:NotifyBrokerPopupQueue.Enqueue([pscustomobject]@{
@@ -315,9 +317,11 @@ for ($i=0; $i -lt 40; $i++) {
     }
     $script:NotifyBrokerPopupQueue.Enqueue([pscustomobject]@{Action=$action;Body=$body;ReceivedAt=[DateTime]::UtcNow})
 }
-for ($batch=1; $batch -le 5; $batch++) {
+for ($batch=1; $script:NotifyBrokerPopupQueue.Count -gt 0 -and $batch -le 40; $batch++) {
+    $before = $script:DispatchSeen.Count
     & $dispatch
-    Assert-Ui ($script:DispatchSeen.Count -eq ($batch * 8)) "dispatch yields after batch $batch"
+    $processed = $script:DispatchSeen.Count - $before
+    Assert-Ui ($processed -ge 1 -and $processed -le 8) "dispatch makes bounded progress in batch $batch"
 }
 Assert-Ui (($script:DispatchSeen -join '|') -ceq ($expected -join '|')) 'dispatch preserves FIFO across batches'
 Assert-Ui ($script:NotifyBrokerPopupQueue.Count -eq 0 -and $script:DispatchErrors.Count -eq 0) 'dispatch drains valid requests without errors'
@@ -325,7 +329,19 @@ $script:DispatchSeen.Clear()
 $script:ReplenishQueue=$true
 $script:NotifyBrokerPopupQueue.Enqueue([pscustomobject]@{Action='/popup';Body='{"title":"start","body":"body","cwdBase":"test"}';ReceivedAt=[DateTime]::UtcNow})
 & $dispatch
-Assert-Ui ($script:DispatchSeen.Count -eq 8 -and $script:NotifyBrokerPopupQueue.Count -eq 1) 'continuous enqueue still yields after eight requests'
+Assert-Ui ($script:DispatchSeen.Count -ge 1 -and $script:DispatchSeen.Count -le 8 -and $script:NotifyBrokerPopupQueue.Count -eq 1) 'continuous enqueue still yields within eight requests'
+$script:NotifyBrokerPopupQueue=[System.Collections.Concurrent.ConcurrentQueue[object]]::new()
+$script:DispatchSeen.Clear()
+$script:ReplenishQueue=$false
+$script:DispatchDelayMs=40
+foreach ($title in @('slow-first', 'slow-second')) {
+    $script:NotifyBrokerPopupQueue.Enqueue([pscustomobject]@{Action='/popup';Body=(@{title=$title;cwdBase='test'} | ConvertTo-Json -Compress);ReceivedAt=[DateTime]::UtcNow})
+}
+& $dispatch
+Assert-Ui ($script:DispatchSeen.Count -eq 1 -and $script:NotifyBrokerPopupQueue.Count -eq 1) 'slow creation yields after one popup instead of blocking for eight'
+& $dispatch
+Assert-Ui (($script:DispatchSeen -join '|') -ceq 'popup:slow-first|popup:slow-second') 'time-bounded batches retain FIFO order'
+$script:DispatchDelayMs=0
 
 
 # A fallback hotkey signals the existing popup; it cannot invent a Terminal route.
