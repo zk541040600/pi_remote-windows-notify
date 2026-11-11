@@ -16,8 +16,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  windows:
-    runs-on: windows-latest
+  portable:
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -30,10 +30,6 @@ jobs:
         run: npm run check
       - name: Sender regressions
         run: npm run test:paseo-sender
-      - name: Windows PowerShell 5.1 popup regressions
-        run: npm run test:popup
-      - name: Windows route regressions
-        run: powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File windows/test-route.ps1
       - name: Standalone Node regressions
         shell: pwsh
         run: |
@@ -42,3 +38,20 @@ jobs:
           $tests = @(Get-ChildItem test/*.test.mjs | Where-Object Name -ne 'pi-web-desktop-lifecycle.test.mjs' | ForEach-Object FullName)
           node --experimental-transform-types --test @tests
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+      - name: Package structure
+        run: node scripts/check-package.mjs
+      - name: Windows PowerShell 5.1 popup regressions
+        run: npm run test:popup
+      - name: Windows route regressions
+        run: powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File windows/test-route.ps1
+      - name: Windows native recovery and QQ regressions
+        run: node --experimental-transform-types --test test/pi-web-notify-recovery.test.mjs test/windows-qq-notify.test.mjs
