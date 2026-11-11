@@ -710,6 +710,7 @@ function Get-NotifyPopupStackPlan {
             }
             catch {
                 Write-NotifyListenerLog -Message ('popup-replace-stop-error pid={0}' -f $popup.ProcessId)
+                return -1
             }
         }
         $remaining += $popup
@@ -725,6 +726,7 @@ function Get-NotifyPopupStackPlan {
         }
         catch {
             Write-NotifyListenerLog -Message ('popup-overflow-stop-error pid={0}' -f $popup.ProcessId)
+            return -1
         }
     }
     if ($reuseSlot -ge 0 -and -not $usedSlots.ContainsKey([string]$reuseSlot)) { return $reuseSlot }

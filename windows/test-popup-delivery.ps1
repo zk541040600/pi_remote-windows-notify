@@ -159,4 +159,51 @@ Assert-Delivery ($response.ElapsedMs -lt 1500) 'reset acknowledgement remains bo
     Assert-Delivery ($script:HealthCalls -eq 0 -and $script:BrokerStarts -eq 0 -and $script:PopupPosts -eq 0) 'disabled broker performs no network work'
 }
 
+& {
+    $config = [pscustomobject]@{ PopupPlacement = 'cursor'; PopupMaxVisible = 3 }
+    function Get-NotifyPopupWorkingArea { param($Placement) return [pscustomobject]@{ Height = 900 } }
+    function Get-NotifyPopupStackCapacity { param($WorkingAreaHeight, $MaxVisible) return $MaxVisible }
+    function Get-NotifyPopupProcesses { return $script:PopupProcesses }
+    function Stop-Process {
+        param($Id, [switch]$Force, $ErrorAction)
+        [void]$script:StopAttempts.Add([int]$Id)
+        if ($script:FailedStopIds -contains [int]$Id) { throw 'simulated process exit failure' }
+    }
+    function New-DeliveryPopup {
+        param([int]$ProcessId, [string]$Target, [int]$Slot)
+        return [pscustomobject]@{
+            ProcessId = $ProcessId; TargetFingerprint = $Target; StackIndex = $Slot
+            CreatedAtUtc = [DateTime]::UtcNow.AddMinutes($Slot - 10)
+        }
+    }
+    $script:StopAttempts = [System.Collections.Generic.List[int]]::new()
+    $script:FailedStopIds = @(101)
+    $script:PopupProcesses = @(New-DeliveryPopup 101 'same' 0)
+    $slot = Get-NotifyPopupStackPlan -TargetKey 'same' -TargetFingerprint 'same'
+    Assert-Delivery ($slot -eq -1) 'failed same-target close blocks a new popup even with spare slots'
+    Assert-Delivery (($script:StopAttempts -join ',') -eq '101') 'failed replacement stops after the failed process'
+
+    $script:StopAttempts.Clear()
+    $script:PopupProcesses = @(New-DeliveryPopup 101 'offscreen' 5)
+    $slot = Get-NotifyPopupStackPlan -TargetKey 'incoming' -TargetFingerprint 'incoming'
+    Assert-Delivery ($slot -eq -1) 'failed out-of-range close blocks a new popup even with spare slots'
+
+    $script:StopAttempts.Clear()
+    $script:PopupProcesses = @(
+        (New-DeliveryPopup 101 'a' 0), (New-DeliveryPopup 102 'b' 1), (New-DeliveryPopup 103 'c' 2)
+    )
+    $slot = Get-NotifyPopupStackPlan -TargetKey 'incoming' -TargetFingerprint 'incoming'
+    Assert-Delivery ($slot -eq -1) 'failed overflow close cannot allocate a new slot'
+    Assert-Delivery (($script:StopAttempts -join ',') -eq '101') 'failed overflow does not close additional unrelated cards'
+
+    $script:StopAttempts.Clear()
+    $script:FailedStopIds = @()
+    $slot = Get-NotifyPopupStackPlan -TargetKey 'incoming' -TargetFingerprint 'incoming'
+    Assert-Delivery ($slot -eq 0 -and ($script:StopAttempts -join ',') -eq '101') 'successful overflow still replaces only the oldest card'
+
+    $script:StopAttempts.Clear()
+    $slot = Get-NotifyPopupStackPlan -TargetKey 'b' -TargetFingerprint 'b'
+    Assert-Delivery ($slot -eq 1 -and ($script:StopAttempts -join ',') -eq '102') 'successful same-target replacement reuses its slot'
+}
+
 Write-Output ("PASS popup delivery: {0} assertions" -f $script:PassCount)
