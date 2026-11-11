@@ -46,7 +46,7 @@ $commonAst = Read-StateAst 'NotifyBridge.Common.ps1'
 $brokerAst = Read-StateAst 'pi-notify-broker.ps1'
 $popupAst = Read-StateAst 'pi-notify-popup.ps1'
 $activationAst = Read-StateAst 'NotifyBridge.Activation.ps1'
-. ([scriptblock]::Create((Get-StateFunctions $commonAst @('Write-NotifyPopupLiveJson'))))
+. ([scriptblock]::Create((Get-StateFunctions $commonAst @('Read-NotifyPopupLiveJson', 'Write-NotifyPopupLiveJson'))))
 . ([scriptblock]::Create((Get-StateFunctions $activationAst @('Get-NotifyActivationRemainingMs', 'Get-NotifyPiWebActivationWatchdogMs'))))
 . ([scriptblock]::Create((Get-StateFunctions $brokerAst @('Get-NotifyBrokerContextFingerprint', 'Get-NotifyBrokerLiveStatePath', 'Save-NotifyBrokerLiveState', 'Remove-NotifyBrokerLiveState', 'Get-NotifyBrokerRecoveryUiText', 'Reset-NotifyBrokerPopupFeedbackVisuals', 'Set-NotifyBrokerRecoveryUiState', 'Set-NotifyBrokerPopupActivating', 'Complete-NotifyBrokerPopupLifecycle'))))
 . ([scriptblock]::Create((Get-StateFunctions $popupAst @('Get-NotifyPopupContextFingerprint', 'Get-NotifyPopupLiveStatePath', 'Save-NotifyPopupLiveState', 'Remove-NotifyPopupLiveState', 'Get-NotifyPopupRecoveryUiText', 'Reset-NotifyPopupFeedbackVisuals', 'Set-NotifyPopupRecoveryUiState', 'Set-NotifyPopupActivating', 'Complete-NotifyPopupLifecycle'))))
@@ -206,6 +206,23 @@ try {
     Assert-State $failed 'locked destination rejects atomic replacement'
     Assert-State (([System.IO.File]::ReadAllText($atomicPath) | ConvertFrom-Json).generation -eq 2) 'failed replacement preserves prior JSON'
     Assert-State (@(Get-ChildItem $script:StateDirectory -Filter '*.tmp-*').Count -eq 0) 'failed atomic replacement cleans temporary files'
+
+    # Hold the exact read handle used by production while the UI replaces/removes state.
+    $readFunction = $commonAst.Find({ param($a) $a -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $a.Name -eq 'Read-NotifyPopupLiveJson' }, $true)
+    $openExpression = $readFunction.Find({ param($a) $a -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and $a.Member.Value -eq 'Open' }, $true)
+    $Path = $atomicPath
+    $heldRead = & ([scriptblock]::Create($openExpression.Extent.Text))
+    try {
+        Write-NotifyPopupLiveJson -Path $atomicPath -Payload @{ generation = 4 }
+        Assert-State ((Read-NotifyPopupLiveJson -Path $atomicPath).generation -eq 4) 'hotkey read handle permits atomic replacement'
+        [System.IO.File]::Delete($atomicPath)
+        Assert-State (-not [System.IO.File]::Exists($atomicPath)) 'hotkey read handle permits immediate withdrawal'
+        $oldReader = [System.IO.StreamReader]::new($heldRead, [System.Text.Encoding]::UTF8)
+        try { $oldGeneration = ($oldReader.ReadToEnd() | ConvertFrom-Json).generation }
+        finally { $oldReader.Dispose() }
+        Assert-State ($oldGeneration -eq 2) 'reader retains a complete prior generation during replacement'
+    }
+    finally { $heldRead.Dispose() }
 }
 finally {
     Remove-Item -LiteralPath $script:StateDirectory -Recurse -Force -ErrorAction SilentlyContinue

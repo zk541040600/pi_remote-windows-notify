@@ -484,6 +484,7 @@ function Get-NotifyPopupWallpaperImage {
 
     if ([string]::IsNullOrWhiteSpace($Path)) { return $null }
 
+    $bitmap = $null
     try {
         $resolved = [System.IO.Path]::GetFullPath($Path.Trim())
         if (-not (Test-Path -LiteralPath $resolved -PathType Leaf)) {
@@ -513,6 +514,7 @@ function Get-NotifyPopupWallpaperImage {
         }
     }
     catch {
+        if ($null -ne $bitmap) { $bitmap.Dispose() }
         Write-NotifyPopupLog -Message ('popup-wallpaper-error "{0}"' -f $_.Exception.Message)
         return $null
     }
@@ -806,6 +808,7 @@ $panel.Dock = [System.Windows.Forms.DockStyle]::Fill
 $panel.BackColor = $cardColor
 $panel.Cursor = [System.Windows.Forms.Cursors]::Hand
 $panel.Add_Paint({
+    $path = $null; $pen = $null; $accentBrush = $null
     try {
         $graphics = $_.Graphics
         $graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
@@ -829,12 +832,14 @@ $panel.Add_Paint({
         $accentBrush = New-Object System.Drawing.SolidBrush($accentColor)
         $graphics.DrawPath($pen, $path)
         $graphics.FillRectangle($accentBrush, 0, 0, 5, $panel.Height)
-        $accentBrush.Dispose()
-        $pen.Dispose()
-        $path.Dispose()
     }
     catch {
         Write-NotifyPopupLog -Message ('popup-paint-error "{0}"' -f $_.Exception.Message)
+    }
+    finally {
+        if ($null -ne $accentBrush) { $accentBrush.Dispose() }
+        if ($null -ne $pen) { $pen.Dispose() }
+        if ($null -ne $path) { $path.Dispose() }
     }
 })
 [void]$form.Controls.Add($panel)

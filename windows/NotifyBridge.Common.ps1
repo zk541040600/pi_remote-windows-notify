@@ -590,6 +590,19 @@ function Get-NotifyPopupActivationEventName {
 }
 
 # Hotkey readers must observe a complete old or new live-state document.
+function Read-NotifyPopupLiveJson {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read,
+        ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete))
+    try {
+        $reader = [System.IO.StreamReader]::new($stream, [System.Text.Encoding]::UTF8)
+        try { return ($reader.ReadToEnd() | ConvertFrom-Json) }
+        finally { $reader.Dispose() }
+    }
+    finally { $stream.Dispose() }
+}
+
 function Write-NotifyPopupLiveJson {
     param([Parameter(Mandatory = $true)][string]$Path, [Parameter(Mandatory = $true)]$Payload)
 

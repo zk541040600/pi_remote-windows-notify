@@ -70,8 +70,13 @@ npm test
 npm run check
 ```
 
-Windows popup behavior checks (Windows PowerShell 5.1):
+Windows popup behavior checks (Windows PowerShell 5.1; isolated fixtures, no live session activation):
 
 ```powershell
-powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File .\windows\test-popup-ui.ps1
+npm run test:popup
 ```
+
+This covers lifecycle and deadlines, hotkey ownership, atomic live-state publication,
+fragmented broker replies, fallback stacking, exact foreground identity, and drawing cleanup.
+
+See [the 2026-11-11 popup improvement report](docs/popup-10-rounds-20261111.md) for the ten changes and validation results.

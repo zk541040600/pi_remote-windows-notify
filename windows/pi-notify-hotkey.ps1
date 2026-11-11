@@ -127,7 +127,7 @@ function Get-NotifyHotkeyLivePopupStates {
     $ownedProcesses = @{}
     foreach ($item in @(Get-ChildItem -LiteralPath $logDir -Filter 'popup-live.*.json' -File -ErrorAction SilentlyContinue)) {
         try {
-            $state = [System.IO.File]::ReadAllText($item.FullName, [System.Text.UTF8Encoding]::new($false)) | ConvertFrom-Json
+            $state = Read-NotifyPopupLiveJson -Path $item.FullName
             # Configurations can share a log directory; leave another instance's state alone.
             if ($state.PSObject.Properties['configFingerprint'] -and ([string]$state.configFingerprint) -ne $configFingerprint) {
                 continue

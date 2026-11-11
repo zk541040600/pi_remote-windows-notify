@@ -11,6 +11,7 @@
   "scripts": {
     "check": "node scripts/run-paseo-sender-gate.mjs check && node scripts/check-package.mjs",
     "test": "node scripts/run-paseo-sender-gate.mjs test && node --experimental-transform-types --test test/*.test.mjs",
+    "test:popup": "powershell.exe -NoProfile -STA -ExecutionPolicy Bypass -File windows/test-popup-all.ps1",
     "test:paseo-sender": "npm --prefix linux/paseo-sender test",
     "check:paseo-sender": "npm --prefix linux/paseo-sender run check"
   },

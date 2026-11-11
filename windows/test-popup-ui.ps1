@@ -346,7 +346,7 @@ $script:DispatchDelayMs=0
 
 # A fallback hotkey signals the existing popup; it cannot invent a Terminal route.
 $hotkeyAst=Read-TestAst 'pi-notify-hotkey.ps1'
-. ([scriptblock]::Create((Get-TestFunctions $commonAst @('Get-NotifyPopupActivationEventName'))))
+. ([scriptblock]::Create((Get-TestFunctions $commonAst @('Get-NotifyPopupActivationEventName', 'Read-NotifyPopupLiveJson'))))
 . ([scriptblock]::Create((Get-TestFunctions $hotkeyAst @('Start-NotifyHotkeyActivation', 'Get-NotifyHotkeyLivePopupStates', 'Get-NotifyHotkeyFingerprint'))))
 function Write-NotifyHotkeyLog { param($Message) }
 $script:HotkeyOwnsProcess=$true
