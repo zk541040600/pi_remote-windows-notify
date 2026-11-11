@@ -25,7 +25,7 @@ function Get-DeliveryFunctions {
     }
     return ($definitions -join "`n")
 }
-. ([scriptblock]::Create((Get-DeliveryFunctions @('Read-HttpRequest', 'Send-NotifyBrokerPopup', 'Invoke-NotifyBrokerPopup', 'Get-NotifyPopupStackPlan', 'Show-Toast'))))
+. ([scriptblock]::Create((Get-DeliveryFunctions @('Read-HttpRequest', 'Test-NotifyBrokerHealth', 'Send-NotifyBrokerPopup', 'Invoke-NotifyBrokerPopup', 'Get-NotifyPopupStackPlan', 'Show-Toast'))))
 function Write-NotifyListenerLog { param($Message) }
 function Get-NotifyRouteFingerprint { param($Value) return 'fixture-fingerprint' }
 
@@ -185,12 +185,34 @@ Assert-Delivery ($response.ElapsedMs -lt 1500) 'reset acknowledgement remains bo
 }
 
 & {
+    # Keep a loopback connection unanswered: the caller's remaining startup budget wins.
+    $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+    $listener.Start()
+    try {
+        $config = [pscustomobject]@{
+            BrokerHealthUrl = ('http://127.0.0.1:{0}/health' -f ([System.Net.IPEndPoint]$listener.LocalEndpoint).Port)
+            BrokerRequestTimeoutMs = 2000
+        }
+        $clock = [System.Diagnostics.Stopwatch]::StartNew()
+        $healthy = Test-NotifyBrokerHealth -TimeoutMs 80
+        $elapsedMs = $clock.ElapsedMilliseconds
+        Assert-Delivery (-not $healthy) 'unresponsive broker health is rejected'
+        Assert-Delivery ($elapsedMs -lt 1000) 'health probe honors its remaining budget instead of the two-second default'
+    }
+    finally { $listener.Stop() }
+}
+
+& {
     $config = [pscustomobject]@{ BrokerEnabled = $true; BrokerStartupTimeoutMs = 100 }
     $script:HealthResults = [System.Collections.Generic.Queue[bool]]::new()
+    $script:HealthBudgets = [System.Collections.Generic.List[int]]::new()
     $script:HealthCalls = 0; $script:BrokerStarts = 0; $script:PopupPosts = 0
-    $script:StartResult = $true; $script:PostResult = $true
+    $script:StartResult = $true; $script:PostResult = $true; $script:SlowHealthProbe = $false
     function Test-NotifyBrokerHealth {
+        param([int]$TimeoutMs = 0)
         $script:HealthCalls += 1
+        [void]$script:HealthBudgets.Add($TimeoutMs)
+        if ($script:SlowHealthProbe -and $TimeoutMs -gt 0) { [System.Threading.Thread]::Sleep($TimeoutMs) }
         if ($script:HealthResults.Count) { return $script:HealthResults.Dequeue() }
         return $false
     }
@@ -203,9 +225,18 @@ Assert-Delivery ($response.ElapsedMs -lt 1500) 'reset acknowledgement remains bo
     Assert-Delivery ($script:HealthCalls -eq 1 -and $script:BrokerStarts -eq 0 -and $script:PopupPosts -eq 1) 'healthy delivery probes once and posts once'
 
     $script:HealthCalls = 0; $script:BrokerStarts = 0; $script:PopupPosts = 0
+    $script:HealthBudgets.Clear()
     $script:HealthResults.Enqueue($false); $script:HealthResults.Enqueue($true)
     Assert-Delivery (Invoke-NotifyBrokerPopup @popupArgs) 'newly started broker receives popup'
     Assert-Delivery ($script:HealthCalls -eq 2 -and $script:BrokerStarts -eq 1 -and $script:PopupPosts -eq 1) 'startup reuses successful poll without another health request'
+    Assert-Delivery ($script:HealthBudgets.Count -eq 2 -and $script:HealthBudgets[1] -gt 0 -and $script:HealthBudgets[1] -lt 100) 'startup polling passes only the budget left after its delay'
+
+    $script:HealthCalls = 0; $script:BrokerStarts = 0; $script:PopupPosts = 0
+    $script:SlowHealthProbe = $true
+    $clock = [System.Diagnostics.Stopwatch]::StartNew()
+    Assert-Delivery (-not (Invoke-NotifyBrokerPopup @popupArgs)) 'broker that exhausts the startup budget requests fallback'
+    Assert-Delivery ($script:HealthCalls -eq 2 -and $script:PopupPosts -eq 0 -and $clock.ElapsedMilliseconds -lt 1000) 'exhausted startup budget cannot start another health probe'
+    $script:SlowHealthProbe = $false
 
     $script:HealthCalls = 0; $script:BrokerStarts = 0; $script:PopupPosts = 0
     $script:StartResult = $false

@@ -774,11 +774,15 @@ function Test-NotifyDuplicateDrop {
 
 # Broker delegation helpers: prefer long-lived broker for popup-focus, fall back to per-popup process
 function Test-NotifyBrokerHealth {
+    param([int]$TimeoutMs = 0)
+
     try {
+        $requestTimeoutMs = [Math]::Max(100, [int]$config.BrokerRequestTimeoutMs)
+        if ($TimeoutMs -gt 0) { $requestTimeoutMs = [Math]::Min($requestTimeoutMs, $TimeoutMs) }
         $request = [System.Net.HttpWebRequest]::Create($config.BrokerHealthUrl)
         $request.Method = 'GET'
-        $request.Timeout = [Math]::Max(100, [int]$config.BrokerRequestTimeoutMs)
-        $request.ReadWriteTimeout = [Math]::Max(100, [int]$config.BrokerRequestTimeoutMs)
+        $request.Timeout = $requestTimeoutMs
+        $request.ReadWriteTimeout = $requestTimeoutMs
         $response = $request.GetResponse()
         try { return ([int]$response.StatusCode -eq 200) } finally { $response.Close() }
     }
@@ -971,10 +975,15 @@ function Invoke-NotifyBrokerPopup {
         Write-NotifyListenerLog -Message 'broker-health-miss attempting-start'
         $started = Start-NotifyBroker
         if ($started) {
-            $deadline = [DateTime]::UtcNow.AddMilliseconds([Math]::Max(100, [int]$config.BrokerStartupTimeoutMs))
-            while ([DateTime]::UtcNow -lt $deadline) {
-                Start-Sleep -Milliseconds 50
-                $brokerHealthy = Test-NotifyBrokerHealth
+            $startupBudgetMs = [Math]::Max(100, [int]$config.BrokerStartupTimeoutMs)
+            $startupClock = [System.Diagnostics.Stopwatch]::StartNew()
+            while ($true) {
+                $remainingMs = $startupBudgetMs - [int]$startupClock.ElapsedMilliseconds
+                if ($remainingMs -le 0) { break }
+                Start-Sleep -Milliseconds ([Math]::Min(50, $remainingMs))
+                $remainingMs = $startupBudgetMs - [int]$startupClock.ElapsedMilliseconds
+                if ($remainingMs -le 0) { break }
+                $brokerHealthy = Test-NotifyBrokerHealth -TimeoutMs $remainingMs
                 if ($brokerHealthy) { break }
             }
         }
