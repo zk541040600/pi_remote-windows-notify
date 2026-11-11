@@ -447,26 +447,9 @@ function Test-NotifyBrokerForegroundTarget {
 
         $selectedTab = @(Get-NotifyBrokerTabs -Handle $handle | Where-Object { $_.IsSelected } | Select-Object -First 1)
         $selectedTitle = if ($selectedTab.Count -gt 0) { [string]$selectedTab[0].Name } else { '' }
-        $haystack = @($selectedTitle, $windowTitle) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
-
-        if (-not [string]::IsNullOrWhiteSpace($SourceTabTitleValue)) {
-            foreach ($value in $haystack) {
-                if ($value.IndexOf($SourceTabTitleValue, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
-                    Write-NotifyBrokerLog -Message ('broker-foreground-target-match sourceTabFingerprint={0} selectedTabFingerprint={1} windowFingerprint={2}' -f (Get-NotifyBrokerContextFingerprint -Value $SourceTabTitleValue), (Get-NotifyBrokerContextFingerprint -Value $selectedTitle), (Get-NotifyBrokerContextFingerprint -Value $windowTitle))
-                    return $true
-                }
-            }
-
-            return $false
-        }
-
-        if (-not [string]::IsNullOrWhiteSpace($CurrentDirBase)) {
-            foreach ($value in $haystack) {
-                if ($value.IndexOf($CurrentDirBase, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
-                    Write-NotifyBrokerLog -Message ('broker-foreground-target-match cwdFingerprint={0} selectedTabFingerprint={1} windowFingerprint={2}' -f (Get-NotifyBrokerContextFingerprint -Value $CurrentDirBase), (Get-NotifyBrokerContextFingerprint -Value $selectedTitle), (Get-NotifyBrokerContextFingerprint -Value $windowTitle))
-                    return $true
-                }
-            }
+        if (Test-NotifyPopupForegroundIdentity -SelectedTabTitle $selectedTitle -WindowTitle $windowTitle -SourceTabTitle $SourceTabTitleValue -CwdBase $CurrentDirBase) {
+            Write-NotifyBrokerLog -Message ('broker-foreground-target-match sourceTabFingerprint={0} cwdFingerprint={1} selectedTabFingerprint={2} windowFingerprint={3}' -f (Get-NotifyBrokerContextFingerprint -Value $SourceTabTitleValue), (Get-NotifyBrokerContextFingerprint -Value $CurrentDirBase), (Get-NotifyBrokerContextFingerprint -Value $selectedTitle), (Get-NotifyBrokerContextFingerprint -Value $windowTitle))
+            return $true
         }
     }
     catch {

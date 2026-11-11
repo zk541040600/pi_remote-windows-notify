@@ -753,29 +753,9 @@ function Test-NotifyPopupForegroundTarget {
 
         $selectedTab = @(Get-NotifyPopupTabs -Handle $handle | Where-Object { $_.IsSelected } | Select-Object -First 1)
         $selectedTitle = if ($selectedTab.Count -gt 0) { [string]$selectedTab[0].Name } else { '' }
-        $haystack = @($selectedTitle, $windowTitle) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
-
-        if (-not [string]::IsNullOrWhiteSpace($SourceTabTitleValue)) {
-            foreach ($value in $haystack) {
-                if ($value.IndexOf($SourceTabTitleValue, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
-                    Write-NotifyPopupLog -Message ('popup-foreground-target-match sourceTabFingerprint={0} selectedTabFingerprint={1} windowFingerprint={2}' -f (Get-NotifyPopupContextFingerprint -Value $SourceTabTitleValue), (Get-NotifyPopupContextFingerprint -Value $selectedTitle), (Get-NotifyPopupContextFingerprint -Value $windowTitle))
-                    return $true
-                }
-            }
-
-            # A precise tab title identifies the popup's own Pi tab. Do not fall back to
-            # cwd matching here: multiple Pi tabs commonly share the same cwd, and a
-            # click on one popup would otherwise make sibling popups dismiss themselves.
-            return $false
-        }
-
-        if (-not [string]::IsNullOrWhiteSpace($CurrentDirBase)) {
-            foreach ($value in $haystack) {
-                if ($value.IndexOf($CurrentDirBase, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
-                    Write-NotifyPopupLog -Message ('popup-foreground-target-match cwdFingerprint={0} selectedTabFingerprint={1} windowFingerprint={2}' -f (Get-NotifyPopupContextFingerprint -Value $CurrentDirBase), (Get-NotifyPopupContextFingerprint -Value $selectedTitle), (Get-NotifyPopupContextFingerprint -Value $windowTitle))
-                    return $true
-                }
-            }
+        if (Test-NotifyPopupForegroundIdentity -SelectedTabTitle $selectedTitle -WindowTitle $windowTitle -SourceTabTitle $SourceTabTitleValue -CwdBase $CurrentDirBase) {
+            Write-NotifyPopupLog -Message ('popup-foreground-target-match sourceTabFingerprint={0} cwdFingerprint={1} selectedTabFingerprint={2} windowFingerprint={3}' -f (Get-NotifyPopupContextFingerprint -Value $SourceTabTitleValue), (Get-NotifyPopupContextFingerprint -Value $CurrentDirBase), (Get-NotifyPopupContextFingerprint -Value $selectedTitle), (Get-NotifyPopupContextFingerprint -Value $windowTitle))
+            return $true
         }
     }
     catch {

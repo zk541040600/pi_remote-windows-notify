@@ -611,6 +611,36 @@ function Get-NotifyPopupLifetimeMs {
     return [int][Math]::Min([double][int]::MaxValue, [Math]::Max([double]3000, ([double]$TimeoutSeconds * 1000)))
 }
 
+# A selected tab is stronger evidence than its possibly stale top-level window title.
+function Test-NotifyPopupForegroundIdentity {
+    param([string]$SelectedTabTitle, [string]$WindowTitle, [string]$SourceTabTitle, [string]$CwdBase)
+
+    $requiredTitle = ([string]$SourceTabTitle).Trim()
+    $title = ([string]$SelectedTabTitle).Trim()
+    if ([string]::IsNullOrWhiteSpace($title)) {
+        $title = ([string]$WindowTitle).Trim()
+        $suffix = ' - Windows Terminal'
+        if ($title.EndsWith($suffix, [System.StringComparison]::OrdinalIgnoreCase) -and -not $title.Equals($requiredTitle, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $title = $title.Substring(0, $title.Length - $suffix.Length).TrimEnd()
+        }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($requiredTitle)) {
+        return $title.Equals($requiredTitle, [System.StringComparison]::OrdinalIgnoreCase)
+    }
+    $cwd = ([string]$CwdBase).Trim()
+    if ([string]::IsNullOrWhiteSpace($cwd) -or [string]::IsNullOrWhiteSpace($title)) { return $false }
+
+    # Legacy cwd-only cards accept a whole final field or path leaf, never a substring.
+    $title = [regex]::Replace($title, ' \u00b7 #[0-9a-f]{12}$', '', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    $title = $title.TrimEnd([char[]]@('/', '\'))
+    if ($title.Equals($cwd, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+    $slash = [Math]::Max($title.LastIndexOf('/'), $title.LastIndexOf('\'))
+    if ($slash -ge 0) {
+        return $title.Substring($slash + 1).Equals($cwd, [System.StringComparison]::OrdinalIgnoreCase)
+    }
+    return $title.EndsWith((' - ' + $cwd), [System.StringComparison]::OrdinalIgnoreCase)
+}
+
 # Shared screen geometry for broker and fallback cards.
 function Get-NotifyPopupWorkingArea {
     param([string]$Placement = 'cursor')
