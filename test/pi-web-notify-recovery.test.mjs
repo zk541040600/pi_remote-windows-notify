@@ -624,8 +624,8 @@ if (-not $stopped -or
 }
 
 # Resolver A may already be stopping to make room for activation B. A later
-# click on popup A must preempt another live resolver C; it must not report
-# success merely because the already-cancelled resolver A exists.
+# click on popup A waits for A's own worker; it must neither lose the intent
+# nor cancel another live resolver C while A is already stopping.
 $script:NotifyBrokerExactWorkerMax = 2
 $script:NotifyBrokerDeferredActivations = @{}
 $resolverA = New-FakeResolver -PopupId 'popup-a' -CancelReason 'preempted-by-activation' -StopAsync ([pscustomobject]@{ IsCompleted = $false }) -StartedAtUtc ([datetime]::UtcNow.AddSeconds(-2))
@@ -638,8 +638,8 @@ if (-not $accepted -or
     -not $script:NotifyBrokerDeferredActivations.ContainsKey('popup-b') -or
     $resolverA.CancelReason -ne 'preempted-by-activation' -or
     $resolverA.PowerShell.BeginStopCalls -ne 0 -or
-    $resolverC.CancelReason -ne 'preempted-by-activation' -or
-    $resolverC.PowerShell.BeginStopCalls -ne 1) {
+    $resolverC.CancelReason -ne '' -or
+    $resolverC.PowerShell.BeginStopCalls -ne 0) {
   throw 'already-cancelled resolver A stole or stranded its own activation'
 }
 if (-not (Test-NotifyBrokerActivationIntent -PopupId 'popup-a')) {

@@ -758,7 +758,7 @@ function Request-NotifyBrokerExactWorkerStop {
 function Add-NotifyBrokerDeferredActivation {
     param(
         [Parameter(Mandatory = $true)][string]$PopupId,
-        [Parameter(Mandatory = $true)][string]$NotificationId,
+        [string]$NotificationId = '',
         [string]$SnapshotId = '',
         [string]$RecoveryTicketId = ''
     )
@@ -799,7 +799,10 @@ function Take-NotifyBrokerDeferredActivation {
         return $null
     }
 
+    $busyPopups = @{}
+    foreach ($worker in $script:NotifyBrokerExactWorkers.Values) { $busyPopups[[string]$worker.PopupId] = $true }
     $next = @($script:NotifyBrokerDeferredActivations.Values |
+        Where-Object { -not $busyPopups.ContainsKey([string]$_.PopupId) } |
         Sort-Object Sequence |
         Select-Object -First 1)
     if ($next.Count -eq 0) {
@@ -818,7 +821,8 @@ function Test-NotifyBrokerActivationIntent {
         return $true
     }
     return @($script:NotifyBrokerExactWorkers.Values | Where-Object {
-        $_.PopupId -eq $PopupId -and $_.Mode -eq 'activate'
+        $_.PopupId -eq $PopupId -and $_.Mode -eq 'activate' -and
+        [string]::IsNullOrWhiteSpace([string]$_.CancelReason) -and $null -eq $_.StopAsync
     }).Count -gt 0
 }
 
@@ -1026,7 +1030,8 @@ function Start-NotifyBrokerExactWorker {
     }
     $operation = if ($Mode -eq 'resolve') { 'resolve' } else { 'activate' }
 
-    $existing = @($script:NotifyBrokerExactWorkers.Values | Where-Object { $_.PopupId -eq $PopupId -and $_.Mode -eq $Mode })
+    $popupWorkers = @($script:NotifyBrokerExactWorkers.Values | Where-Object { $_.PopupId -eq $PopupId })
+    $existing = @($popupWorkers | Where-Object { $_.Mode -eq $Mode -and [string]::IsNullOrWhiteSpace([string]$_.CancelReason) -and $null -eq $_.StopAsync })
     if ($existing.Count -gt 0) {
         return $true
     }
@@ -1034,6 +1039,16 @@ function Start-NotifyBrokerExactWorker {
     if ($Mode -eq 'activate') {
         if ($script:NotifyBrokerDeferredActivations.ContainsKey($PopupId)) {
             return $true
+        }
+
+        # A cancelling worker still owns this popup's slot until EndStop finishes.
+        # Keep the click in the existing queue instead of starting beside it or
+        # preempting another card that cannot make this popup ready any sooner.
+        $stopping = @($popupWorkers | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_.CancelReason) -or $null -ne $_.StopAsync })
+        if ($stopping.Count -gt 0) {
+            if (Add-NotifyBrokerDeferredActivation -PopupId $PopupId -NotificationId $NotificationId -SnapshotId $SnapshotId -RecoveryTicketId $RecoveryTicketId) { return $true }
+            Set-NotifyBrokerExactWorkerFailClosed -PopupId $PopupId -Reason 'activation-queue-cap-reached' -Operation $operation -OriginKind $resolvedOrigin
+            return $false
         }
 
         $resolvers = @($script:NotifyBrokerExactWorkers.Values | Where-Object {
@@ -1056,6 +1071,7 @@ function Start-NotifyBrokerExactWorker {
             return $true
         }
     }
+    elseif ($popupWorkers.Count -gt 0) { return $false }
 
     if ($script:NotifyBrokerExactWorkers.Count -ge $script:NotifyBrokerExactWorkerMax) {
         if ($Mode -eq 'activate') {

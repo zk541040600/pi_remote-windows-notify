@@ -66,7 +66,7 @@ function Join-Path {
     return [System.IO.Path]::Combine($Path, $ChildPath)
 }
 . ([scriptblock]::Create((Get-CoordinationFunctions $activationAst @('Get-NotifyActivationRemainingMs'))))
-. ([scriptblock]::Create((Get-CoordinationFunctions $brokerAst @('Start-NotifyBrokerExactWorker', 'Start-NotifyBrokerNextDeferredActivation', 'Take-NotifyBrokerDeferredActivation', 'Add-NotifyBrokerDeferredActivation'))))
+. ([scriptblock]::Create((Get-CoordinationFunctions $brokerAst @('Start-NotifyBrokerExactWorker', 'Start-NotifyBrokerNextDeferredActivation', 'Take-NotifyBrokerDeferredActivation', 'Add-NotifyBrokerDeferredActivation', 'Test-NotifyBrokerActivationIntent'))))
 . ([scriptblock]::Create((Get-CoordinationFunctions $popupAst @('Start-NotifyPopupExactWorker'))))
 function Write-NotifyPopupLog { param($Message) }
 function Ensure-NotifyBrokerExactWorkerTimer {}
@@ -160,5 +160,42 @@ finally {
         finally { $worker.PowerShell.Dispose(); $worker.Runspace.Close(); $worker.Runspace.Dispose() }
     }
 }
+
+# Clicking a resolver already being cancelled waits for its own worker to leave.
+# It must neither run alongside that worker nor cancel a second card for space.
+function Request-NotifyBrokerExactWorkerStop {
+    param($Worker, $Reason)
+    $script:CancelRequests.Add([string]$Worker.PopupId)
+    return $true
+}
+foreach ($mode in @('resolve', 'activate')) {
+    foreach ($cap in @(2, 3)) {
+        $script:WorkerStarts = 0
+        $script:CancelRequests = [System.Collections.Generic.List[string]]::new()
+        $script:NotifyBrokerExactWorkerMax = $cap
+        $script:NotifyBrokerDeferredActivations = @{}
+        $script:NotifyBrokerActivePopups = @{ a = (New-CoordinationCard -Id a); b = (New-CoordinationCard -Id b) }
+        $script:NotifyBrokerExactWorkers = @{
+            a = [pscustomobject]@{ PopupId = 'a'; Mode = $mode; CancelReason = 'preempted-by-activation'; StopAsync = [pscustomobject]@{ IsCompleted = $false }; StartedAtUtc = [DateTime]::UtcNow.AddSeconds(-2) }
+            c = [pscustomobject]@{ PopupId = 'c'; Mode = 'resolve'; CancelReason = ''; StopAsync = $null; StartedAtUtc = [DateTime]::UtcNow }
+        }
+        [void](Add-NotifyBrokerDeferredActivation -PopupId b -NotificationId 'other')
+        $accepted = Start-NotifyBrokerExactWorker -PopupId a -Mode activate -OriginKind paseo -SnapshotId 'paseo-snapshot'
+        Assert-Coordination ($accepted -and $script:NotifyBrokerDeferredActivations.ContainsKey('a')) "cancelled $mode retains click intent at capacity=$cap"
+        Assert-Coordination ($script:CancelRequests.Count -eq 0 -and $script:WorkerStarts -eq 0) "cancelled $mode waits without stealing a second worker at capacity=$cap"
+        $first = Take-NotifyBrokerDeferredActivation
+        Assert-Coordination ($null -ne $first -and $first.PopupId -eq 'b') "unrelated pending work remains eligible at capacity=$cap mode=$mode"
+        $blocked = Take-NotifyBrokerDeferredActivation
+        Assert-Coordination ($null -eq $blocked -and $script:NotifyBrokerDeferredActivations.Count -eq 1) "blocked intent is preserved at capacity=$cap mode=$mode"
+        $script:NotifyBrokerExactWorkers.Remove('a')
+        $next = Take-NotifyBrokerDeferredActivation
+        Assert-Coordination ($null -ne $next -and $next.PopupId -eq 'a' -and $next.SnapshotId -eq 'paseo-snapshot') "intent becomes eligible once its own worker stops at capacity=$cap mode=$mode"
+        Assert-Coordination ($null -eq (Take-NotifyBrokerDeferredActivation)) "intent is taken exactly once at capacity=$cap mode=$mode"
+    }
+}
+$script:NotifyBrokerExactWorkers = @{ a = [pscustomobject]@{ PopupId = 'a'; Mode = 'activate'; CancelReason = 'popup-closed'; StopAsync = $null } }
+Assert-Coordination (-not (Test-NotifyBrokerActivationIntent -PopupId a)) 'cancelled worker alone does not imply activation intent'
+[void](Add-NotifyBrokerDeferredActivation -PopupId a -NotificationId '')
+Assert-Coordination (Test-NotifyBrokerActivationIntent -PopupId a) 'explicit pending intent survives worker cancellation'
 
 Write-Output "Popup coordination tests passed: $script:PassCount"
