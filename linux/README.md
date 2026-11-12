@@ -30,6 +30,21 @@ Edit `~/.pi/agent/remote-windows-notify.json`:
 
 Then restart Pi or run `/reload`.
 
+### Applying an update in Pi Web
+
+Pi caches extension factories in its long-running process. Updating the package
+on disk, refreshing the browser, or creating/resuming a session does not by
+itself invalidate that cache. Run Pi's `/reload` from an idle session after the
+update. Wait for that session's child agents to finish first: reload tears down
+its extension runtime and can stop its child agents.
+
+Reload clears the shared factory cache for subsequently created runtimes; other
+already-bound sessions and running children keep their old handlers until they
+are individually reloaded or finished. Verify deployment with a newly created
+real child agent and the receiver's logs, plus a main-session notification as a
+positive control. A fresh-process SDK test alone cannot prove that a running Pi
+Web host has picked up the update.
+
 The package entry is the preferred active source. `pi-notify-ensure.mjs`, used by the Windows
 installer and Linux boot guard, keeps exactly one load path: package copies when this package is
 installed, otherwise the standalone global extension. A different pre-existing global copy causes
