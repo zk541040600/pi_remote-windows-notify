@@ -35,6 +35,15 @@ installer and Linux boot guard, keeps exactly one load path: package copies when
 installed, otherwise the standalone global extension. A different pre-existing global copy causes
 the installer to fail for manual review instead of overwriting it.
 
+## Notification scope
+
+Inside a Pi Web host (`PI_WEB_NO_OPEN=1`), only UI-bound RPC/TUI runtimes send
+notifications. Headless SDK runtimes (`print`/`json`), including in-process
+`pi-subagents` workers, do not send completion or ask-user notifications. This
+filter is runtime-local: it does not silence other tabs, depend on agent names,
+or disable session persistence. User-created forks remain eligible. Standalone
+CLI senders outside Pi Web retain their existing notification behavior.
+
 ## Environment overrides
 
 - `PI_NOTIFY_CONFIG` - config file path.

@@ -704,6 +704,18 @@ function shouldSkipNotificationForThisProcess(): boolean {
   return false;
 }
 
+/**
+ * Pi Web binds its user-facing sessions as RPC, but in-process SDK subagents
+ * keep print mode and inherit the host's Web environment. Filter headless Web
+ * runtimes locally, without suppressing other tabs or standalone CLI senders.
+ * Names and parentSession are not role markers: agents can be renamed and
+ * ordinary user-created forks also have a parent session.
+ */
+function shouldSkipNotificationForThisSession(mode: string | undefined): boolean {
+  return shouldSkipNotificationForThisProcess() ||
+    (isPiWebHostProcess() && (mode === "print" || mode === "json"));
+}
+
 function normalizeTabTitlePart(value: unknown, fallback: string): string {
   const raw = typeof value === "string" ? value : "";
   const cleaned = raw
@@ -805,7 +817,7 @@ export default function remoteWindowsNotify(pi: ExtensionAPI): void {
 
   const promptUnsubscribe = pi.events.on(ASK_USER_PROMPT_EVENT, async (data) => {
     const snapshot = currentSnapshot ? { ...currentSnapshot } : undefined;
-    if (!snapshot || !isAlive()) {
+    if (!snapshot || !isAlive() || shouldSkipNotificationForThisSession(snapshot.mode)) {
       return;
     }
 
@@ -888,7 +900,7 @@ export default function remoteWindowsNotify(pi: ExtensionAPI): void {
   });
 
   pi.on("agent_end", async (event, ctx) => {
-    if (shouldSkipNotificationForThisProcess() || !isAlive()) {
+    if (!isAlive() || shouldSkipNotificationForThisSession(ctx.mode)) {
       return;
     }
     const config = await getRuntimeConfig();
